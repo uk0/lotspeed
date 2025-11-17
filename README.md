@@ -30,4 +30,5 @@ cat /sys/module/lotspeed/parameters/lotserver_gain
 # 调整参数（例如设置为 5Gbps）
 echo 625000000 | sudo tee /sys/module/lotspeed/parameters/lotserver_rate
 
+lsmod |grep lotspeed
 ```

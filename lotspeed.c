@@ -505,24 +505,31 @@ static int __init lotspeed_module_init(void)
 {
     unsigned long gbps_int, gbps_frac;
     unsigned int gain_int, gain_frac;
+    char line_buffer[64];  // 添加这行声明
+    int len;
+
 
     BUILD_BUG_ON(sizeof(struct lotspeed) > ICSK_CA_PRIV_SIZE);
 
     pr_info("╔════════════════════════════════════════════════════════╗\n");
     pr_info("║          LotSpeed v2.0 - 锐速复活版                    ║\n");
-    pr_info("║          Created by uk0 @ 2025-11-18 06:43:26          ║\n");
+    pr_info("║          Created by uk0 @ 2025-11-18 06:45:23          ║\n");
 
-    // 格式化内核版本行，确保总宽度为60字符
-    snprintf(line_buffer, sizeof(line_buffer),
-             "║          Kernel: %u.%u.%-34u║",
-             LINUX_VERSION_CODE >> 16,
-             (LINUX_VERSION_CODE >> 8) & 0xff,
-             LINUX_VERSION_CODE & 0xff);
+    // 格式化内核版本行
+    len = snprintf(line_buffer, sizeof(line_buffer),
+                   "║          Kernel: %u.%u.%u",
+                   LINUX_VERSION_CODE >> 16,
+                   (LINUX_VERSION_CODE >> 8) & 0xff,
+                   LINUX_VERSION_CODE & 0xff);
 
-    // 确保长度正好是60（包括边框）
-    line_buffer[58] = ' ';  // 填充空格
-    line_buffer[59] = '║';  // 右边框
-    line_buffer[60] = '\0'; // 字符串结束
+    // 填充空格到固定长度
+    while (len < 58) {
+        line_buffer[len++] = ' ';
+    }
+
+    // 添加右边框（使用字符串连接而不是单个字符）
+    line_buffer[len] = '\0';
+    strcat(line_buffer, "║");
 
     pr_info("%s\n", line_buffer);
     pr_info("╚════════════════════════════════════════════════════════╝\n");

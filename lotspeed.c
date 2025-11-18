@@ -11,7 +11,7 @@
 #include <linux/ktime.h>
 
 // 可调参数（通过 sysfs 动态修改）
-static unsigned long lotserver_rate = 1250000000ULL;  // 默认 10Gbps
+static unsigned long lotserver_rate = 125000000ULL;  // 默认 1Gbps
 static unsigned int lotserver_gain = 30;               // 3.0x 默认增益
 static unsigned int lotserver_min_cwnd = 50;           // 最小拥塞窗口
 static unsigned int lotserver_max_cwnd = 10000;        // 最大拥塞窗口
@@ -141,7 +141,7 @@ module_param(force_unload, bool, 0644);
 MODULE_PARM_DESC(force_unload, "Force unload module ignoring references");
 
 module_param_cb(lotserver_rate, &param_ops_rate, &lotserver_rate, 0644);
-MODULE_PARM_DESC(lotserver_rate, "Target rate in bytes/sec (default 10Gbps)");
+MODULE_PARM_DESC(lotserver_rate, "Target rate in bytes/sec (default 1Gbps)");
 
 module_param_cb(lotserver_gain, &param_ops_gain, &lotserver_gain, 0644);
 MODULE_PARM_DESC(lotserver_gain, "Gain multiplier x10 (30 = 3.0x)");

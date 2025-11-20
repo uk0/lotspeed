@@ -87,5 +87,16 @@ Examples:
   lotspeed monitor
 ```
 
+
+### test youtube
+
+
+<div align=center>
+    <img src="https://github.com/uk0/lotspeed/blob/main/img_2.png" width="1024" height="768" />
+</div>
+
+
+
 ### changelog
 * 支持 `debian`,`ubunut` 5.x.x ,6.x.x 内核
+* RN垃圾服务器能实现双 `8K 120fps` 秒开，

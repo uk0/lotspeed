@@ -705,9 +705,9 @@ static int __init lotspeed_module_init(void)
     print_boxed_line("          Kernel: ", buffer);
 
 #ifdef LOTSPEED_NEW_CONG_CONTROL_API
-    pr_info("║          API: NEW (6.9+)                                ║\n");
+    pr_info("║          API: NEW (6.9+)                               ║\n");
 #else
-    pr_info("║          API: LEGACY (6.8 and older)                    ║\n");
+    pr_info("║          API: LEGACY (6.8 and older)                   ║\n");
 #endif
 
     pr_info("╚════════════════════════════════════════════════════════╝\n");

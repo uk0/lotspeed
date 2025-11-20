@@ -5,6 +5,14 @@
 </div>
 
 
+### branch explanation
+
+* `main`: lotspeed 自动优化版本最新版
+* `v2.1`: lotspeed 暴力版本
+* `v3.1`: lotspeed 最小优化算法版本
+* `lotspeed-mini`  lotspeed 极简版本，仅包含核心代码
+
+
 
 * auto install
 
@@ -117,3 +125,5 @@ Note: v3.3 includes ProbeRTT, Smart Startup, ECN support
 ### changelog
 * 支持 `debian`,`ubunut` 5.x.x ,6.x.x 内核
 * RN垃圾服务器能实现双 `8K 60fps` 秒开，
+
+

@@ -33,7 +33,7 @@ static unsigned int lotserver_min_cwnd = 50;           // 最小拥塞窗口
 static unsigned int lotserver_max_cwnd = 10000;        // 最大拥塞窗口
 static bool lotserver_adaptive = true;                 // 自适应模式
 static bool lotserver_turbo = false;                   // 涡轮模式
-static bool lotserver_verbose = true;                  // 详细日志模式
+static bool lotserver_verbose = false;                  // 详细日志模式
 static bool force_unload = false;
 
 // 参数变更回调 - 速率

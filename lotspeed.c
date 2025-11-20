@@ -32,7 +32,7 @@ static unsigned int lotserver_gain = 30;               // 3.0x 默认增益
 static unsigned int lotserver_min_cwnd = 40;           // 最小拥塞窗口
 static unsigned int lotserver_max_cwnd = 20000;        // 最大拥塞窗口 (调大以适应大带宽)
 static bool lotserver_turbo = false;                   // 涡轮模式
-static bool lotserver_verbose = true;                  // 仅控制连接开关的日志，不影响性能
+static bool lotserver_verbose = false;                  // 仅控制连接开关的日志，不影响性能
 static bool force_unload = false;
 
 // 参数回调函数 (保留基本功能)

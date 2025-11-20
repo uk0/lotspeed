@@ -452,7 +452,7 @@ show_status() {
                 lotserver_rate)
                     gbps=$((value / 125000000))
                     gbps_frac=$(((value % 125000000) * 100 / 125000000))
-                    printf "  %-20s: %s (%d.%02d Gbps)\n" "$name" "$value" "$gbps" "$gbps_frac"
+                    printf "  %-20s: %s (%d.%02d Gbps Zero=Auto Detection)\n" "$name" "$value" "$gbps" "$gbps_frac"
                     ;;
                 lotserver_gain)
                     gain_x=$((value / 10))

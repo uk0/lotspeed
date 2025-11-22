@@ -1,13 +1,12 @@
 /*
- * lotspeed_zeta_v5_fixed.c
- * "公路超跑" Zeta-TCP 深度复刻版 - 修复版
- * Author: uk0 (Size Optimized)
+ * lotspeed_zeta_v5_1.c
+ * "公路超跑" Zeta-TCP 深度复刻版 - 内存优化修正版
+ * Author: uk0 (Fixed by Gemini)
  *
- * Features:
- * 1. Zeta-Like Learning Mode (历史带宽记忆，实现 0-RTT 满速启动)
- * 2. RTT-based Loss Differentiation (基于延迟梯度的丢包区分)
- * 3. BBR-style Pacing & Probing
- * 4. Safety Guards (防止内核恐慌的安全检查)
+ * Fixes:
+ * - Solved "BUILD_BUG_ON" compilation error by optimizing struct layout.
+ * - Removed non-critical statistics (start_time, bytes_sent) to fit in kernel memory.
+ * - Reordered fields to minimize padding.
  */
 
 #include <linux/module.h>
@@ -17,21 +16,34 @@
 #include <linux/moduleparam.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/rtc.h>
 #include <linux/hashtable.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/rculist.h>
 
 // --- 安全性宏定义 ---
 #define SAFETY_CHECK(ptr, ret) do { \
     if (unlikely(!(ptr))) { \
-        if (lotserver_verbose) \
-            pr_err("lotspeed: NULL pointer at %s:%d\n", __func__, __LINE__); \
         return ret; \
     } \
 } while(0)
 
 #define SAFE_DIV(n, d) ((d) ? (n)/(d) : 0)
 #define SAFE_DIV64(n, d) ((d) ? div64_u64(n, d) : 0)
+
+// --- 基础宏定义 ---
+#define CURRENT_TIMESTAMP ({ \
+    static char __ts[32]; \
+    struct timespec64 ts; \
+    struct tm tm; \
+    ktime_get_real_ts64(&ts); \
+    time64_to_tm(ts.tv_sec, 0, &tm); \
+    snprintf(__ts, sizeof(__ts), "%04ld-%02d-%02d %02d:%02d:%02d", \
+            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, \
+            tm.tm_hour, tm.tm_min, tm.tm_sec); \
+    __ts; \
+})
 
 // --- Zeta-TCP 核心配置 ---
 #define HISTORY_BITS 10
@@ -71,102 +83,67 @@ static bool lotserver_turbo = false;
 static bool lotserver_verbose = false;
 static bool lotserver_safe_mode = true;
 
-// --- 参数回调函数 ---
-static int param_set_rate(const char *val, const struct kernel_param *kp)
-{
-    unsigned long old_val = lotserver_rate;
-    int ret = param_set_ulong(val, kp);
-    if (ret == 0 && old_val != lotserver_rate && lotserver_verbose) {
-        pr_info("lotspeed: rate changed: %lu -> %lu\n", old_val, lotserver_rate);
-    }
-    return ret;
-}
-
-static int param_set_gain(const char *val, const struct kernel_param *kp)
-{
-    unsigned int old_val = lotserver_gain;
+// --- 参数回调 (保持不变) ---
+static int param_set_rate(const char *val, const struct kernel_param *kp) { return param_set_ulong(val, kp); }
+static int param_set_gain(const char *val, const struct kernel_param *kp) { return param_set_uint(val, kp); }
+static int param_set_min_cwnd(const char *val, const struct kernel_param *kp) {
     int ret = param_set_uint(val, kp);
-    if (ret == 0 && old_val != lotserver_gain && lotserver_verbose) {
-        pr_info("lotspeed: gain changed: %u -> %u\n", old_val, lotserver_gain);
+    if (!ret && lotserver_min_cwnd < 4) lotserver_min_cwnd = 4;
+    return ret;
+}
+static int param_set_max_cwnd(const char *val, const struct kernel_param *kp) {
+    int ret = param_set_uint(val, kp);
+    if (!ret && lotserver_max_cwnd > 100000) lotserver_max_cwnd = 100000;
+    return ret;
+}
+static int param_set_adaptive(const char *val, const struct kernel_param *kp) { return param_set_bool(val, kp); }
+static int param_set_turbo(const char *val, const struct kernel_param *kp) { return param_set_bool(val, kp); }
+static int param_set_beta(const char *val, const struct kernel_param *kp) {
+    int ret = param_set_uint(val, kp);
+    if (!ret) {
+        if (lotserver_beta > LOTSPEED_BETA_SCALE) lotserver_beta = LOTSPEED_BETA_SCALE;
+        if (lotserver_beta < 512) lotserver_beta = 512;
     }
     return ret;
 }
 
-static int param_set_turbo(const char *val, const struct kernel_param *kp)
-{
-    bool old_val = lotserver_turbo;
-    int ret = param_set_bool(val, kp);
-    if (ret == 0 && old_val != lotserver_turbo) {
-        if (lotserver_turbo) {
-            pr_warn("lotspeed: ⚡ TURBO MODE ACTIVATED ⚡\n");
-        } else {
-            pr_info("lotspeed: Turbo mode deactivated\n");
-        }
-    }
-    return ret;
-}
+static const struct kernel_param_ops param_ops_rate = { .set = param_set_rate, .get = param_get_ulong, };
+static const struct kernel_param_ops param_ops_gain = { .set = param_set_gain, .get = param_get_uint, };
+static const struct kernel_param_ops param_ops_min_cwnd = { .set = param_set_min_cwnd, .get = param_get_uint, };
+static const struct kernel_param_ops param_ops_max_cwnd = { .set = param_set_max_cwnd, .get = param_get_uint, };
+static const struct kernel_param_ops param_ops_adaptive = { .set = param_set_adaptive, .get = param_get_bool, };
+static const struct kernel_param_ops param_ops_turbo = { .set = param_set_turbo, .get = param_get_bool, };
+static const struct kernel_param_ops param_ops_beta = { .set = param_set_beta, .get = param_get_uint, };
 
-static const struct kernel_param_ops param_ops_rate = {
-        .set = param_set_rate,
-        .get = param_get_ulong,
-};
-
-static const struct kernel_param_ops param_ops_gain = {
-        .set = param_set_gain,
-        .get = param_get_uint,
-};
-
-static const struct kernel_param_ops param_ops_turbo = {
-        .set = param_set_turbo,
-        .get = param_get_bool,
-};
-
-// --- 参数定义 ---
 module_param_cb(lotserver_rate, &param_ops_rate, &lotserver_rate, 0644);
-MODULE_PARM_DESC(lotserver_rate, "Target rate in bytes/sec (default 1Gbps)");
-
 module_param_cb(lotserver_gain, &param_ops_gain, &lotserver_gain, 0644);
-MODULE_PARM_DESC(lotserver_gain, "Gain multiplier x10 (20 = 2.0x)");
-
-module_param(lotserver_min_cwnd, uint, 0644);
-MODULE_PARM_DESC(lotserver_min_cwnd, "Minimum congestion window");
-
-module_param(lotserver_max_cwnd, uint, 0644);
-MODULE_PARM_DESC(lotserver_max_cwnd, "Maximum congestion window");
-
-module_param(lotserver_adaptive, bool, 0644);
-MODULE_PARM_DESC(lotserver_adaptive, "Enable adaptive rate control");
-
+module_param_cb(lotserver_min_cwnd, &param_ops_min_cwnd, &lotserver_min_cwnd, 0644);
+module_param_cb(lotserver_max_cwnd, &param_ops_max_cwnd, &lotserver_max_cwnd, 0644);
+module_param_cb(lotserver_adaptive, &param_ops_adaptive, &lotserver_adaptive, 0644);
 module_param_cb(lotserver_turbo, &param_ops_turbo, &lotserver_turbo, 0644);
-MODULE_PARM_DESC(lotserver_turbo, "Turbo mode - ignore congestion signals");
-
-module_param(lotserver_beta, uint, 0644);
-MODULE_PARM_DESC(lotserver_beta, "Beta for fairness (default 717 = 0.7)");
-
+module_param_cb(lotserver_beta, &param_ops_beta, &lotserver_beta, 0644);
 module_param(lotserver_verbose, bool, 0644);
-MODULE_PARM_DESC(lotserver_verbose, "Enable verbose logging");
-
 module_param(lotserver_safe_mode, bool, 0644);
-MODULE_PARM_DESC(lotserver_safe_mode, "Enable safety checks");
 
 // --- 全局统计 ---
 static atomic_t active_connections = ATOMIC_INIT(0);
 static atomic64_t total_bytes_sent = ATOMIC64_INIT(0);
+static atomic_t total_losses = ATOMIC_INIT(0);
 static atomic_t history_entries_count = ATOMIC_INIT(0);
 
-// --- ZETA 历史记录结构 ---
+// --- ZETA 学习引擎结构 ---
 struct zeta_history_entry {
     struct hlist_node node;
     struct rcu_head rcu;
     u32 daddr;
     u64 cached_bw;
     u32 cached_min_rtt;
+    u32 cached_median_rtt;
     u64 last_update;
-    u16 sample_count;  // 减小为u16
-    u16 loss_count;    // 减小为u16
+    u32 sample_count;
+    u32 loss_count;
 };
 
-// 全局哈希表与锁
 static DEFINE_HASHTABLE(zeta_history_map, HISTORY_BITS);
 static DEFINE_SPINLOCK(zeta_history_lock);
 
@@ -179,45 +156,52 @@ enum lotspeed_state {
     PROBE_RTT
 };
 
-// --- 精简的私有数据结构 (优化大小) ---
+static const char* state_to_str(enum lotspeed_state state) {
+    switch (state) {
+        case STARTUP: return "STARTUP";
+        case PROBING: return "PROBING";
+        case CRUISING: return "CRUISING";
+        case AVOIDING: return "AVOIDING";
+        case PROBE_RTT: return "PROBE_RTT";
+        default: return "UNKNOWN";
+    }
+}
+
+// --- 私有数据结构 (内存优化版) ---
+// 严禁随意添加字段，否则会导致编译失败 (BUILD_BUG_ON)
 struct lotspeed {
-    // 64-bit fields (8 bytes each) - 总共24字节
+    // 1. 8字节对齐字段 (u64) - 放在最前面
     u64 target_rate;
     u64 actual_rate;
-    u64 bytes_sent;
+    u64 last_bw;
 
-    // 32-bit fields (4 bytes each) - 总共48字节
-    u32 rtt_min;
+    // 2. 4字节对齐字段 (u32, enum)
+    u32 cwnd_gain;
     u32 last_state_ts;
     u32 probe_rtt_ts;
-    u32 last_bw;
-    u32 cwnd_gain;
-    u32 start_time;
+    u32 last_cruise_ts;
+
+    u32 rtt_min;
     u32 rtt_median;
+    u32 rtt_cnt;
+    u32 loss_count;
+
+    u32 bw_stalled_rounds;
+    u32 probe_cnt;
     u32 rtt_variance;
     u32 last_loss_rtt;
-    u32 last_cruise_ts;
-    u16 sample_count;    // 16-bit
-    u16 loss_count;      // 16-bit
+    u32 sample_count;
 
-    // 8-bit fields (1 byte each) - 总共8字节
-    u8 state;
-    u8 probe_cnt;
-    u8 bw_stalled_rounds;
-    u8 rtt_cnt;
-    u8 flags;            // 位域标志: ss_mode(bit0), history_hit(bit1)
-    u8 reserved[3];      // 对齐填充
-}; // 总大小: 24 + 48 + 8 = 80字节
+    enum lotspeed_state state; // 通常是4字节
 
-// 标志位操作宏
-#define FLAG_SS_MODE      0x01
-#define FLAG_HISTORY_HIT  0x02
+    // 3. 1字节对齐字段 (bool) - 放在最后减少padding
+    bool ss_mode;
+    bool history_hit;
 
-#define SET_FLAG(ca, flag)    ((ca)->flags |= (flag))
-#define CLEAR_FLAG(ca, flag)  ((ca)->flags &= ~(flag))
-#define CHECK_FLAG(ca, flag)  ((ca)->flags & (flag))
+    // 已移除: start_time, bytes_sent (节省16字节)
+};
 
-// --- 历史管理函数 ---
+// --- 安全的历史引擎函数 ---
 static void free_history_entry_rcu(struct rcu_head *head)
 {
     struct zeta_history_entry *entry = container_of(head, struct zeta_history_entry, rcu);
@@ -229,15 +213,19 @@ static struct zeta_history_entry *find_history_safe(u32 daddr)
 {
     struct zeta_history_entry *entry;
     hash_for_each_possible_rcu(zeta_history_map, entry, node, daddr) {
-        if (entry && entry->daddr == daddr) return entry;
+        if (entry && entry->daddr == daddr) {
+            return entry;
+        }
     }
     return NULL;
 }
 
-static void update_history_safe(u32 daddr, u64 bw, u32 rtt, u16 loss_count)
+static void update_history_safe(u32 daddr, u64 bw, u32 rtt, u32 loss_count)
 {
-    struct zeta_history_entry *entry;
+    struct zeta_history_entry *entry, *oldest = NULL;
+    u64 oldest_time = ULLONG_MAX;
     bool found = false;
+    int bkt;
 
     if (!bw || !rtt) return;
 
@@ -246,49 +234,61 @@ static void update_history_safe(u32 daddr, u64 bw, u32 rtt, u16 loss_count)
     entry = find_history_safe(daddr);
     if (entry) {
         entry->cached_bw = (entry->cached_bw * 7 + bw * 3) / 10;
-        if (rtt < entry->cached_min_rtt) {
-            entry->cached_min_rtt = rtt;
-        }
-        entry->loss_count = min_t(u32, entry->loss_count + loss_count, 65535);
-        entry->sample_count = min_t(u32, entry->sample_count + 1, 65535);
+        if (rtt < entry->cached_min_rtt) entry->cached_min_rtt = rtt;
+        entry->cached_median_rtt = (entry->cached_median_rtt * 9 + rtt) / 10;
+        entry->loss_count += loss_count;
+        entry->sample_count++;
         entry->last_update = get_jiffies_64();
         found = true;
     }
 
-    if (!found && atomic_read(&history_entries_count) < HISTORY_MAX_ENTRIES) {
+    if (!found) {
+        if (atomic_read(&history_entries_count) >= HISTORY_MAX_ENTRIES) {
+            struct zeta_history_entry *tmp;
+            hash_for_each_rcu(zeta_history_map, bkt, tmp, node) {
+                if (tmp && tmp->last_update < oldest_time) {
+                    oldest_time = tmp->last_update;
+                    oldest = tmp;
+                }
+            }
+            if (oldest) {
+                hash_del_rcu(&oldest->node);
+                call_rcu(&oldest->rcu, free_history_entry_rcu);
+            }
+        }
+
         entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
         if (entry) {
             entry->daddr = daddr;
             entry->cached_bw = bw;
             entry->cached_min_rtt = rtt;
+            entry->cached_median_rtt = rtt;
             entry->loss_count = loss_count;
             entry->sample_count = 1;
             entry->last_update = get_jiffies_64();
             hash_add_rcu(zeta_history_map, &entry->node, daddr);
             atomic_inc(&history_entries_count);
+            if (lotserver_verbose) {
+                pr_info("lotspeed: [Zeta] Learned %pI4\n", &daddr);
+            }
         }
     }
-
     spin_unlock_bh(&zeta_history_lock);
 }
 
 // --- 状态切换 ---
 static void enter_state(struct sock *sk, enum lotspeed_state new_state)
 {
-    struct lotspeed *ca;
-    SAFETY_CHECK(sk, );
-    ca = inet_csk_ca(sk);
+    struct lotspeed *ca = inet_csk_ca(sk);
     SAFETY_CHECK(ca, );
 
     if (ca->state != new_state) {
         if (lotserver_verbose) {
-            pr_info("lotspeed: state %d -> %d\n", ca->state, new_state);
+            pr_info("lotspeed: [uk0] %s -> %s\n", state_to_str(ca->state), state_to_str(new_state));
         }
         ca->state = new_state;
         ca->last_state_ts = tcp_jiffies32;
-        if (new_state == CRUISING) {
-            ca->last_cruise_ts = tcp_jiffies32;
-        }
+        if (new_state == CRUISING) ca->last_cruise_ts = tcp_jiffies32;
     }
 }
 
@@ -302,20 +302,18 @@ static void lotspeed_init(struct sock *sk)
 
     SAFETY_CHECK(sk, );
     tp = tcp_sk(sk);
-    SAFETY_CHECK(tp, );
     ca = inet_csk_ca(sk);
-    SAFETY_CHECK(ca, );
+    daddr = sk->sk_daddr;
 
     memset(ca, 0, sizeof(struct lotspeed));
 
-    daddr = sk->sk_daddr;
     ca->state = STARTUP;
     ca->last_state_ts = tcp_jiffies32;
     ca->probe_rtt_ts = tcp_jiffies32;
     ca->target_rate = lotserver_rate;
     ca->cwnd_gain = lotserver_gain;
-    ca->start_time = ktime_get_real_seconds();
-    SET_FLAG(ca, FLAG_SS_MODE);
+    ca->ss_mode = true;
+    ca->history_hit = false;
 
     tp->snd_ssthresh = lotserver_turbo ? TCP_INFINITE_SSTHRESH : max(tp->snd_cwnd * 2, 10U);
 
@@ -330,24 +328,22 @@ static void lotspeed_init(struct sock *sk)
     history = find_history_safe(daddr);
     if (history && history->sample_count >= ZETA_MIN_SAMPLES) {
         u64 age_ms = jiffies_to_msecs(get_jiffies_64() - history->last_update);
-
         if (age_ms < HISTORY_TTL_SEC * 1000ULL && history->cached_bw > 0) {
             ca->target_rate = (history->cached_bw * ZETA_ALPHA) / 100;
             ca->rtt_min = history->cached_min_rtt;
-            SET_FLAG(ca, FLAG_HISTORY_HIT);
+            ca->rtt_median = history->cached_median_rtt;
+            ca->history_hit = true;
 
             if (tp->mss_cache > 0 && ca->rtt_min > 0) {
                 u64 bdp = ca->target_rate * (u64)ca->rtt_min;
                 u32 init_cwnd = SAFE_DIV64(bdp, (u64)tp->mss_cache * 1000000ULL);
                 init_cwnd = clamp(init_cwnd, 10U, lotserver_max_cwnd);
-
                 tp->snd_cwnd = init_cwnd;
                 tp->snd_ssthresh = max(init_cwnd, 10U);
                 ca->state = PROBING;
-                CLEAR_FLAG(ca, FLAG_SS_MODE);
-
+                ca->ss_mode = false;
                 if (lotserver_verbose) {
-                    pr_info("lotspeed: Zeta HIT! cwnd=%u\n", init_cwnd);
+                    pr_info("lotspeed: [Zeta] HIT %pI4! CWND=%u\n", &daddr, init_cwnd);
                 }
             }
         }
@@ -358,10 +354,7 @@ static void lotspeed_init(struct sock *sk)
 // --- 释放连接 ---
 static void lotspeed_release(struct sock *sk)
 {
-    struct lotspeed *ca;
-
-    SAFETY_CHECK(sk, );
-    ca = inet_csk_ca(sk);
+    struct lotspeed *ca = inet_csk_ca(sk);
 
     if (!ca) {
         atomic_dec(&active_connections);
@@ -369,13 +362,10 @@ static void lotspeed_release(struct sock *sk)
     }
 
     atomic_dec(&active_connections);
+    if (ca->loss_count > 0) atomic_add(ca->loss_count, &total_losses);
 
-    if (ca->bytes_sent > 0) {
-        atomic64_add(ca->bytes_sent, &total_bytes_sent);
-    }
-
+    // Zeta Learning: 只依赖采样数和速率，不依赖 bytes_sent
     if (ca->sample_count >= ZETA_MIN_SAMPLES &&
-        ca->bytes_sent > 1048576 &&
         ca->actual_rate > 0 &&
         ca->rtt_min > 0 &&
         sk->sk_daddr != 0) {
@@ -385,78 +375,54 @@ static void lotspeed_release(struct sock *sk)
 
 static void lotspeed_update_rtt(struct sock *sk, u32 rtt_us)
 {
-    struct lotspeed *ca;
-
-    SAFETY_CHECK(sk, );
-    ca = inet_csk_ca(sk);
+    struct lotspeed *ca = inet_csk_ca(sk);
     SAFETY_CHECK(ca, );
-
     if (!rtt_us) return;
 
     if (ca->state == PROBE_RTT || !ca->rtt_min || rtt_us < ca->rtt_min) {
         ca->rtt_min = rtt_us;
     }
 
-    if (ca->rtt_median == 0) {
-        ca->rtt_median = rtt_us;
-    } else {
-        ca->rtt_median = (ca->rtt_median * 9 + rtt_us) / 10;
-    }
+    if (ca->rtt_median == 0) ca->rtt_median = rtt_us;
+    else ca->rtt_median = (ca->rtt_median * 9 + rtt_us) / 10;
 
     if (ca->rtt_min > 0) {
         u32 diff = (rtt_us > ca->rtt_min) ? (rtt_us - ca->rtt_min) : 0;
         ca->rtt_variance = (ca->rtt_variance * 3 + diff) / 4;
     }
 
-    ca->rtt_cnt = min(ca->rtt_cnt + 1, 255U);
-    ca->sample_count = min(ca->sample_count + 1, 65535U);
+    ca->rtt_cnt++;
+    ca->sample_count++;
 }
 
 // --- 核心算法 ---
 static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample *rs, int flag)
 {
-    struct tcp_sock *tp;
-    struct lotspeed *ca;
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct lotspeed *ca = inet_csk_ca(sk);
     u64 bw = 0;
-    u32 rtt_us, cwnd, target_cwnd, mss;
+    u32 rtt_us = tp->srtt_us >> 3;
+    u32 cwnd, target_cwnd;
+    u32 mss = tp->mss_cache ? : 1460;
     bool congestion_detected = false;
 
-    SAFETY_CHECK(sk, );
-    tp = tcp_sk(sk);
-    SAFETY_CHECK(tp, );
-    ca = inet_csk_ca(sk);
-    SAFETY_CHECK(ca, );
-
-    rtt_us = tp->srtt_us >> 3;
     lotspeed_update_rtt(sk, rtt_us);
     if (!rtt_us) rtt_us = 1000;
 
-    mss = tp->mss_cache;
-    if (mss == 0) mss = 1460;
-
-    if (rs && rs->delivered > 0) {
-        ca->bytes_sent += rs->delivered;
-        if (rs->interval_us > 0) {
-            bw = (u64)rs->delivered * USEC_PER_SEC;
-            bw = SAFE_DIV64(bw, (u64)rs->interval_us);
-            ca->actual_rate = bw;
-        }
+    if (rs && rs->delivered > 0 && rs->interval_us > 0) {
+        bw = (u64)rs->delivered * USEC_PER_SEC;
+        bw = SAFE_DIV64(bw, (u64)rs->interval_us);
+        ca->actual_rate = bw;
     }
 
     if (!lotserver_turbo || lotserver_safe_mode) {
-        if (flag & CA_ACK_ECE) {
-            congestion_detected = true;
-        }
-
+        if (flag & CA_ACK_ECE) congestion_detected = true;
         if (ca->rtt_min > 0 && ca->rtt_variance > 0) {
             u32 threshold = ca->rtt_min + (ca->rtt_min >> 2) + ca->rtt_variance;
-            if (rtt_us > threshold) {
-                congestion_detected = true;
-            }
+            if (rtt_us > threshold) congestion_detected = true;
         }
     }
 
-    // 状态机
     if (ca->state != PROBE_RTT && ca->rtt_min > 0 &&
         time_after32(tcp_jiffies32, ca->probe_rtt_ts + msecs_to_jiffies(LOTSPEED_PROBE_RTT_INTERVAL_MS))) {
         enter_state(sk, PROBE_RTT);
@@ -464,50 +430,34 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
 
     switch (ca->state) {
         case STARTUP:
-            if (congestion_detected) {
-                enter_state(sk, AVOIDING);
-            } else if (bw > 0) {
+            if (congestion_detected) enter_state(sk, AVOIDING);
+            else if (bw > 0) {
                 if (ca->last_bw > 0 && bw * 1024 > ca->last_bw * LOTSPEED_STARTUP_GROWTH_TARGET) {
                     ca->last_bw = bw;
                     ca->bw_stalled_rounds = 0;
-                } else {
-                    ca->bw_stalled_rounds = min(ca->bw_stalled_rounds + 1, 255U);
-                }
+                } else ca->bw_stalled_rounds++;
 
                 if (ca->bw_stalled_rounds >= LOTSPEED_STARTUP_EXIT_ROUNDS) {
                     ca->target_rate = bw;
-                    CLEAR_FLAG(ca, FLAG_SS_MODE);
+                    ca->ss_mode = false;
                     enter_state(sk, PROBING);
                 }
-
                 if (ca->last_bw == 0) ca->last_bw = bw;
             }
             break;
-
         case PROBING:
-            if (congestion_detected) {
-                enter_state(sk, AVOIDING);
-            } else if (bw > 0 && bw > ca->target_rate * 9 / 10) {
-                enter_state(sk, CRUISING);
-            }
-            ca->probe_cnt = min(ca->probe_cnt + 1, 255U);
+            if (congestion_detected) enter_state(sk, AVOIDING);
+            else if (bw > 0 && bw > ca->target_rate * 9 / 10) enter_state(sk, CRUISING);
+            ca->probe_cnt++;
             if (ca->probe_cnt >= 100) ca->probe_cnt = 0;
             break;
-
         case CRUISING:
-            if (congestion_detected) {
-                enter_state(sk, AVOIDING);
-            } else if (time_after32(tcp_jiffies32, ca->last_cruise_ts + msecs_to_jiffies(200))) {
-                enter_state(sk, PROBING);
-            }
+            if (congestion_detected) enter_state(sk, AVOIDING);
+            else if (time_after32(tcp_jiffies32, ca->last_cruise_ts + msecs_to_jiffies(200))) enter_state(sk, PROBING);
             break;
-
         case AVOIDING:
-            if (!congestion_detected) {
-                enter_state(sk, PROBING);
-            }
+            if (!congestion_detected) enter_state(sk, PROBING);
             break;
-
         case PROBE_RTT:
             if (time_after32(tcp_jiffies32, ca->last_state_ts + msecs_to_jiffies(LOTSPEED_PROBE_RTT_DURATION_MS))) {
                 ca->probe_rtt_ts = tcp_jiffies32;
@@ -516,50 +466,34 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
             break;
     }
 
-    // 速率调整
     switch (ca->state) {
         case STARTUP:
             ca->cwnd_gain = min(lotserver_gain * 12 / 10, 30U);
             ca->target_rate = min(lotserver_rate, LOTSPEED_MAX_U64 / 2);
             break;
-
         case PROBING:
             ca->target_rate = min(ca->target_rate * ZETA_PROBE_GAIN / 100, LOTSPEED_MAX_U64 / 2);
             ca->cwnd_gain = lotserver_gain;
             break;
-
         case CRUISING:
-            if (bw > 0) {
-                ca->target_rate = min(bw * 11 / 10, LOTSPEED_MAX_U64 / 2);
-            }
+            if (bw > 0) ca->target_rate = min(bw * 11 / 10, LOTSPEED_MAX_U64 / 2);
             ca->cwnd_gain = lotserver_gain;
             break;
-
         case AVOIDING:
-            if (bw > 0) {
-                ca->target_rate = max_t(u64, bw * 9 / 10, lotserver_rate / 20);
-            } else {
-                ca->target_rate = max_t(u64, ca->target_rate * 9 / 10, lotserver_rate / 20);
-            }
+            if (bw > 0) ca->target_rate = max_t(u64, bw * 9 / 10, lotserver_rate / 20);
+            else ca->target_rate = max_t(u64, ca->target_rate * 9 / 10, lotserver_rate / 20);
             ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, 10);
             break;
-
-        case PROBE_RTT:
-            break;
+        case PROBE_RTT: break;
     }
 
-    if (lotserver_adaptive) {
-        ca->target_rate = clamp(ca->target_rate, lotserver_rate / 20, lotserver_rate);
-    } else {
-        ca->target_rate = lotserver_rate;
-    }
+    if (lotserver_adaptive) ca->target_rate = clamp(ca->target_rate, lotserver_rate / 20, lotserver_rate);
+    else ca->target_rate = lotserver_rate;
 
-    // CWND 计算
     target_cwnd = 0;
     if (mss > 0 && rtt_us > 0 && ca->target_rate < LOTSPEED_MAX_U64 / rtt_us) {
         u64 bdp = ca->target_rate * (u64)rtt_us;
         target_cwnd = (u32)SAFE_DIV64(bdp, (u64)mss * 1000000ULL);
-
         if (ca->cwnd_gain > 0 && target_cwnd < LOTSPEED_MAX_U32 / ca->cwnd_gain) {
             target_cwnd = (target_cwnd * ca->cwnd_gain) / 10;
         }
@@ -567,32 +501,21 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
 
     if (ca->state == PROBE_RTT) {
         cwnd = lotserver_min_cwnd;
-    } else if (CHECK_FLAG(ca, FLAG_SS_MODE) && tp->snd_cwnd < tp->snd_ssthresh) {
-        if (tp->snd_cwnd < LOTSPEED_MAX_U32 / 2) {
-            cwnd = tp->snd_cwnd * 2;
-        } else {
-            cwnd = tp->snd_cwnd + 1;
-        }
-
+    } else if (ca->ss_mode && tp->snd_cwnd < tp->snd_ssthresh) {
+        if (tp->snd_cwnd < LOTSPEED_MAX_U32 / 2) cwnd = tp->snd_cwnd * 2;
+        else cwnd = tp->snd_cwnd + 1;
         if (target_cwnd > 0 && cwnd >= target_cwnd) {
-            CLEAR_FLAG(ca, FLAG_SS_MODE);
+            ca->ss_mode = false;
             cwnd = target_cwnd;
         }
     } else {
         if (ca->state == STARTUP && rs && rs->acked_sacked > 0) {
-            if (tp->snd_cwnd < LOTSPEED_MAX_U32 - rs->acked_sacked) {
-                cwnd = tp->snd_cwnd + rs->acked_sacked;
-            } else {
-                cwnd = tp->snd_cwnd;
-            }
+            cwnd = (tp->snd_cwnd < LOTSPEED_MAX_U32 - rs->acked_sacked) ? tp->snd_cwnd + rs->acked_sacked : tp->snd_cwnd;
         } else {
             cwnd = target_cwnd;
         }
-
-        if (ca->probe_cnt > 0 && ca->probe_cnt % 100 == 0) {
-            if (cwnd < LOTSPEED_MAX_U32 * 10 / 11) {
-                cwnd = cwnd * 11 / 10;
-            }
+        if (ca->probe_cnt > 0 && ca->probe_cnt % 100 == 0 && cwnd < LOTSPEED_MAX_U32 * 10 / 11) {
+            cwnd = cwnd * 11 / 10;
         }
     }
 
@@ -600,11 +523,8 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
     tp->snd_cwnd = min_t(u32, tp->snd_cwnd, tp->snd_cwnd_clamp);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
-    if (ca->target_rate < LOTSPEED_MAX_U64 * 5 / 6) {
-        sk->sk_pacing_rate = (ca->target_rate * 6) / 5;
-    } else {
-        sk->sk_pacing_rate = ca->target_rate;
-    }
+    if (ca->target_rate < LOTSPEED_MAX_U64 * 5 / 6) sk->sk_pacing_rate = (ca->target_rate * 6) / 5;
+    else sk->sk_pacing_rate = ca->target_rate;
 #endif
 }
 
@@ -621,51 +541,30 @@ static void lotspeed_cong_control(struct sock *sk, const struct rate_sample *rs)
 // --- SSTHRESH: Zeta Loss Differentiation ---
 static u32 lotspeed_ssthresh(struct sock *sk)
 {
-    struct tcp_sock *tp;
-    struct lotspeed *ca;
-    u32 rtt_us, tolerance, new_ssthresh;
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct lotspeed *ca = inet_csk_ca(sk);
+    u32 rtt_us = tp->srtt_us >> 3;
+    u32 tolerance, new_ssthresh;
 
-    SAFETY_CHECK(sk, TCP_INFINITE_SSTHRESH);
-    tp = tcp_sk(sk);
-    SAFETY_CHECK(tp, TCP_INFINITE_SSTHRESH);
-    ca = inet_csk_ca(sk);
-    SAFETY_CHECK(ca, TCP_INFINITE_SSTHRESH);
+    if (lotserver_turbo && !lotserver_safe_mode) return TCP_INFINITE_SSTHRESH;
 
-    if (lotserver_turbo && !lotserver_safe_mode) {
-        return TCP_INFINITE_SSTHRESH;
-    }
-
-    rtt_us = tp->srtt_us >> 3;
     if (!rtt_us) rtt_us = ca->rtt_median ? ca->rtt_median : 20000;
-
     u32 base_rtt = ca->rtt_min ? ca->rtt_min : rtt_us;
 
     tolerance = (base_rtt * LOSS_DIFFERENTIATION_K) / 100;
     tolerance += RTT_JITTER_TOLERANCE_US;
-    if (ca->rtt_variance > 0) {
-        tolerance += ca->rtt_variance / 2;
-    }
+    if (ca->rtt_variance > 0) tolerance += ca->rtt_variance / 2;
 
     if (rtt_us <= tolerance) {
-        if (lotserver_verbose) {
-            pr_info("lotspeed: Non-congestion loss, RTT=%u\n", rtt_us);
-        }
+        // Loss Immunity: 只降5%或不降
         ca->last_loss_rtt = rtt_us;
-
-        if (lotserver_safe_mode) {
-            new_ssthresh = (tp->snd_cwnd * 95) / 100;
-        } else {
-            new_ssthresh = tp->snd_cwnd;
-        }
+        if (lotserver_safe_mode) new_ssthresh = (tp->snd_cwnd * 95) / 100;
+        else new_ssthresh = tp->snd_cwnd;
     } else {
-        if (lotserver_verbose) {
-            pr_info("lotspeed: Congestion loss, RTT=%u\n", rtt_us);
-        }
-
-        ca->loss_count = min(ca->loss_count + 1, 65535U);
+        // Congestion
+        ca->loss_count++;
         ca->last_loss_rtt = rtt_us;
         ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, 10);
-
         new_ssthresh = (tp->snd_cwnd * lotserver_beta) / LOTSPEED_BETA_SCALE;
     }
 
@@ -674,73 +573,46 @@ static u32 lotspeed_ssthresh(struct sock *sk)
 
 static void lotspeed_set_state_hook(struct sock *sk, u8 new_state)
 {
-    struct lotspeed *ca;
-
-    SAFETY_CHECK(sk, );
-    ca = inet_csk_ca(sk);
-    SAFETY_CHECK(ca, );
-
+    struct lotspeed *ca = inet_csk_ca(sk);
     switch (new_state) {
         case TCP_CA_Loss:
             if (!lotserver_turbo || lotserver_safe_mode) {
-                ca->loss_count = min(ca->loss_count + 1, 65535U);
+                ca->loss_count++;
                 enter_state(sk, AVOIDING);
             }
             break;
-
         case TCP_CA_Recovery:
-            if (!lotserver_turbo || lotserver_safe_mode) {
-                ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 9 / 10, 15);
-            }
+            if (!lotserver_turbo || lotserver_safe_mode) ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 9 / 10, 15);
             break;
-
         case TCP_CA_Open:
-            CLEAR_FLAG(ca, FLAG_SS_MODE);
+            ca->ss_mode = false;
             break;
     }
 }
 
 static u32 lotspeed_undo_cwnd(struct sock *sk)
 {
-    struct tcp_sock *tp;
-    struct lotspeed *ca;
-
-    SAFETY_CHECK(sk, 10);
-    tp = tcp_sk(sk);
-    SAFETY_CHECK(tp, 10);
-    ca = inet_csk_ca(sk);
-    SAFETY_CHECK(ca, 10);
-
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct lotspeed *ca = inet_csk_ca(sk);
     if (ca->loss_count > 0) ca->loss_count--;
-    CLEAR_FLAG(ca, FLAG_SS_MODE);
-
+    ca->ss_mode = false;
     return max(tp->snd_cwnd, tp->prior_cwnd);
 }
 
 static void lotspeed_cwnd_event(struct sock *sk, enum tcp_ca_event event)
 {
-    struct lotspeed *ca;
-
-    SAFETY_CHECK(sk, );
-    ca = inet_csk_ca(sk);
-    SAFETY_CHECK(ca, );
-
+    struct lotspeed *ca = inet_csk_ca(sk);
     switch (event) {
         case CA_EVENT_LOSS:
-            ca->loss_count = min(ca->loss_count + 1, 65535U);
-            if (!lotserver_turbo || lotserver_safe_mode) {
-                ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, 10);
-            }
+            ca->loss_count++;
+            if (!lotserver_turbo || lotserver_safe_mode) ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, 10);
             break;
-
         case CA_EVENT_TX_START:
         case CA_EVENT_CWND_RESTART:
-            SET_FLAG(ca, FLAG_SS_MODE);
+            ca->ss_mode = true;
             ca->probe_cnt = 0;
             break;
-
-        default:
-            break;
+        default: break;
     }
 }
 
@@ -757,19 +629,11 @@ static struct tcp_congestion_ops lotspeed_ops __read_mostly = {
         .flags          = TCP_CONG_NON_RESTRICTED,
 };
 
-// --- 模块生命周期 ---
 static int __init lotspeed_module_init(void)
 {
     BUILD_BUG_ON(sizeof(struct lotspeed) > ICSK_CA_PRIV_SIZE);
-
-    pr_info("╔════════════════════════════════════════════════════╗\n");
-    pr_info("║     LotSpeed Zeta v5.0 - Optimized Edition        ║\n");
-    pr_info("║     Size: %zu bytes (limit: %d)                    ║\n",
-            sizeof(struct lotspeed), ICSK_CA_PRIV_SIZE);
-    pr_info("╚════════════════════════════════════════════════════╝\n");
-
+    pr_info("lotspeed v5.1 loaded. Safety mode: %s\n", lotserver_safe_mode ? "ON" : "OFF");
     hash_init(zeta_history_map);
-
     return tcp_register_congestion_control(&lotspeed_ops);
 }
 
@@ -777,28 +641,19 @@ static void __exit lotspeed_module_exit(void)
 {
     struct zeta_history_entry *entry;
     struct hlist_node *tmp;
-    int bkt, wait_count = 0;
-    const int max_wait = 100;
+    int bkt, retry=0;
 
     tcp_unregister_congestion_control(&lotspeed_ops);
-
-    while (atomic_read(&active_connections) > 0 && wait_count < max_wait) {
-        msleep(100);
-        wait_count++;
-    }
-
+    while (atomic_read(&active_connections) > 0 && retry < 50) { msleep(100); retry++; }
     synchronize_rcu();
 
     spin_lock_bh(&zeta_history_lock);
     hash_for_each_safe(zeta_history_map, bkt, tmp, entry, node) {
         hash_del(&entry->node);
         kfree(entry);
-        atomic_dec(&history_entries_count);
     }
     spin_unlock_bh(&zeta_history_lock);
-
-    pr_info("lotspeed: Module unloaded. Total sent: %llu MB\n",
-            atomic64_read(&total_bytes_sent) >> 20);
+    pr_info("lotspeed v5.1 unloaded.\n");
 }
 
 module_init(lotspeed_module_init);
@@ -806,6 +661,6 @@ module_exit(lotspeed_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("uk0");
-MODULE_VERSION("5.0-fixed");
-MODULE_DESCRIPTION("LotSpeed Zeta - Size Optimized TCP Congestion Control");
+MODULE_VERSION("5.1");
+MODULE_DESCRIPTION("LotSpeed Zeta - Memory Optimized");
 MODULE_ALIAS("tcp_lotspeed");

@@ -1,14 +1,13 @@
 /*
- * lotspeed_zeta_v5_9.c
- * "公路超跑" Zeta-TCP - 不死鸟版 (Immortal Edition)
+ * lotspeed_zeta_v5_6.c
+ * "公路超跑" Zeta-TCP - 自适应攀升版 (Auto-Scaling Edition)
  * Author: uk0 (Fixed by Gemini)
  *
  * Feature:
- * 1. Soft Start & Auto Scaling: Starts safe, climbs fast.
- * 2. Immortal Logic: IGNORES gain reduction during TCP Recovery (Crucial for high loss).
- * 3. Global Cap: Individual connection rate never exceeds 'lotserver_rate'.
- * 4. Smart Guard: Loss Rate Cap & BDP Cap.
- * 5. Bulldozer Mode: Forced climbing when speed is below floor.
+ * 1. Soft Start: New connections start at 'lotserver_start_rate' (default ~50Mbps) to protect low-bandwidth clients.
+ * 2. Auto Scaling: Automatically climbs up if the pipe is healthy, finding the true bottleneck.
+ * 3. Global Cap: Individual connection rate never exceeds 'lotserver_rate' (1Gbps).
+ * 4. Smart Guard: Includes Loss Rate Cap & BDP Cap from v5.3/v5.4.
  */
 
 #include <linux/module.h>
@@ -60,9 +59,9 @@
 #define ZETA_MIN_SAMPLES 10
 
 // --- 保护阈值 (Smart Guard) ---
-#define LOSS_RATE_CAP_PERCENT 25     // [v5.9] 容忍 25% 丢包
-#define BDP_CAP_SCALE 4              // [v5.9] BDP 上限提升至 4 倍 (抗丢包需要更大窗口)
-#define PACKET_HISTORY_WIN 512       // [v5.9] 更大的统计窗口
+#define LOSS_RATE_CAP_PERCENT 15     // 丢包率熔断阈值
+#define BDP_CAP_SCALE 3 4            // BDP 上限倍数
+#define PACKET_HISTORY_WIN 512       // 滑动窗口大小
 
 // --- BBR/LotSpeed 参数 ---
 #define LOTSPEED_BETA_SCALE 1024
@@ -83,14 +82,12 @@
 // --- 模块参数 ---
 // 1. 全局物理上限 (1Gbps = 125MB/s)
 static unsigned long lotserver_rate = 125000000;
-// 2. 软启动速率
-static unsigned long lotserver_start_rate = 6250000;
-// 3. [新增] 保底速率 (默认为启动速率的一半，约25Mbps)
-static unsigned long lotserver_min_rate = 3125000;
+// 2. [新增] 软启动速率 (50Mbps = 6.25MB/s) - 保护小水管
+static unsigned long lotserver_start_rate = 12500000;
 
 static unsigned int lotserver_gain = 20;
-static unsigned int lotserver_min_cwnd = 32; // [v5.9] 稍微调大
-static unsigned int lotserver_max_cwnd = 30000; // [v5.9] 放宽最大窗口
+static unsigned int lotserver_min_cwnd = 16;
+static unsigned int lotserver_max_cwnd = 15000; // 稍微放宽，因为有BDP Cap保护
 static unsigned int lotserver_beta = 717;
 static bool lotserver_adaptive = true;
 static bool lotserver_turbo = false;
@@ -130,8 +127,7 @@ static const struct kernel_param_ops param_ops_turbo = { .set = param_set_turbo,
 static const struct kernel_param_ops param_ops_beta = { .set = param_set_beta, .get = param_get_uint, };
 
 module_param_cb(lotserver_rate, &param_ops_rate, &lotserver_rate, 0644);
-module_param_cb(lotserver_start_rate, &param_ops_rate, &lotserver_start_rate, 0644);
-module_param_cb(lotserver_min_rate, &param_ops_rate, &lotserver_min_rate, 0644); // [新增]
+module_param_cb(lotserver_start_rate, &param_ops_rate, &lotserver_start_rate, 0644); // 新增
 module_param_cb(lotserver_gain, &param_ops_gain, &lotserver_gain, 0644);
 module_param_cb(lotserver_min_cwnd, &param_ops_min_cwnd, &lotserver_min_cwnd, 0644);
 module_param_cb(lotserver_max_cwnd, &param_ops_max_cwnd, &lotserver_max_cwnd, 0644);
@@ -183,27 +179,37 @@ static const char* state_to_str(enum lotspeed_state state) {
     }
 }
 
-// --- 私有数据结构 ---
+// --- 私有数据结构 (内存优化版) ---
 struct lotspeed {
+    // 1. 8字节对齐字段 (u64)
     u64 target_rate;
     u64 actual_rate;
     u64 last_bw;
+
+    // 2. 4字节对齐字段 (u32, enum)
     u32 cwnd_gain;
     u32 last_state_ts;
     u32 probe_rtt_ts;
     u32 last_cruise_ts;
+
     u32 rtt_min;
     u32 rtt_median;
     u32 rtt_cnt;
     u32 loss_count;
+
     u32 bw_stalled_rounds;
     u32 probe_cnt;
     u32 rtt_variance;
     u32 last_loss_rtt;
     u32 sample_count;
+
+    // 丢包率统计
     u32 packet_window_count;
     u32 loss_window_count;
+
     enum lotspeed_state state;
+
+    // 3. 1字节对齐字段 (bool)
     bool ss_mode;
     bool history_hit;
 };
@@ -316,6 +322,7 @@ static void lotspeed_init(struct sock *sk)
     ca->probe_rtt_ts = tcp_jiffies32;
 
     // --- v5.6: 软启动 (Soft Start) ---
+    // 不再直接使用 lotserver_rate (1Gbps)，而是使用 start_rate (50Mbps)
     ca->target_rate = lotserver_start_rate;
 
     ca->cwnd_gain = lotserver_gain;
@@ -333,15 +340,22 @@ static void lotspeed_init(struct sock *sk)
 
     atomic_inc(&active_connections);
 
-    // Zeta Learning
+    // Zeta Learning: 如果有历史记录，则根据历史记录设置起始速度
     rcu_read_lock();
     history = find_history_safe(daddr);
     if (history && history->sample_count >= ZETA_MIN_SAMPLES) {
         u64 age_ms = jiffies_to_msecs(get_jiffies_64() - history->last_update);
         if (age_ms < HISTORY_TTL_SEC * 1000ULL && history->cached_bw > 0) {
+            // 使用历史带宽，但也受限于 global rate
             u64 learned_rate = (history->cached_bw * ZETA_ALPHA) / 100;
-            if (learned_rate > ca->target_rate) ca->target_rate = learned_rate;
-            if (ca->target_rate > lotserver_rate) ca->target_rate = lotserver_rate;
+
+            // 如果历史速度 > start_rate，则提升，但不超过 global rate
+            if (learned_rate > ca->target_rate) {
+                ca->target_rate = learned_rate;
+            }
+            if (ca->target_rate > lotserver_rate) {
+                ca->target_rate = lotserver_rate;
+            }
 
             ca->rtt_min = history->cached_min_rtt;
             ca->rtt_median = history->cached_median_rtt;
@@ -421,50 +435,45 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
     lotspeed_update_rtt(sk, rtt_us);
     if (!rtt_us) rtt_us = 1000;
 
-    if (rs && rs->delivered > 0) {
-        if (rs->interval_us > 0) {
-            bw = (u64)rs->delivered * USEC_PER_SEC;
-            bw = SAFE_DIV64(bw, (u64)rs->interval_us);
-            ca->actual_rate = bw;
-        }
-        // v5.9: 增大窗口以获得更平滑的丢包率
+    if (rs && rs->delivered > 0 && rs->interval_us > 0) {
+        bw = (u64)rs->delivered * USEC_PER_SEC;
+        bw = SAFE_DIV64(bw, (u64)rs->interval_us);
+        ca->actual_rate = bw;
+
         ca->packet_window_count += (rs->delivered + rs->losses);
         ca->loss_window_count += rs->losses;
+
         if (ca->packet_window_count > PACKET_HISTORY_WIN) {
             ca->packet_window_count >>= 1;
             ca->loss_window_count >>= 1;
         }
     }
 
-    // --- 丢包率计算 ---
-    bool high_loss = false;
-    if (ca->packet_window_count > 100) {
-        if (SAFE_DIV(ca->loss_window_count * 100, ca->packet_window_count) > LOSS_RATE_CAP_PERCENT)
-            high_loss = true;
-    }
+    // --- v5.6: 自适应攀升逻辑 (Auto-Scaling) ---
+    if (bw > 0) {
+        // 1. 如果实际带宽跑满了当前目标 (说明还有余力)
+        // 且 没到拥塞阶段
+        if (bw >= ca->target_rate * 8 / 10 && ca->state != AVOIDING) {
+            // 缓慢攀升：每次增加 5%
+            u64 next_rate = ca->target_rate * 105 / 100;
 
-    // --- v5.9 Auto-Scaling: 推土机逻辑 ---
-    // 1. 强制保底攀升 (Forced Climb): 如果当前连保底速率都跑不到，无视丢包，强行加码
-    if (ca->target_rate < lotserver_min_rate) {
-        // 每次加 10% 的保底速度，快速拉起
-        ca->target_rate += (lotserver_min_rate / 10);
-    }
-        // 2. 正常攀升: 只要实际带宽跑得不错 (70%)，且没触发严重熔断
-    else if (bw > 0 && bw >= ca->target_rate * 7 / 10 && !high_loss) {
-        // 标准模式: 乘性增加
-        ca->target_rate = ca->target_rate * 105 / 100;
-    }
+            // 封顶：绝对不超过 1Gbps (lotserver_rate)
+            if (next_rate > lotserver_rate) next_rate = lotserver_rate;
 
-    // 3. 降速保护: 只有在严重丢包(>25%) 且 速度很高时才降
-    // v5.9: 将降速条件放宽到 2倍 min_rate
-    if (high_loss && ca->target_rate > lotserver_min_rate * 2) {
-        // 缓慢收敛，而不是直接砍半
-        ca->target_rate = (ca->target_rate * 95) / 100;
-    }
+            ca->target_rate = next_rate;
+        }
 
-    // 硬性限制
-    if (ca->target_rate < lotserver_min_rate) ca->target_rate = lotserver_min_rate;
-    if (ca->target_rate > lotserver_rate) ca->target_rate = lotserver_rate;
+        // 2. 如果实际带宽远低于目标 (例如客户端只有100M，我们设了500M)
+        // 且发生了严重丢包或延迟
+        if (bw < ca->target_rate / 2 && ca->loss_window_count > 0) {
+            // 收敛：将目标速率下调，靠近真实速率
+            ca->target_rate = (ca->target_rate * 9 + bw) / 10;
+        }
+
+        // 3. 兜底：不能低于 start_rate 的一半
+        if (ca->target_rate < lotserver_start_rate / 2)
+            ca->target_rate = lotserver_start_rate / 2;
+    }
     // --------------------------------------
 
     if (!lotserver_turbo || lotserver_safe_mode) {
@@ -484,6 +493,7 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
         case STARTUP:
             if (congestion_detected) enter_state(sk, AVOIDING);
             else if (bw > 0) {
+                // 这里的逻辑改为依赖 target_rate 的攀升
                 if (ca->target_rate > lotserver_start_rate * 2) {
                     ca->ss_mode = false;
                     enter_state(sk, PROBING);
@@ -511,12 +521,13 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
             break;
     }
 
-    // v5.9 [CRITICAL]: 即使在 AVOIDING/Recovery 状态，也不降增益
-    // 只有当检测到 High Loss (>25%) 时才允许降一点
-    if (high_loss) {
-        ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, 10);
-    } else {
-        ca->cwnd_gain = lotserver_gain; // 死守 2.0x
+    // v5.6: 速率调整逻辑已经前置到 Auto-Scaling 部分，这里只需微调 gain
+    switch (ca->state) {
+        case STARTUP: ca->cwnd_gain = min(lotserver_gain * 12 / 10, 30U); break;
+        case PROBING: ca->cwnd_gain = lotserver_gain; break;
+        case CRUISING: ca->cwnd_gain = lotserver_gain; break;
+        case AVOIDING: ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, 10); break;
+        case PROBE_RTT: break;
     }
 
     // BDP 计算与窗口限制
@@ -529,23 +540,12 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
         }
     }
 
-    // --- BDP Cap v5.9 ---
-    // 计算保底窗口 (Min Rate Window)
-    // 确保窗口至少能跑满 min_rate
+    // --- BDP Cap (Smart Guard) ---
     if (target_cwnd > 0) {
-        u64 min_rate_bytes = (u64)lotserver_min_rate * (u64)rtt_us;
-        u32 min_rate_cwnd = (u32)SAFE_DIV64(min_rate_bytes, (u64)mss * 1000000ULL);
-        if (min_rate_cwnd < 16) min_rate_cwnd = 16;
-
-        // 确保不低于保底
-        if (target_cwnd < min_rate_cwnd) target_cwnd = min_rate_cwnd;
-
-        // BDP 上限: v5.9 提升至 4 倍 (抗丢包)
         u64 bdp_bytes = ca->target_rate * (u64)rtt_us;
         u32 bdp_pkts = (u32)SAFE_DIV64(bdp_bytes, (u64)mss * 1000000ULL);
         u32 max_safe_cwnd = bdp_pkts * BDP_CAP_SCALE;
-
-        if (max_safe_cwnd < 32) max_safe_cwnd = 32;
+        if (max_safe_cwnd < 16) max_safe_cwnd = 16;
         if (target_cwnd > max_safe_cwnd) target_cwnd = max_safe_cwnd;
     }
     // ---------------------------
@@ -574,8 +574,13 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
     tp->snd_cwnd = min_t(u32, tp->snd_cwnd, tp->snd_cwnd_clamp);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
-    // Pacing: v5.9 更激进的 1.3x
-    sk->sk_pacing_rate = (ca->target_rate * 130) / 100;
+    if (ca->state == AVOIDING) {
+        sk->sk_pacing_rate = ca->target_rate;
+    } else {
+        // 1.2x Pacing
+        if (ca->target_rate < LOTSPEED_MAX_U64 * 5 / 6) sk->sk_pacing_rate = (ca->target_rate * 6) / 5;
+        else sk->sk_pacing_rate = ca->target_rate;
+    }
 #endif
 }
 
@@ -615,26 +620,45 @@ static u32 lotspeed_ssthresh(struct sock *sk)
     tolerance += RTT_JITTER_TOLERANCE_US;
     if (ca->rtt_variance > 0) tolerance += ca->rtt_variance / 2;
 
-    // v5.9: 免疫逻辑增强
-    // 只要没到 25% 丢包，或者速度还在保底线以下，就绝不降速
-    if (!high_loss || ca->target_rate < lotserver_min_rate * 2) {
-        return tp->snd_cwnd;
+    if (rtt_us <= tolerance && !high_loss_detected) {
+        // Loss Immunity
+        ca->last_loss_rtt = rtt_us;
+        if (lotserver_safe_mode) new_ssthresh = (tp->snd_cwnd * 95) / 100;
+        else new_ssthresh = tp->snd_cwnd;
+    } else {
+        // Congestion
+        ca->loss_count++;
+        ca->last_loss_rtt = rtt_us;
+
+        if (high_loss_detected) {
+            ca->cwnd_gain = 10;
+            new_ssthresh = max(tp->snd_cwnd >> 1, 10U);
+        } else {
+            ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, 10);
+            new_ssthresh = (tp->snd_cwnd * lotserver_beta) / LOTSPEED_BETA_SCALE;
+        }
     }
 
-    // 只有在高速且严重丢包时，才进行拥塞控制
-    ca->loss_count++;
-    ca->last_loss_rtt = rtt_us;
-
-    // 即使降速也比较温和 (0.9x)
-    new_ssthresh = (tp->snd_cwnd * 9) / 10;
-    return max(new_ssthresh, lotserver_min_cwnd);
+    return max_t(u32, new_ssthresh, lotserver_min_cwnd);
 }
 
 static void lotspeed_set_state_hook(struct sock *sk, u8 new_state)
 {
     struct lotspeed *ca = inet_csk_ca(sk);
-    // v5.9 [CRITICAL]: 不在状态切换时降 gain
-    // 保持全速，直到 ssthresh 决定降速
+    switch (new_state) {
+        case TCP_CA_Loss:
+            if (!lotserver_turbo || lotserver_safe_mode) {
+                ca->loss_count++;
+                enter_state(sk, AVOIDING);
+            }
+            break;
+        case TCP_CA_Recovery:
+            if (!lotserver_turbo || lotserver_safe_mode) ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 9 / 10, 15);
+            break;
+        case TCP_CA_Open:
+            ca->ss_mode = false;
+            break;
+    }
 }
 
 static u32 lotspeed_undo_cwnd(struct sock *sk)
@@ -649,7 +673,18 @@ static u32 lotspeed_undo_cwnd(struct sock *sk)
 static void lotspeed_cwnd_event(struct sock *sk, enum tcp_ca_event event)
 {
     struct lotspeed *ca = inet_csk_ca(sk);
-    // v5.9: 不在事件中降 gain
+    switch (event) {
+        case CA_EVENT_LOSS:
+            ca->loss_count++;
+            if (!lotserver_turbo || lotserver_safe_mode) ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, 10);
+            break;
+        case CA_EVENT_TX_START:
+        case CA_EVENT_CWND_RESTART:
+            ca->ss_mode = true;
+            ca->probe_cnt = 0;
+            break;
+        default: break;
+    }
 }
 
 static struct tcp_congestion_ops lotspeed_ops __read_mostly = {
@@ -669,7 +704,7 @@ static int __init lotspeed_module_init(void)
 {
     BUILD_BUG_ON(sizeof(struct lotspeed) > ICSK_CA_PRIV_SIZE);
 
-    pr_info("lotspeed v5.9 (Immortal) loaded.\n");
+    pr_info("lotspeed v5.6 (Auto-Scaling) loaded.\n");
     pr_info("Struct size: %u bytes (limit: %u)\n",
             (unsigned int)sizeof(struct lotspeed),
             (unsigned int)ICSK_CA_PRIV_SIZE);
@@ -694,7 +729,7 @@ static void __exit lotspeed_module_exit(void)
         kfree(entry);
     }
     spin_unlock_bh(&zeta_history_lock);
-    pr_info("lotspeed v5.9 unloaded.\n");
+    pr_info("lotspeed v5.6 unloaded.\n");
 }
 
 module_init(lotspeed_module_init);
@@ -702,6 +737,6 @@ module_exit(lotspeed_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("uk0");
-MODULE_VERSION("5.9");
-MODULE_DESCRIPTION("LotSpeed Zeta - Immortal Edition");
+MODULE_VERSION("5.6");
+MODULE_DESCRIPTION("LotSpeed Zeta - Auto-Scaling Edition");
 MODULE_ALIAS("tcp_lotspeed");

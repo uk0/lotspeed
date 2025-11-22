@@ -59,9 +59,9 @@
 #define ZETA_MIN_SAMPLES 10
 
 // --- 保护阈值 (Smart Guard) ---
-#define LOSS_RATE_CAP_PERCENT 15     // 丢包率熔断阈值 (15%)
-#define BDP_CAP_SCALE 3              // BDP 上限倍数 (v5.4 fix: 3x BDP)
-#define PACKET_HISTORY_WIN 128       // 滑动窗口大小
+#define LOSS_RATE_CAP_PERCENT 15     // 丢包率熔断阈值
+#define BDP_CAP_SCALE 3 4            // BDP 上限倍数
+#define PACKET_HISTORY_WIN 512       // 滑动窗口大小
 
 // --- BBR/LotSpeed 参数 ---
 #define LOTSPEED_BETA_SCALE 1024
@@ -83,7 +83,7 @@
 // 1. 全局物理上限 (1Gbps = 125MB/s)
 static unsigned long lotserver_rate = 125000000;
 // 2. [新增] 软启动速率 (50Mbps = 6.25MB/s) - 保护小水管
-static unsigned long lotserver_start_rate = 6250000;
+static unsigned long lotserver_start_rate = 12500000;
 
 static unsigned int lotserver_gain = 20;
 static unsigned int lotserver_min_cwnd = 16;

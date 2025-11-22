@@ -82,8 +82,8 @@
 // --- 模块参数 ---
 // 1. 全局物理上限 (1Gbps = 125MB/s)
 static unsigned long lotserver_rate = 125000000;
-// 2. [新增] 软启动速率 (50Mbps = 6.25MB/s) - 保护小水管
-static unsigned long lotserver_start_rate = 6250000;
+// 2. [新增] 软启动速率 (80Mbps = 10.00MB/s) - 保护小水管
+static unsigned long lotserver_start_rate = 1000000;
 
 static unsigned int lotserver_gain = 20;
 static unsigned int lotserver_min_cwnd = 16;

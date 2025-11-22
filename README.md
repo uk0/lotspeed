@@ -1,4 +1,4 @@
-### lotspeed 开心版
+### lotspeed zeta-tcp
 
 <div align=center>
     <img src="https://github.com/uk0/lotspeed/blob/main/img.png" width="400" height="400" />
@@ -7,6 +7,7 @@
 
 ### branch explanation
 
+* `zeta-tcp`: lotspeed zeta-tcp 参考AppEx Networking TCP算法优化版本
 * `main`: lotspeed 自动优化版本最新版
 * `v2.1`: lotspeed 暴力版本
 * `v3.1`: lotspeed 最小优化算法版本
@@ -18,9 +19,9 @@
 
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/zeta-tcp/install.sh | sudo bash
 #   or
-wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/main/install.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/zeta-tcp/install.sh | sudo bash
 ```
 
 

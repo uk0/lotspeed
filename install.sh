@@ -736,6 +736,25 @@ SCRIPT_EOF
     log_success "Management script created at /usr/local/bin/lotspeed"
 }
 
+print_kv_row() {
+    local key="$1"
+    local val="$2"
+    local color="${3:-$CYAN}"
+
+    local key_width=$(get_width "$key")
+    local val_width=$(get_width "$val")
+
+    # 左右各1空格Padding + 中间
+    local available=$((BOX_WIDTH - 4))
+    local padding=$((available - key_width - val_width))
+
+    [ $padding -lt 1 ] && padding=1
+
+    echo -ne "${color}║${NC} $key"
+    repeat_char " " $padding
+    echo -e "$val ${color}║${NC}"
+}
+
 # ================= 结尾显示 =================
 show_info() {
     echo ""

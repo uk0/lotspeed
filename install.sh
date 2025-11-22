@@ -248,6 +248,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
 WHITE='\033[1;37m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 # 格式化函数
@@ -278,6 +279,44 @@ format_bps() {
     fi
 }
 
+# 计算显示宽度（考虑中文和emoji占2个字符宽度）
+calc_display_width() {
+    local str="$1"
+    # 移除所有ANSI颜色代码
+    str=$(printf "%b" "$str" | sed -E 's/\x1b\[[0-9;]*m//g')
+
+    local width=0
+    local len=${#str}
+
+    for ((i=0; i<len; i++)); do
+        local char="${str:$i:1}"
+        if [ -z "$char" ]; then
+            continue
+        fi
+        local ord=$(LC_CTYPE=C printf '%d' "'$char" 2>/dev/null || echo 128)
+
+        # ASCII可打印字符 (32-126) 宽度为1，其他为2
+        if [ "$ord" -ge 32 ] && [ "$ord" -le 126 ]; then
+            width=$((width + 1))
+        else
+            width=$((width + 2))
+        fi
+    done
+
+    echo $width
+}
+
+# 生成指定数量的空格
+spaces() {
+    printf '%*s' "$1" ''
+}
+
+# 生成分隔线
+generate_line() {
+    local width=$1
+    printf '─%.0s' $(seq 1 $width)
+}
+
 # 获取系统默认的拥塞控制算法
 get_default_congestion_control() {
     AVAILABLE=$(sysctl net.ipv4.tcp_available_congestion_control | awk -F= '{print $2}')
@@ -293,30 +332,56 @@ get_default_congestion_control() {
 }
 
 show_status() {
-    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║               LotSpeed v$VERSION Status (Zeta-TCP)                    ║${NC}"
-    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}${BOLD}╔═══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║               LotSpeed v$VERSION Status (Zeta-TCP)                    ║${NC}"
+    echo -e "${CYAN}${BOLD}╚═══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
+
+    # 准备数据
+    declare -a labels
+    declare -a values
 
     # 检查模块是否加载
     if lsmod | grep -q lotspeed; then
-        printf "  %-24s : ${GREEN}● Loaded${NC}\n" "Module Status"
+        labels+=("Module Status")
+        values+=("${GREEN}● Loaded${NC}")
+
         REF_COUNT=$(lsmod | grep lotspeed | awk '{print $3}')
-        printf "  %-24s : ${CYAN}%s${NC}\n" "Reference Count" "$REF_COUNT"
+        labels+=("Reference Count")
+        values+=("${CYAN}$REF_COUNT${NC}")
+
         ACTIVE_CONNS=$(ss -tin 2>/dev/null | grep -c lotspeed 2>/dev/null || echo "0")
-        printf "  %-24s : ${CYAN}%s${NC}\n" "Active Connections" "$ACTIVE_CONNS"
+        labels+=("Active Connections")
+        values+=("${CYAN}$ACTIVE_CONNS${NC}")
     else
-        printf "  %-24s : ${RED}○ Not Loaded${NC}\n" "Module Status"
+        labels+=("Module Status")
+        values+=("${RED}○ Not Loaded${NC}")
+        echo ""
+        echo -e "  Module Status      : ${RED}○ Not Loaded${NC}"
         return
     fi
 
     # 检查是否为当前算法
     CURRENT=$(sysctl -n net.ipv4.tcp_congestion_control)
     if [[ "$CURRENT" == "lotspeed" ]]; then
-        printf "  %-24s : ${GREEN}lotspeed ✓${NC}\n" "Active Algorithm"
+        labels+=("Active Algorithm")
+        values+=("${GREEN}lotspeed ✓${NC}")
     else
-        printf "  %-24s : ${YELLOW}%s${NC}\n" "Active Algorithm" "$CURRENT"
+        labels+=("Active Algorithm")
+        values+=("${YELLOW}$CURRENT${NC}")
     fi
+
+    # 计算最大宽度
+    max_label_width=0
+    for label in "${labels[@]}"; do
+        width=$(calc_display_width "$label")
+        [ $width -gt $max_label_width ] && max_label_width=$width
+    done
+
+    # 打印基本状态
+    for i in "${!labels[@]}"; do
+        printf "  %-${max_label_width}s : %b\n" "${labels[$i]}" "${values[$i]}"
+    done
 
     echo ""
     echo -e "${CYAN}  ┌───────────────────────────────────────────────────────────────┐${NC}"
@@ -324,7 +389,10 @@ show_status() {
     echo -e "${CYAN}  ├───────────────────────────────────────────────────────────────┤${NC}"
 
     if [[ -d /sys/module/lotspeed/parameters ]]; then
-        # 读取所有参数
+        # 收集参数数据
+        declare -a param_labels
+        declare -a param_values
+
         for param in lotserver_rate lotserver_start_rate lotserver_gain lotserver_min_cwnd \
                      lotserver_max_cwnd lotserver_beta lotserver_adaptive lotserver_turbo \
                      lotserver_verbose lotserver_safe_mode; do
@@ -335,58 +403,98 @@ show_status() {
                     lotserver_rate)
                         formatted=$(format_bytes $value)
                         bps=$(format_bps $value)
-                        printf "  │ %-22s : %-40s │\n" "Global Rate Limit" "$formatted ($bps)"
+                        param_labels+=("Global Rate Limit")
+                        param_values+=("$formatted ($bps)")
                         ;;
                     lotserver_start_rate)
                         formatted=$(format_bytes $value)
                         bps=$(format_bps $value)
-                        printf "  │ %-22s : %-40s │\n" "Soft Start Rate" "$formatted ($bps)"
+                        param_labels+=("Soft Start Rate")
+                        param_values+=("$formatted ($bps)")
                         ;;
                     lotserver_gain)
                         gain_x=$((value / 10))
                         gain_frac=$((value % 10))
-                        printf "  │ %-22s : %-40s │\n" "Gain Factor" "${gain_x}.${gain_frac}x"
+                        param_labels+=("Gain Factor")
+                        param_values+=("${gain_x}.${gain_frac}x")
                         ;;
                     lotserver_beta)
                         beta_val=$((value * 100 / 1024))
-                        printf "  │ %-22s : %-40s │\n" "Fairness (Beta)" "${beta_val}%"
+                        param_labels+=("Fairness (Beta)")
+                        param_values+=("${beta_val}%")
                         ;;
                     lotserver_min_cwnd)
-                        printf "  │ %-22s : %-40s │\n" "Min CWND" "$value packets"
+                        param_labels+=("Min CWND")
+                        param_values+=("$value packets")
                         ;;
                     lotserver_max_cwnd)
-                        printf "  │ %-22s : %-40s │\n" "Max CWND" "$value packets"
+                        param_labels+=("Max CWND")
+                        param_values+=("$value packets")
                         ;;
                     lotserver_adaptive)
+                        param_labels+=("Adaptive Mode")
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            printf "  │ %-22s : ${GREEN}%-40s${NC} │\n" "Adaptive Mode" "Enabled"
+                            param_values+=("${GREEN}Enabled${NC}")
                         else
-                            printf "  │ %-22s : ${YELLOW}%-40s${NC} │\n" "Adaptive Mode" "Disabled"
+                            param_values+=("${YELLOW}Disabled${NC}")
                         fi
                         ;;
                     lotserver_turbo)
+                        param_labels+=("Turbo Mode")
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            printf "  │ %-22s : ${YELLOW}%-40s${NC} │\n" "Turbo Mode" "Enabled ⚡"
+                            param_values+=("${YELLOW}Enabled ⚡${NC}")
                         else
-                            printf "  │ %-22s : %-40s │\n" "Turbo Mode" "Disabled"
+                            param_values+=("Disabled")
                         fi
                         ;;
                     lotserver_verbose)
+                        param_labels+=("Verbose Logging")
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            printf "  │ %-22s : ${CYAN}%-40s${NC} │\n" "Verbose Logging" "Enabled"
+                            param_values+=("${CYAN}Enabled${NC}")
                         else
-                            printf "  │ %-22s : %-40s │\n" "Verbose Logging" "Disabled"
+                            param_values+=("Disabled")
                         fi
                         ;;
                     lotserver_safe_mode)
+                        param_labels+=("Safe Mode")
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            printf "  │ %-22s : ${GREEN}%-40s${NC} │\n" "Safe Mode" "Enabled"
+                            param_values+=("${GREEN}Enabled${NC}")
                         else
-                            printf "  │ %-22s : %-40s │\n" "Safe Mode" "Disabled"
+                            param_values+=("Disabled")
                         fi
                         ;;
                 esac
             fi
+        done
+
+        # 计算参数最大标签宽度
+        max_param_label_width=0
+        max_param_value_width=0
+        for i in "${!param_labels[@]}"; do
+            label_width=$(calc_display_width "${param_labels[$i]}")
+            [ $label_width -gt $max_param_label_width ] && max_param_label_width=$label_width
+
+            # 计算值的宽度（去掉颜色代码）
+            clean_value=$(printf "%b" "${param_values[$i]}" | sed -E 's/\x1b\[[0-9;]*m//g')
+            value_width=$(calc_display_width "$clean_value")
+            [ $value_width -gt $max_param_value_width ] && max_param_value_width=$value_width
+        done
+
+        # 打印参数
+        for i in "${!param_labels[@]}"; do
+            label="${param_labels[$i]}"
+            value="${param_values[$i]}"
+            label_width=$(calc_display_width "$label")
+
+            # 计算值的实际显示宽度
+            clean_value=$(printf "%b" "$value" | sed -E 's/\x1b\[[0-9;]*m//g')
+            value_width=$(calc_display_width "$clean_value")
+
+            printf "  │ %s" "$label"
+            spaces $((max_param_label_width - label_width + 1))
+            printf ": %b" "$value"
+            spaces $((max_param_value_width - value_width + 1))
+            printf "│\n"
         done
     fi
     echo -e "${CYAN}  └───────────────────────────────────────────────────────────────┘${NC}"
@@ -603,9 +711,9 @@ case "$ACTION" in
         ss -tin | grep lotspeed || echo "No active connections"
         ;;
     uninstall)
-        echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${YELLOW}║               Uninstalling LotSpeed v$VERSION                     ║${NC}"
-        echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════════╝${NC}"
+        echo -e "${YELLOW}${BOLD}╔═══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${YELLOW}${BOLD}║               Uninstalling LotSpeed v$VERSION                     ║${NC}"
+        echo -e "${YELLOW}${BOLD}╚═══════════════════════════════════════════════════════════════╝${NC}"
         echo ""
 
         # 停止服务
@@ -635,19 +743,19 @@ case "$ACTION" in
         # 检查是否需要重启
         if lsmod | grep -q lotspeed; then
             echo ""
-            echo -e "${MAGENTA}╔═══════════════════════════════════════════════════════════════╗${NC}"
-            echo -e "${MAGENTA}║                    REBOOT REQUIRED                           ║${NC}"
-            echo -e "${MAGENTA}╟───────────────────────────────────────────────────────────────╢${NC}"
-            echo -e "${MAGENTA}║${NC} The kernel module is still loaded in memory.                 ${MAGENTA}║${NC}"
-            echo -e "${MAGENTA}║${NC} ${YELLOW}Please REBOOT your system to complete the uninstallation.${NC}    ${MAGENTA}║${NC}"
-            echo -e "${MAGENTA}║${NC}                                                               ${MAGENTA}║${NC}"
-            echo -e "${MAGENTA}║${NC} After reboot, LotSpeed will be completely removed.           ${MAGENTA}║${NC}"
-            echo -e "${MAGENTA}╚═══════════════════════════════════════════════════════════════╝${NC}"
+            echo -e "${MAGENTA}${BOLD}╔═══════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${MAGENTA}${BOLD}║                    REBOOT REQUIRED                           ║${NC}"
+            echo -e "${MAGENTA}${BOLD}╟───────────────────────────────────────────────────────────────╢${NC}"
+            echo -e "${MAGENTA}${BOLD}║${NC} The kernel module is still loaded in memory.                 ${MAGENTA}${BOLD}║${NC}"
+            echo -e "${MAGENTA}${BOLD}║${NC} ${YELLOW}Please REBOOT your system to complete the uninstallation.${NC}    ${MAGENTA}${BOLD}║${NC}"
+            echo -e "${MAGENTA}${BOLD}║${NC}                                                               ${MAGENTA}${BOLD}║${NC}"
+            echo -e "${MAGENTA}${BOLD}║${NC} After reboot, LotSpeed will be completely removed.           ${MAGENTA}${BOLD}║${NC}"
+            echo -e "${MAGENTA}${BOLD}╚═══════════════════════════════════════════════════════════════╝${NC}"
         else
             echo ""
-            echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-            echo -e "${GREEN}║         LotSpeed v$VERSION Uninstalled Successfully!              ║${NC}"
-            echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+            echo -e "${GREEN}${BOLD}╔═══════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${GREEN}${BOLD}║         LotSpeed v$VERSION Uninstalled Successfully!              ║${NC}"
+            echo -e "${GREEN}${BOLD}╚═══════════════════════════════════════════════════════════════╝${NC}"
         fi
 
         # 删除管理脚本（最后删除自己）

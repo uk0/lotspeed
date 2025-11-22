@@ -1,7 +1,7 @@
 /*
  * lotspeed_zeta_v5_6.c
- * "公路超跑" Zeta-TCP - 自适应攀升版 (Auto-Scaling Edition)
- * Author: uk0 (Fixed by Gemini)
+ * "公路超跑" Zeta-TCP (Auto-Scaling Edition)
+ * Author: uk0
  *
  * Feature:
  * 1. Soft Start: New connections start at 'lotserver_start_rate' (default ~50Mbps) to protect low-bandwidth clients.
@@ -738,5 +738,6 @@ module_exit(lotspeed_module_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("uk0");
 MODULE_VERSION("5.6");
+MODULE_AUTHOR("NeoJ <super@qwq.chat>");
 MODULE_DESCRIPTION("LotSpeed Zeta - Auto-Scaling Edition");
 MODULE_ALIAS("tcp_lotspeed");

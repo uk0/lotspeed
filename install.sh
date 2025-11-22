@@ -449,7 +449,7 @@ show_status() {
 
     # 检查模块状态
     if lsmod | grep -q lotspeed; then
-        print_kv_row "Module Status" "${GREEN}● Loaded ${NC}"
+        print_kv_row "Module Status" "${GREEN}● Loaded${NC}"
 
         REF_COUNT=$(lsmod | grep lotspeed | awk '{print $3}')
         print_kv_row "Reference Count" "${CYAN}$REF_COUNT${NC}"
@@ -468,7 +468,7 @@ show_status() {
     # 检查当前算法
     CURRENT=$(sysctl -n net.ipv4.tcp_congestion_control)
     if [[ "$CURRENT" == "lotspeed" ]]; then
-        print_kv_row "Active Algorithm" "${GREEN}lotspeed ✓ ${NC}"
+        print_kv_row "Active Algorithm" "${GREEN}lotspeed ✓${NC}"
     else
         print_kv_row "Active Algorithm" "${YELLOW}$CURRENT${NC}"
     fi
@@ -732,15 +732,18 @@ case "$ACTION" in
         print_kv_row "Config Files" "${GREEN}Removed${NC}" "${MAGENTA}"
         print_kv_row "Startup Scripts" "${GREEN}Removed${NC}" "${MAGENTA}"
 
-        # 最终检查
+        # 最终检查 - 修复这里的对齐问题
         print_box_div "${MAGENTA}"
         if lsmod | grep -q lotspeed; then
-            print_box_row "${RED}╔════════════════════════════════════╗${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}║     REBOOT REQUIRED                ║${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}╟────────────────────────────────────╢${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}║ Module will be completely removed  ║${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}║ after system reboot.               ║${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}╚════════════════════════════════════╝${NC}" "center" "${MAGENTA}"
+            # 内嵌的重启提示框
+            print_box_row "" "center" "${MAGENTA}"
+            print_box_row "${RED}        ╔════════════════════════════════════╗        ${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}        ║        REBOOT REQUIRED             ║        ${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}        ╟────────────────────────────────────╢        ${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}        ║  Module will be completely removed ║        ${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}        ║  after system reboot.              ║        ${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}        ╚════════════════════════════════════╝        ${NC}" "center" "${MAGENTA}"
+            print_box_row "" "center" "${MAGENTA}"
         else
             print_box_row "${GREEN}✅ LotSpeed Completely Uninstalled!${NC}" "center" "${MAGENTA}"
         fi

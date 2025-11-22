@@ -1,18 +1,13 @@
 ### lotspeed zeta-tcp
 
 <div align=center>
-    <img src="https://github.com/uk0/lotspeed/blob/zeta-tcp/img.png" width="400" height="400" />
+    <img src="https://github.com/uk0/lotspeed/blob/zeta-tcp/logo.png" width="400" height="400" />
 </div>
 
 
 ### branch explanation
 
 * `zeta-tcp`: lotspeed zeta-tcp 参考AppEx Networking TCP算法优化版本
-* `main`: lotspeed 自动优化版本最新版
-* `v2.1`: lotspeed 暴力版本
-* `v3.1`: lotspeed 最小优化算法版本
-* `lotspeed-mini`  lotspeed 极简版本，仅包含核心代码
-
 
 
 * auto install
@@ -76,26 +71,19 @@ root@racknerd-6bf1e7b:~# lotspeed
 
 
 <div align=center>
-    <img src="https://github.com/uk0/lotspeed/blob/zeta-tcp/img_2.png" width="1024" height="768" />
+    <img src="https://github.com/uk0/lotspeed/blob/zeta-tcp/zeta-tcp.png" width="1024" height="768" />
 </div>
 
 
-### test iperf3
+### test iperf3 loss
 
 ```bash
 
-sudo tc qdisc add dev ens3 root netem loss 6%
+sudo tc qdisc add dev ens3 root netem loss 16%
 
 sudo tc qdisc del dev ens3 root netem 
 
 
- iperf3 -s -p 25201
- iperf3 -c green1 -p 25201 -R -t 30
+iperf3 -s -p 25201
+iperf3 -c green1 -p 25201 -R -t 30
 ```
-
-
-### changelog
-* 支持 `debian`,`ubunut` 5.x.x ,6.x.x 内核
-* RN垃圾服务器能实现双 `8K 60fps` 秒开，
-
-

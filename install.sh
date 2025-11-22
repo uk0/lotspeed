@@ -1,18 +1,16 @@
 #!/bin/bash
 #
-# LotSpeed v5.6 - Zeta-TCP Auto-Scaling Edition
+# LotSpeed v5.6 - Zeta-TCP Auto-Scaling Edition (UI Enhanced)
 # Author: uk0 @ 2025-11-23
 # GitHub: https://github.com/uk0/lotspeed
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/zeta-tcp/install.sh | sudo bash
-#   or
-#   wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/zeta-tcp/install.sh | sudo bash
 #
 
 set -e
 
-# 配置
+# ================= 配置区域 =================
 GITHUB_REPO="uk0/lotspeed"
 GITHUB_BRANCH="zeta-tcp"
 INSTALL_DIR="/opt/lotspeed"
@@ -21,7 +19,7 @@ VERSION="5.6"
 CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 CURRENT_USER=$(whoami)
 
-# 颜色定义
+# ================= 颜色定义 =================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -31,44 +29,118 @@ CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
-# 打印函数
+# ================= UI 核心算法 (安装脚本用) =================
+BOX_WIDTH=70
+
+# 计算视觉宽度 (忽略颜色代码, 中文/全角符号算2, 英文算1)
+get_width() {
+    local str="$1"
+    # 移除 ANSI 颜色代码
+    local clean_str=$(echo -e "$str" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g")
+
+    local width=0
+    local len=${#clean_str}
+
+    for ((i=0; i<len; i++)); do
+        local char="${clean_str:$i:1}"
+        # 获取字符的 ASCII 值，简单的判断方法
+        local ord=$(printf "%d" "'$char" 2>/dev/null || echo 128)
+        if [ "$ord" -gt 127 ]; then
+            ((width+=2))
+        else
+            ((width+=1))
+        fi
+    done
+    echo $width
+}
+
+# 打印重复字符
+repeat_char() {
+    local char="$1"
+    local count="$2"
+    if [ "$count" -gt 0 ]; then
+        printf "%0.s$char" $(seq 1 $count)
+    fi
+}
+
+# 绘制盒子顶部
+print_box_top() {
+    local color="${1:-$CYAN}"
+    echo -ne "${color}╔"
+    repeat_char "═" $((BOX_WIDTH - 2))
+    echo -e "╗${NC}"
+}
+
+# 绘制盒子分隔线
+print_box_div() {
+    local color="${1:-$CYAN}"
+    echo -ne "${color}╟"
+    repeat_char "─" $((BOX_WIDTH - 2))
+    echo -e "╢${NC}"
+}
+
+# 绘制盒子底部
+print_box_bottom() {
+    local color="${1:-$CYAN}"
+    echo -ne "${color}╚"
+    repeat_char "═" $((BOX_WIDTH - 2))
+    echo -e "╝${NC}"
+}
+
+# 绘制内容行 (支持 align=left|center)
+print_box_row() {
+    local content="$1"
+    local align="${2:-left}"
+    local color="${3:-$CYAN}"
+
+    local content_width=$(get_width "$content")
+    local total_padding=$((BOX_WIDTH - 2 - content_width))
+
+    if [ $total_padding -lt 0 ]; then total_padding=0; fi
+
+    echo -ne "${color}║${NC}"
+
+    if [ "$align" == "center" ]; then
+        local left_pad=$((total_padding / 2))
+        local right_pad=$((total_padding - left_pad))
+        repeat_char " " $left_pad
+        echo -ne "$content"
+        repeat_char " " $right_pad
+    else
+        echo -ne " $content"
+        repeat_char " " $((total_padding - 1))
+    fi
+
+    echo -e "${color}║${NC}"
+}
+
+# ================= 基础日志函数 =================
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
+
 print_banner() {
     echo -e "${CYAN}"
     cat << "EOF"
-╔════════════════════════════════════════════════════════════╗
-║                                                            ║
-║     _          _   ____                      _            ║
-║    | |    ___ | |_/ ___| _ __   ___  ___  __| |           ║
-║    | |   / _ \| __\___ \| '_ \ / _ \/ _ \/ _` |           ║
-║    | |__| (_) | |_ ___) | |_) |  __/  __/ (_| |           ║
-║    |_____\___/ \__|____/| .__/ \___|\___|\__,_|           ║
-║                         |_|                                ║
-║                                                            ║
-║              Zeta-TCP Auto-Scaling Edition                ║
-║                      Version 5.6                           ║
-║                                                            ║
-╚════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════════╗
+║                                                                      ║
+║      _          _   ____                      _                      ║
+║     | |    ___ | |_/ ___| _ __   ___  ___  __| |                     ║
+║     | |   / _ \| __\___ \| '_ \ / _ \/ _ \/ _` |                     ║
+║     | |__| (_) | |_ ___) | |_) |  __/  __/ (_| |                     ║
+║     |_____\___/ \__|____/| .__/ \___|\___|\__,_|                     ║
+║                          |_|                                         ║
+║                                                                      ║
+║               Zeta-TCP Auto-Scaling Edition                          ║
+║                       Version 5.6                                    ║
+╚══════════════════════════════════════════════════════════════════════╝
 EOF
     echo -e "${NC}"
 }
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
+# ================= 安装逻辑函数 =================
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-log_success() {
-    echo -e "${GREEN}[✓]${NC} $1"
-}
-
-# 检查 root 权限
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "This script must be run as root"
@@ -77,7 +149,6 @@ check_root() {
     fi
 }
 
-# 检查系统
 check_system() {
     log_info "Checking system compatibility..."
 
@@ -116,7 +187,6 @@ check_system() {
     log_success "System: $OS $OS_VERSION (kernel $(uname -r), $ARCH)"
 }
 
-# 安装依赖
 install_dependencies() {
     log_info "Installing dependencies..."
 
@@ -136,7 +206,6 @@ install_dependencies() {
     log_success "Dependencies installed"
 }
 
-# 下载源码
 download_source() {
     log_info "Downloading LotSpeed v$VERSION source code..."
 
@@ -179,7 +248,6 @@ EOF
     log_success "Source code downloaded"
 }
 
-# 编译模块
 compile_module() {
     log_info "Compiling LotSpeed v$VERSION kernel module..."
 
@@ -200,7 +268,6 @@ compile_module() {
     log_success "Module compiled successfully"
 }
 
-# 加载模块
 load_module() {
     log_info "Loading LotSpeed v$VERSION module..."
 
@@ -230,18 +297,20 @@ load_module() {
     log_success "Module loaded and set as default"
 }
 
-# 创建管理脚本
+# ================= 创建管理脚本 (嵌入 UI 算法) =================
 create_management_script() {
     log_info "Creating management script..."
 
+    # 使用 'SCRIPT_EOF' 避免变量在此时展开，而是在生成的脚本运行时展开
     cat > /usr/local/bin/lotspeed << 'SCRIPT_EOF'
 #!/bin/bash
-# LotSpeed v5.6 Management Script (Zeta-TCP Auto-Scaling Edition)
+# LotSpeed Management Script (Auto-Aligned UI)
 
 ACTION=$1
 INSTALL_DIR="/opt/lotspeed"
 VERSION="5.6"
 
+# 颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -251,7 +320,93 @@ WHITE='\033[1;37m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# 格式化函数
+# ================= UI 算法 (嵌入) =================
+BOX_WIDTH=70
+
+# 计算视觉宽度
+get_width() {
+    local str="$1"
+    local clean_str=$(echo -e "$str" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g")
+    local width=0
+    local len=${#clean_str}
+    for ((i=0; i<len; i++)); do
+        local char="${clean_str:$i:1}"
+        local ord=$(printf "%d" "'$char" 2>/dev/null || echo 128)
+        if [ "$ord" -gt 127 ]; then ((width+=2)); else ((width+=1)); fi
+    done
+    echo $width
+}
+
+repeat_char() {
+    if [ "$2" -gt 0 ]; then printf "%0.s$1" $(seq 1 $2); fi
+}
+
+print_box_top() {
+    local color="${1:-$CYAN}"
+    echo -ne "${color}╔"
+    repeat_char "═" $((BOX_WIDTH - 2))
+    echo -e "╗${NC}"
+}
+
+print_box_div() {
+    local color="${1:-$CYAN}"
+    echo -ne "${color}╟"
+    repeat_char "─" $((BOX_WIDTH - 2))
+    echo -e "╢${NC}"
+}
+
+print_box_bottom() {
+    local color="${1:-$CYAN}"
+    echo -ne "${color}╚"
+    repeat_char "═" $((BOX_WIDTH - 2))
+    echo -e "╝${NC}"
+}
+
+print_box_row() {
+    local content="$1"
+    local align="${2:-left}"
+    local color="${3:-$CYAN}"
+
+    local content_width=$(get_width "$content")
+    local total_padding=$((BOX_WIDTH - 2 - content_width))
+    [ $total_padding -lt 0 ] && total_padding=0
+
+    echo -ne "${color}║${NC}"
+    if [ "$align" == "center" ]; then
+        local left_pad=$((total_padding / 2))
+        local right_pad=$((total_padding - left_pad))
+        repeat_char " " $left_pad
+        echo -ne "$content"
+        repeat_char " " $right_pad
+    else
+        echo -ne " $content"
+        repeat_char " " $((total_padding - 1))
+    fi
+    echo -e "${color}║${NC}"
+}
+
+# 打印键值对行 (Left Key ...... Right Value)
+print_kv_row() {
+    local key="$1"
+    local val="$2"
+    local color="${3:-$CYAN}"
+
+    local key_width=$(get_width "$key")
+    local val_width=$(get_width "$val")
+
+    # 左右各1空格Padding + 中间
+    local available=$((BOX_WIDTH - 4))
+    local padding=$((available - key_width - val_width))
+
+    [ $padding -lt 1 ] && padding=1
+
+    echo -ne "${color}║${NC} $key"
+    repeat_char " " $padding
+    echo -e "$val ${color}║${NC}"
+}
+
+# ================= 业务逻辑 =================
+
 format_bytes() {
     local bytes=$1
     if [[ $bytes -ge 1000000000 ]]; then
@@ -279,123 +434,51 @@ format_bps() {
     fi
 }
 
-# 计算显示宽度（考虑中文和emoji占2个字符宽度）
-calc_display_width() {
-    local str="$1"
-    # 移除所有ANSI颜色代码
-    str=$(printf "%b" "$str" | sed -E 's/\x1b\[[0-9;]*m//g')
-
-    local width=0
-    local len=${#str}
-
-    for ((i=0; i<len; i++)); do
-        local char="${str:$i:1}"
-        if [ -z "$char" ]; then
-            continue
-        fi
-        local ord=$(LC_CTYPE=C printf '%d' "'$char" 2>/dev/null || echo 128)
-
-        # ASCII可打印字符 (32-126) 宽度为1，其他为2
-        if [ "$ord" -ge 32 ] && [ "$ord" -le 126 ]; then
-            width=$((width + 1))
-        else
-            width=$((width + 2))
-        fi
-    done
-
-    echo $width
-}
-
-# 生成指定数量的空格
-spaces() {
-    printf '%*s' "$1" ''
-}
-
-# 生成分隔线
-generate_line() {
-    local width=$1
-    printf '─%.0s' $(seq 1 $width)
-}
-
-# 获取系统默认的拥塞控制算法
 get_default_congestion_control() {
     AVAILABLE=$(sysctl net.ipv4.tcp_available_congestion_control | awk -F= '{print $2}')
-    if echo "$AVAILABLE" | grep -q "cubic"; then
-        echo "cubic"
-    elif echo "$AVAILABLE" | grep -q "reno"; then
-        echo "reno"
-    elif echo "$AVAILABLE" | grep -q "bbr"; then
-        echo "bbr"
-    else
-        echo "$AVAILABLE" | awk '{print $1}'
-    fi
+    if echo "$AVAILABLE" | grep -q "cubic"; then echo "cubic";
+    elif echo "$AVAILABLE" | grep -q "reno"; then echo "reno";
+    elif echo "$AVAILABLE" | grep -q "bbr"; then echo "bbr";
+    else echo "$AVAILABLE" | awk '{print $1}'; fi
 }
 
 show_status() {
-    echo -e "${CYAN}${BOLD}╔═══════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║               LotSpeed v$VERSION Status (Zeta-TCP)                    ║${NC}"
-    echo -e "${CYAN}${BOLD}╚═══════════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
+    print_box_top
+    print_box_row "LotSpeed v$VERSION Status (Zeta-TCP)" "center"
+    print_box_div
 
-    # 准备数据
-    declare -a labels
-    declare -a values
-
-    # 检查模块是否加载
+    # 检查模块状态
     if lsmod | grep -q lotspeed; then
-        labels+=("Module Status")
-        values+=("${GREEN}● Loaded${NC}")
+        print_kv_row "Module Status" "${GREEN}● Loaded${NC}"
 
         REF_COUNT=$(lsmod | grep lotspeed | awk '{print $3}')
-        labels+=("Reference Count")
-        values+=("${CYAN}$REF_COUNT${NC}")
+        print_kv_row "Reference Count" "${CYAN}$REF_COUNT${NC}"
 
         ACTIVE_CONNS=$(ss -tin 2>/dev/null | grep -c lotspeed 2>/dev/null || echo "0")
-        labels+=("Active Connections")
-        values+=("${CYAN}$ACTIVE_CONNS${NC}")
+        print_kv_row "Active Connections" "${CYAN}$ACTIVE_CONNS${NC}"
     else
-        labels+=("Module Status")
-        values+=("${RED}○ Not Loaded${NC}")
-        echo ""
-        echo -e "  Module Status      : ${RED}○ Not Loaded${NC}"
+        print_kv_row "Module Status" "${RED}○ Not Loaded${NC}"
+        print_box_bottom
         return
     fi
 
-    # 检查是否为当前算法
+    # 检查当前算法
     CURRENT=$(sysctl -n net.ipv4.tcp_congestion_control)
     if [[ "$CURRENT" == "lotspeed" ]]; then
-        labels+=("Active Algorithm")
-        values+=("${GREEN}lotspeed ✓${NC}")
+        print_kv_row "Active Algorithm" "${GREEN}lotspeed ✓${NC}"
     else
-        labels+=("Active Algorithm")
-        values+=("${YELLOW}$CURRENT${NC}")
+        print_kv_row "Active Algorithm" "${YELLOW}$CURRENT${NC}"
     fi
 
-    # 计算最大宽度
-    max_label_width=0
-    for label in "${labels[@]}"; do
-        width=$(calc_display_width "$label")
-        [ $width -gt $max_label_width ] && max_label_width=$width
-    done
-
-    # 打印基本状态
-    for i in "${!labels[@]}"; do
-        printf "  %-${max_label_width}s : %b\n" "${labels[$i]}" "${values[$i]}"
-    done
-
-    echo ""
-    echo -e "${CYAN}  ┌───────────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${CYAN}  │                      Current Parameters                      │${NC}"
-    echo -e "${CYAN}  ├───────────────────────────────────────────────────────────────┤${NC}"
+    print_box_div
+    print_box_row "Current Parameters" "center"
+    print_box_div
 
     if [[ -d /sys/module/lotspeed/parameters ]]; then
-        # 收集参数数据
-        declare -a param_labels
-        declare -a param_values
-
         for param in lotserver_rate lotserver_start_rate lotserver_gain lotserver_min_cwnd \
                      lotserver_max_cwnd lotserver_beta lotserver_adaptive lotserver_turbo \
                      lotserver_verbose lotserver_safe_mode; do
+
             param_file="/sys/module/lotspeed/parameters/$param"
             if [[ -f "$param_file" ]]; then
                 value=$(cat $param_file 2>/dev/null)
@@ -403,286 +486,179 @@ show_status() {
                     lotserver_rate)
                         formatted=$(format_bytes $value)
                         bps=$(format_bps $value)
-                        param_labels+=("Global Rate Limit")
-                        param_values+=("$formatted ($bps)")
+                        print_kv_row "Global Rate Limit" "$formatted ($bps)"
                         ;;
                     lotserver_start_rate)
                         formatted=$(format_bytes $value)
                         bps=$(format_bps $value)
-                        param_labels+=("Soft Start Rate")
-                        param_values+=("$formatted ($bps)")
+                        print_kv_row "Soft Start Rate" "$formatted ($bps)"
                         ;;
                     lotserver_gain)
                         gain_x=$((value / 10))
                         gain_frac=$((value % 10))
-                        param_labels+=("Gain Factor")
-                        param_values+=("${gain_x}.${gain_frac}x")
+                        print_kv_row "Gain Factor" "${gain_x}.${gain_frac}x"
                         ;;
                     lotserver_beta)
                         beta_val=$((value * 100 / 1024))
-                        param_labels+=("Fairness (Beta)")
-                        param_values+=("${beta_val}%")
-                        ;;
-                    lotserver_min_cwnd)
-                        param_labels+=("Min CWND")
-                        param_values+=("$value packets")
-                        ;;
-                    lotserver_max_cwnd)
-                        param_labels+=("Max CWND")
-                        param_values+=("$value packets")
+                        print_kv_row "Fairness (Beta)" "${beta_val}%"
                         ;;
                     lotserver_adaptive)
-                        param_labels+=("Adaptive Mode")
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            param_values+=("${GREEN}Enabled${NC}")
+                            print_kv_row "Adaptive Mode" "${GREEN}Enabled${NC}"
                         else
-                            param_values+=("${YELLOW}Disabled${NC}")
+                            print_kv_row "Adaptive Mode" "${YELLOW}Disabled${NC}"
                         fi
                         ;;
                     lotserver_turbo)
-                        param_labels+=("Turbo Mode")
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            param_values+=("${YELLOW}Enabled ⚡${NC}")
+                            print_kv_row "Turbo Mode" "${YELLOW}Enabled ⚡${NC}"
                         else
-                            param_values+=("Disabled")
-                        fi
-                        ;;
-                    lotserver_verbose)
-                        param_labels+=("Verbose Logging")
-                        if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            param_values+=("${CYAN}Enabled${NC}")
-                        else
-                            param_values+=("Disabled")
+                            print_kv_row "Turbo Mode" "Disabled"
                         fi
                         ;;
                     lotserver_safe_mode)
-                        param_labels+=("Safe Mode")
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            param_values+=("${GREEN}Enabled${NC}")
+                            print_kv_row "Safe Mode" "${GREEN}Enabled${NC}"
                         else
-                            param_values+=("Disabled")
+                            print_kv_row "Safe Mode" "Disabled"
                         fi
                         ;;
                 esac
             fi
         done
-
-        # 计算参数最大标签宽度
-        max_param_label_width=0
-        max_param_value_width=0
-        for i in "${!param_labels[@]}"; do
-            label_width=$(calc_display_width "${param_labels[$i]}")
-            [ $label_width -gt $max_param_label_width ] && max_param_label_width=$label_width
-
-            # 计算值的宽度（去掉颜色代码）
-            clean_value=$(printf "%b" "${param_values[$i]}" | sed -E 's/\x1b\[[0-9;]*m//g')
-            value_width=$(calc_display_width "$clean_value")
-            [ $value_width -gt $max_param_value_width ] && max_param_value_width=$value_width
-        done
-
-        # 打印参数
-        for i in "${!param_labels[@]}"; do
-            label="${param_labels[$i]}"
-            value="${param_values[$i]}"
-            label_width=$(calc_display_width "$label")
-
-            # 计算值的实际显示宽度
-            clean_value=$(printf "%b" "$value" | sed -E 's/\x1b\[[0-9;]*m//g')
-            value_width=$(calc_display_width "$clean_value")
-
-            printf "  │ %s" "$label"
-            spaces $((max_param_label_width - label_width + 1))
-            printf ": %b" "$value"
-            spaces $((max_param_value_width - value_width + 1))
-            printf "│\n"
-        done
     fi
-    echo -e "${CYAN}  └───────────────────────────────────────────────────────────────┘${NC}"
+    print_box_bottom
 }
 
 apply_preset() {
     PRESET=$2
 
-    echo -e "${CYAN}Applying preset: $PRESET${NC}"
+    # 模拟设置参数 (实际写入 sysfs)
+    set_val() {
+        echo $2 > /sys/module/lotspeed/parameters/$1 2>/dev/null
+    }
+
+    print_box_top
+    print_box_row "Applying Preset: $PRESET" "center"
+    print_box_div
 
     case $PRESET in
         conservative)
-            echo 125000000 > /sys/module/lotspeed/parameters/lotserver_rate     # 1Gbps
-            echo 6250000 > /sys/module/lotspeed/parameters/lotserver_start_rate  # 50Mbps
-            echo 15 > /sys/module/lotspeed/parameters/lotserver_gain
-            echo 16 > /sys/module/lotspeed/parameters/lotserver_min_cwnd
-            echo 2000 > /sys/module/lotspeed/parameters/lotserver_max_cwnd
-            echo 717 > /sys/module/lotspeed/parameters/lotserver_beta
-            echo 1 > /sys/module/lotspeed/parameters/lotserver_adaptive
-            echo 0 > /sys/module/lotspeed/parameters/lotserver_turbo
-            echo 1 > /sys/module/lotspeed/parameters/lotserver_safe_mode
-            echo -e "${GREEN}Applied conservative preset (1Gbps cap, 1.5x gain, safe mode)${NC}"
+            set_val lotserver_rate 125000000
+            set_val lotserver_start_rate 6250000
+            set_val lotserver_gain 15
+            set_val lotserver_min_cwnd 16
+            set_val lotserver_max_cwnd 2000
+            set_val lotserver_beta 717
+            set_val lotserver_adaptive 1
+            set_val lotserver_turbo 0
+            set_val lotserver_safe_mode 1
+            print_box_row "Applied: Conservative (1Gbps, 1.5x, Safe)" "left"
             ;;
         balanced)
-            echo 625000000 > /sys/module/lotspeed/parameters/lotserver_rate     # 5Gbps
-            echo 12500000 > /sys/module/lotspeed/parameters/lotserver_start_rate # 100Mbps
-            echo 20 > /sys/module/lotspeed/parameters/lotserver_gain
-            echo 16 > /sys/module/lotspeed/parameters/lotserver_min_cwnd
-            echo 5000 > /sys/module/lotspeed/parameters/lotserver_max_cwnd
-            echo 717 > /sys/module/lotspeed/parameters/lotserver_beta
-            echo 1 > /sys/module/lotspeed/parameters/lotserver_adaptive
-            echo 0 > /sys/module/lotspeed/parameters/lotserver_turbo
-            echo 1 > /sys/module/lotspeed/parameters/lotserver_safe_mode
-            echo -e "${GREEN}Applied balanced preset (5Gbps cap, 2.0x gain, adaptive)${NC}"
+            set_val lotserver_rate 625000000
+            set_val lotserver_start_rate 12500000
+            set_val lotserver_gain 20
+            set_val lotserver_min_cwnd 16
+            set_val lotserver_max_cwnd 5000
+            set_val lotserver_beta 717
+            set_val lotserver_adaptive 1
+            set_val lotserver_turbo 0
+            set_val lotserver_safe_mode 1
+            print_box_row "Applied: Balanced (5Gbps, 2.0x, Adaptive)" "left"
             ;;
         aggressive)
-            echo 1250000000 > /sys/module/lotspeed/parameters/lotserver_rate    # 10Gbps
-            echo 62500000 > /sys/module/lotspeed/parameters/lotserver_start_rate # 500Mbps
-            echo 30 > /sys/module/lotspeed/parameters/lotserver_gain
-            echo 32 > /sys/module/lotspeed/parameters/lotserver_min_cwnd
-            echo 8000 > /sys/module/lotspeed/parameters/lotserver_max_cwnd
-            echo 819 > /sys/module/lotspeed/parameters/lotserver_beta
-            echo 1 > /sys/module/lotspeed/parameters/lotserver_adaptive
-            echo 0 > /sys/module/lotspeed/parameters/lotserver_turbo
-            echo 0 > /sys/module/lotspeed/parameters/lotserver_safe_mode
-            echo -e "${GREEN}Applied aggressive preset (10Gbps cap, 3.0x gain, no safe mode)${NC}"
+            set_val lotserver_rate 1250000000
+            set_val lotserver_start_rate 62500000
+            set_val lotserver_gain 30
+            set_val lotserver_min_cwnd 32
+            set_val lotserver_max_cwnd 8000
+            set_val lotserver_beta 819
+            set_val lotserver_adaptive 1
+            set_val lotserver_turbo 0
+            set_val lotserver_safe_mode 0
+            print_box_row "Applied: Aggressive (10Gbps, 3.0x, No Safe)" "left"
             ;;
         extreme)
-            echo 2500000000 > /sys/module/lotspeed/parameters/lotserver_rate    # 20Gbps
-            echo 125000000 > /sys/module/lotspeed/parameters/lotserver_start_rate # 1Gbps
-            echo 50 > /sys/module/lotspeed/parameters/lotserver_gain
-            echo 50 > /sys/module/lotspeed/parameters/lotserver_min_cwnd
-            echo 15000 > /sys/module/lotspeed/parameters/lotserver_max_cwnd
-            echo 921 > /sys/module/lotspeed/parameters/lotserver_beta
-            echo 0 > /sys/module/lotspeed/parameters/lotserver_adaptive
-            echo 1 > /sys/module/lotspeed/parameters/lotserver_turbo
-            echo 0 > /sys/module/lotspeed/parameters/lotserver_safe_mode
-            echo -e "${YELLOW}⚡ Applied EXTREME preset (20Gbps, 5.0x gain, TURBO mode)${NC}"
-            echo -e "${RED}WARNING: This preset ignores congestion signals!${NC}"
+            set_val lotserver_rate 2500000000
+            set_val lotserver_start_rate 125000000
+            set_val lotserver_gain 50
+            set_val lotserver_min_cwnd 50
+            set_val lotserver_max_cwnd 15000
+            set_val lotserver_beta 921
+            set_val lotserver_adaptive 0
+            set_val lotserver_turbo 1
+            set_val lotserver_safe_mode 0
+            print_box_row "Applied: EXTREME (20Gbps, 5.0x, TURBO)" "left" "${YELLOW}"
             ;;
         vps100m)
-            echo 12500000 > /sys/module/lotspeed/parameters/lotserver_rate      # 100Mbps
-            echo 1250000 > /sys/module/lotspeed/parameters/lotserver_start_rate  # 10Mbps
-            echo 18 > /sys/module/lotspeed/parameters/lotserver_gain
-            echo 10 > /sys/module/lotspeed/parameters/lotserver_min_cwnd
-            echo 1000 > /sys/module/lotspeed/parameters/lotserver_max_cwnd
-            echo 717 > /sys/module/lotspeed/parameters/lotserver_beta
-            echo 1 > /sys/module/lotspeed/parameters/lotserver_adaptive
-            echo 0 > /sys/module/lotspeed/parameters/lotserver_turbo
-            echo 1 > /sys/module/lotspeed/parameters/lotserver_safe_mode
-            echo -e "${GREEN}Applied VPS 100M preset (100Mbps cap, 1.8x gain, safe)${NC}"
-            ;;
-        debug)
-            echo 1 > /sys/module/lotspeed/parameters/lotserver_verbose
-            echo -e "${GREEN}Debug mode enabled - verbose logging ON${NC}"
+            set_val lotserver_rate 12500000
+            set_val lotserver_start_rate 1250000
+            set_val lotserver_gain 18
+            set_val lotserver_min_cwnd 10
+            set_val lotserver_max_cwnd 1000
+            set_val lotserver_beta 717
+            set_val lotserver_adaptive 1
+            set_val lotserver_turbo 0
+            set_val lotserver_safe_mode 1
+            print_box_row "Applied: VPS 100M (100Mbps, 1.8x)" "left"
             ;;
         *)
-            echo -e "${CYAN}Available presets:${NC}"
-            echo "  conservative - Safe for shared networks (1Gbps, 1.5x)"
-            echo "  balanced     - Good performance (5Gbps, 2.0x) [RECOMMENDED]"
-            echo "  aggressive   - High performance (10Gbps, 3.0x)"
-            echo "  extreme      - Maximum speed (20Gbps, 5.0x, TURBO)"
-            echo "  vps100m      - For 100Mbps VPS (100Mbps, 1.8x)"
-            echo "  debug        - Enable verbose debug logging"
+            print_box_row "Unknown preset: $PRESET" "left" "${RED}"
+            print_box_div
+            print_box_row "Available: conservative, balanced, aggressive," "left"
+            print_box_row "           extreme, vps100m" "left"
+            print_box_bottom
             exit 1
             ;;
     esac
+    print_box_bottom
 }
 
 set_param() {
     PARAM=$2
     VALUE=$3
-
     if [[ -z "$PARAM" ]] || [[ -z "$VALUE" ]]; then
-        echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║                  LotSpeed v$VERSION Parameters                    ║${NC}"
-        echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        echo "Usage: lotspeed set <parameter> <value>"
-        echo ""
-        echo "Available parameters:"
-        echo "┌──────────────────────┬─────────────────────────────────────────┐"
-        echo "│ Parameter            │ Description                             │"
-        echo "├──────────────────────┼─────────────────────────────────────────┤"
-        echo "│ lotserver_rate       │ Max rate cap in bytes/sec               │"
-        echo "│ lotserver_start_rate │ Soft start rate in bytes/sec (v5.6 new) │"
-        echo "│ lotserver_gain       │ Gain multiplier x10 (20 = 2.0x)         │"
-        echo "│ lotserver_min_cwnd   │ Minimum congestion window (packets)     │"
-        echo "│ lotserver_max_cwnd   │ Maximum congestion window (packets)     │"
-        echo "│ lotserver_beta       │ Fairness factor /1024 (717 = 70%)       │"
-        echo "│ lotserver_adaptive   │ Enable adaptive mode (0/1)              │"
-        echo "│ lotserver_turbo      │ Enable turbo mode (0/1)                 │"
-        echo "│ lotserver_verbose    │ Enable verbose logging (0/1)            │"
-        echo "│ lotserver_safe_mode  │ Enable safe mode (0/1)                  │"
-        echo "└──────────────────────┴─────────────────────────────────────────┘"
-        echo ""
-        echo "Examples:"
-        echo "  lotspeed set lotserver_rate 1250000000       # 10Gbps cap"
-        echo "  lotspeed set lotserver_start_rate 6250000    # 50Mbps start"
-        echo "  lotspeed set lotserver_gain 25               # 2.5x gain"
-        echo "  lotspeed set lotserver_beta 819              # 80% fairness"
-        echo "  lotspeed set lotserver_turbo 1               # Enable turbo"
-        echo "  lotspeed set lotserver_safe_mode 0           # Disable safe mode"
+        print_box_top
+        print_box_row "Parameter Set Error" "center" "${RED}"
+        print_box_div
+        print_box_row "Usage: lotspeed set <parameter> <value>" "left"
+        print_box_row "Example: lotspeed set lotserver_gain 25" "left"
+        print_box_bottom
         exit 1
     fi
 
     PARAM_FILE="/sys/module/lotspeed/parameters/$PARAM"
     if [[ -f "$PARAM_FILE" ]]; then
-        OLD_VALUE=$(cat $PARAM_FILE)
         echo $VALUE > $PARAM_FILE 2>/dev/null || {
-            echo -e "${RED}Error: Failed to set parameter (invalid value?)${NC}"
-            exit 1
+             echo -e "${RED}Error setting value${NC}"; exit 1;
         }
-
-        # 特殊显示某些参数
-        case $PARAM in
-            lotserver_rate|lotserver_start_rate)
-                formatted=$(format_bytes $VALUE)
-                bps=$(format_bps $VALUE)
-                echo -e "${GREEN}✓ Set $PARAM = $formatted ($bps)${NC}"
-                echo -e "  Previous value: $(format_bytes $OLD_VALUE)"
-                ;;
-            lotserver_gain)
-                gain_x=$((VALUE / 10))
-                gain_frac=$((VALUE % 10))
-                echo -e "${GREEN}✓ Set $PARAM = ${gain_x}.${gain_frac}x${NC}"
-                echo -e "  Previous value: $OLD_VALUE"
-                ;;
-            lotserver_beta)
-                beta_val=$((VALUE * 100 / 1024))
-                echo -e "${GREEN}✓ Set $PARAM = ${beta_val}% fairness${NC}"
-                echo -e "  Previous value: $OLD_VALUE"
-                ;;
-            *)
-                echo -e "${GREEN}✓ Set $PARAM = $VALUE${NC}"
-                echo -e "  Previous value: $OLD_VALUE"
-                ;;
-        esac
+        print_box_top "${GREEN}"
+        print_box_row "Parameter Updated" "center" "${GREEN}"
+        print_box_div "${GREEN}"
+        print_kv_row "$PARAM" "$VALUE" "${GREEN}"
+        print_box_bottom "${GREEN}"
     else
-        echo -e "${RED}Error: Parameter $PARAM not found${NC}"
-        echo "Run 'lotspeed set' to see available parameters"
-        exit 1
+        echo -e "${RED}Parameter not found${NC}"
     fi
 }
 
 case "$ACTION" in
     start)
-        if lsmod | grep -q lotspeed; then
-            echo -e "${YELLOW}LotSpeed v$VERSION module is already loaded${NC}"
-            CURRENT=$(sysctl -n net.ipv4.tcp_congestion_control)
-            if [[ "$CURRENT" != "lotspeed" ]]; then
-                echo -e "${CYAN}Switching algorithm to lotspeed...${NC}"
-                sysctl -w net.ipv4.tcp_congestion_control=lotspeed >/dev/null
-            fi
-        else
-            modprobe lotspeed 2>/dev/null || insmod $INSTALL_DIR/lotspeed.ko
-            sysctl -w net.ipv4.tcp_congestion_control=lotspeed >/dev/null
-        fi
-        echo -e "${GREEN}✓ LotSpeed v$VERSION is active${NC}"
+        modprobe lotspeed 2>/dev/null || insmod $INSTALL_DIR/lotspeed.ko
+        sysctl -w net.ipv4.tcp_congestion_control=lotspeed >/dev/null
+        print_box_top "${GREEN}"
+        print_box_row "LotSpeed Started" "center" "${GREEN}"
+        print_box_bottom "${GREEN}"
         ;;
     stop)
         DEFAULT_ALGO=$(get_default_congestion_control)
         sysctl -w net.ipv4.tcp_congestion_control=$DEFAULT_ALGO >/dev/null 2>&1
-        rmmod lotspeed 2>/dev/null || {
-            echo -e "${YELLOW}Module is in use, algorithm switched to $DEFAULT_ALGO${NC}"
-            exit 0
-        }
-        echo -e "${GREEN}✓ LotSpeed stopped, using $DEFAULT_ALGO${NC}"
+        rmmod lotspeed 2>/dev/null
+        print_box_top "${YELLOW}"
+        print_box_row "LotSpeed Stopped" "center" "${YELLOW}"
+        print_kv_row "Current Algo" "$DEFAULT_ALGO" "${YELLOW}"
+        print_box_bottom "${YELLOW}"
         ;;
     restart)
         $0 stop
@@ -699,102 +675,58 @@ case "$ACTION" in
         set_param $@
         ;;
     log|logs)
-        echo -e "${CYAN}Recent LotSpeed kernel logs:${NC}"
-        dmesg | grep -i lotspeed | tail -50
+        print_box_top
+        print_box_row "Kernel Logs (Last 10)" "center"
+        print_box_bottom
+        dmesg | grep -i lotspeed | tail -10
         ;;
     monitor)
-        echo -e "${CYAN}Monitoring LotSpeed logs (Ctrl+C to stop)...${NC}"
+        echo -e "${CYAN}Monitoring logs (Ctrl+C to stop)...${NC}"
         dmesg -w | grep --color=always -i lotspeed
         ;;
-    connections|conns)
-        echo -e "${CYAN}Active connections using LotSpeed:${NC}"
-        ss -tin | grep lotspeed || echo "No active connections"
-        ;;
     uninstall)
-        echo -e "${YELLOW}${BOLD}╔═══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${YELLOW}${BOLD}║               Uninstalling LotSpeed v$VERSION                     ║${NC}"
-        echo -e "${YELLOW}${BOLD}╚═══════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
+        print_box_top "${RED}"
+        print_box_row "UNINSTALLATION" "center" "${RED}"
+        print_box_div "${RED}"
 
-        # 停止服务
         DEFAULT_ALGO=$(get_default_congestion_control)
-        echo -e "${CYAN}Switching to default algorithm: $DEFAULT_ALGO${NC}"
         sysctl -w net.ipv4.tcp_congestion_control=$DEFAULT_ALGO >/dev/null 2>&1
 
-        # 尝试卸载模块
         if rmmod lotspeed 2>/dev/null; then
-            echo -e "${GREEN}✓ Module unloaded successfully${NC}"
+             print_kv_row "Module Unloaded" "Success" "${RED}"
         else
-            echo -e "${YELLOW}⚠ Module is still in use by active connections${NC}"
-            echo -e "${YELLOW}  Module will be fully removed after system reboot${NC}"
+             print_kv_row "Module Unloaded" "Failed (In Use)" "${RED}"
+             print_box_row "Please reboot to finish cleanup." "center" "${YELLOW}"
         fi
 
-        # 删除文件
-        echo -e "${CYAN}Removing installation files...${NC}"
         rm -rf $INSTALL_DIR
         rm -f /etc/modules-load.d/lotspeed.conf
         rm -f /lib/modules/$(uname -r)/kernel/net/ipv4/lotspeed.ko
         depmod -a
         sed -i '/net.ipv4.tcp_congestion_control=lotspeed/d' /etc/sysctl.conf
 
-        echo -e "${GREEN}✓ Configuration files removed${NC}"
-        echo -e "${GREEN}✓ Startup scripts removed${NC}"
+        print_box_div "${RED}"
+        print_box_row "LotSpeed removed successfully." "center" "${RED}"
+        print_box_bottom "${RED}"
 
-        # 检查是否需要重启
-        if lsmod | grep -q lotspeed; then
-            echo ""
-            echo -e "${MAGENTA}${BOLD}╔═══════════════════════════════════════════════════════════════╗${NC}"
-            echo -e "${MAGENTA}${BOLD}║                    REBOOT REQUIRED                           ║${NC}"
-            echo -e "${MAGENTA}${BOLD}╟───────────────────────────────────────────────────────────────╢${NC}"
-            echo -e "${MAGENTA}${BOLD}║${NC} The kernel module is still loaded in memory.                 ${MAGENTA}${BOLD}║${NC}"
-            echo -e "${MAGENTA}${BOLD}║${NC} ${YELLOW}Please REBOOT your system to complete the uninstallation.${NC}    ${MAGENTA}${BOLD}║${NC}"
-            echo -e "${MAGENTA}${BOLD}║${NC}                                                               ${MAGENTA}${BOLD}║${NC}"
-            echo -e "${MAGENTA}${BOLD}║${NC} After reboot, LotSpeed will be completely removed.           ${MAGENTA}${BOLD}║${NC}"
-            echo -e "${MAGENTA}${BOLD}╚═══════════════════════════════════════════════════════════════╝${NC}"
-        else
-            echo ""
-            echo -e "${GREEN}${BOLD}╔═══════════════════════════════════════════════════════════════╗${NC}"
-            echo -e "${GREEN}${BOLD}║         LotSpeed v$VERSION Uninstalled Successfully!              ║${NC}"
-            echo -e "${GREEN}${BOLD}╚═══════════════════════════════════════════════════════════════╝${NC}"
-        fi
-
-        # 删除管理脚本（最后删除自己）
         rm -f /usr/local/bin/lotspeed
         ;;
     *)
-        echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║            LotSpeed v$VERSION Management Tool                     ║${NC}"
-        echo -e "${CYAN}║           Zeta-TCP Auto-Scaling Edition                       ║${NC}"
-        echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        echo "Usage: lotspeed {command} [options]"
-        echo ""
-        echo "Commands:"
-        echo "  start       - Start LotSpeed"
-        echo "  stop        - Stop LotSpeed"
-        echo "  restart     - Restart LotSpeed"
-        echo "  status      - Show current status and parameters"
-        echo "  preset      - Apply preset configuration"
-        echo "  set         - Set parameter value"
-        echo "  connections - Show active connections"
-        echo "  log         - Show recent logs"
-        echo "  monitor     - Monitor logs in real-time"
-        echo "  uninstall   - Completely uninstall LotSpeed"
-        echo ""
-        echo "Presets:"
-        echo "  lotspeed preset conservative  - 1Gbps, 1.5x gain, safe mode"
-        echo "  lotspeed preset balanced      - 5Gbps, 2.0x gain [RECOMMENDED]"
-        echo "  lotspeed preset aggressive    - 10Gbps, 3.0x gain"
-        echo "  lotspeed preset extreme       - 20Gbps, 5.0x gain, TURBO"
-        echo "  lotspeed preset vps100m       - For 100Mbps VPS"
-        echo "  lotspeed preset debug         - Enable debug logging"
-        echo ""
-        echo "Key Features in v$VERSION:"
-        echo "  • Auto-Scaling: Automatically finds optimal speed"
-        echo "  • Soft Start: Starts at 50Mbps, climbs if healthy"
-        echo "  • Smart Guard: Loss rate cap & BDP protection"
-        echo "  • Zeta Learning: Remembers best settings per destination"
-        echo ""
+        print_box_top
+        print_box_row "LotSpeed v$VERSION Management" "center"
+        print_box_div
+        print_kv_row "start" "Start LotSpeed"
+        print_kv_row "stop" "Stop LotSpeed"
+        print_kv_row "restart" "Restart LotSpeed"
+        print_kv_row "status" "Check Status"
+        print_kv_row "preset [name]" "Apply Config"
+        print_kv_row "set [k] [v]" "Set Parameter"
+        print_kv_row "monitor" "Live Logs"
+        print_kv_row "uninstall" "Remove Completely"
+        print_box_div
+        print_box_row "Presets: conservative, balanced, aggressive" "left"
+        print_box_row "         extreme, vps100m" "left"
+        print_box_bottom
         exit 1
         ;;
 esac
@@ -804,77 +736,45 @@ SCRIPT_EOF
     log_success "Management script created at /usr/local/bin/lotspeed"
 }
 
-# 显示配置信息
+# ================= 结尾显示 =================
 show_info() {
     echo ""
-    echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║         LotSpeed v$VERSION Installation Complete!                 ║${NC}"
-    echo -e "${GREEN}║          Zeta-TCP Auto-Scaling Edition                        ║${NC}"
-    echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+    print_box_top "${GREEN}"
+    print_box_row "LotSpeed v$VERSION Installation Complete!" "center" "${GREEN}"
+    print_box_row "Zeta-TCP Auto-Scaling Edition" "center" "${GREEN}"
+    print_box_bottom "${GREEN}"
+
     echo ""
 
-    # 显示当前状态
+    # 调用新生成的脚本显示状态
     /usr/local/bin/lotspeed status
 
     echo ""
-    echo -e "${CYAN}┌─────────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${CYAN}│                    Quick Start Guide                        │${NC}"
-    echo -e "${CYAN}├─────────────────────────────────────────────────────────────┤${NC}"
-    echo -e "${CYAN}│${NC} ${WHITE}lotspeed status${NC}           - Check current status           ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC} ${WHITE}lotspeed preset balanced${NC}  - Apply balanced preset (5Gbps) ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC} ${WHITE}lotspeed preset vps100m${NC}   - For 100Mbps VPS               ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC} ${WHITE}lotspeed monitor${NC}          - Monitor real-time logs        ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC} ${WHITE}lotspeed set${NC}              - View all parameters           ${CYAN}│${NC}"
-    echo -e "${CYAN}└─────────────────────────────────────────────────────────────┘${NC}"
+    print_box_top "${YELLOW}"
+    print_box_row "Recommended Settings" "center" "${YELLOW}"
+    print_box_div "${YELLOW}"
+    print_kv_row "VPS/Cloud (<=1Gbps)" "lotspeed preset conservative" "${YELLOW}"
+    print_kv_row "VPS/Cloud (>1Gbps)" "lotspeed preset balanced" "${YELLOW}"
+    print_kv_row "Dedicated Server" "lotspeed preset aggressive" "${YELLOW}"
+    print_kv_row "Speed Testing" "lotspeed preset extreme" "${YELLOW}"
+    print_box_bottom "${YELLOW}"
     echo ""
-    echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${YELLOW}│                  Recommended Settings                       │${NC}"
-    echo -e "${YELLOW}├─────────────────────────────────────────────────────────────┤${NC}"
-    echo -e "${YELLOW}│${NC} • VPS/Cloud (≤1Gbps):  ${GREEN}lotspeed preset conservative${NC}       ${YELLOW}│${NC}"
-    echo -e "${YELLOW}│${NC} • VPS/Cloud (>1Gbps):  ${GREEN}lotspeed preset balanced${NC}           ${YELLOW}│${NC}"
-    echo -e "${YELLOW}│${NC} • Dedicated Server:    ${GREEN}lotspeed preset aggressive${NC}         ${YELLOW}│${NC}"
-    echo -e "${YELLOW}│${NC} • Speed Testing:       ${GREEN}lotspeed preset extreme${NC}            ${YELLOW}│${NC}"
-    echo -e "${YELLOW}│${NC} • Debug Issues:        ${GREEN}lotspeed preset debug${NC}              ${YELLOW}│${NC}"
-    echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
-    echo ""
-    echo -e "${MAGENTA}┌─────────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${MAGENTA}│              What's New in Version 5.6                      │${NC}"
-    echo -e "${MAGENTA}├─────────────────────────────────────────────────────────────┤${NC}"
-    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Auto-Scaling${NC}: Automatically climbs to find true limit  ${MAGENTA}│${NC}"
-    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Soft Start${NC}: Begins at 50Mbps, protects slow clients   ${MAGENTA}│${NC}"
-    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Smart Guard${NC}: Loss rate cap (15%) & BDP protection     ${MAGENTA}│${NC}"
-    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Zeta Learning${NC}: AI-powered destination memory          ${MAGENTA}│${NC}"
-    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Safe Mode${NC}: New protection against network storms      ${MAGENTA}│${NC}"
-    echo -e "${MAGENTA}└─────────────────────────────────────────────────────────────┘${NC}"
-    echo ""
-    echo -e "${GREEN}Installation Details:${NC}"
-    echo "  • Install Path:    $INSTALL_DIR"
-    echo "  • Management Tool: /usr/local/bin/lotspeed"
-    echo "  • Kernel Module:   /lib/modules/$(uname -r)/kernel/net/ipv4/lotspeed.ko"
-    echo "  • Install Time:    $CURRENT_TIME"
-    echo "  • Installed By:    $CURRENT_USER"
-    echo ""
-    echo -e "${CYAN}GitHub:${NC} https://github.com/$GITHUB_REPO"
-    echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
-# 错误处理
 error_exit() {
     log_error "$1"
-    echo -e "${RED}Installation failed. Check logs above for details.${NC}"
+    echo -e "${RED}Installation failed.${NC}"
     exit 1
 }
 
-# 主函数
+# ================= 主流程 =================
 main() {
     clear
     print_banner
 
     echo -e "${CYAN}Starting installation at $CURRENT_TIME${NC}"
-    echo -e "${CYAN}Installer: $CURRENT_USER${NC}"
     echo ""
 
-    # 执行安装步骤
     check_root || error_exit "Root check failed"
     check_system || error_exit "System check failed"
     install_dependencies || error_exit "Dependency installation failed"
@@ -883,12 +783,9 @@ main() {
     load_module || error_exit "Module loading failed"
     create_management_script || error_exit "Script creation failed"
 
-    # 显示完成信息
     show_info
 
-    # 记录安装日志
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] LotSpeed v$VERSION installed by $CURRENT_USER" >> /var/log/lotspeed_install.log
 }
 
-# 执行主函数
 main

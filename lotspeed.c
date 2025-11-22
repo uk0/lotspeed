@@ -580,6 +580,6 @@ module_exit(lotspeed_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("uk0 <github.com/uk0>");
-MODULE_VERSION("3.2");
-MODULE_DESCRIPTION("LotSpeed v3.2 - Enterprise-grade CCA with ECN, Smart Startup, ProbeRTT and Fairness");
+MODULE_VERSION("3.1");
+MODULE_DESCRIPTION("LotSpeed v3.1 - Enterprise-grade CCA with ECN, Smart Startup, ProbeRTT and Fairness");
 MODULE_ALIAS("tcp_lotspeed");

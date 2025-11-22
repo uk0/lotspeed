@@ -10,9 +10,9 @@
 
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/v3.1/install.sh | sudo bash
 #   or
-wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/main/install.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/v3.1/install.sh | sudo bash
 ```
 
 
@@ -44,7 +44,7 @@ dmesg -w
 * 核心原理与设计哲学
 
 <div align=center>
-    <img src="https://github.com/uk0/lotspeed/blob/main/img_1.png" width="800" height="600" />
+    <img src="https://github.com/uk0/lotspeed/blob/v3.1/img_1.png" width="800" height="600" />
 </div>
 
 
@@ -55,7 +55,7 @@ dmesg -w
 
 root@ubuntu:~# lotspeed
 ╔════════════════════════════════════════════════════════╗
-║          LotSpeed v2.0 Management Tool                 ║
+║          LotSpeed v3.1 Management Tool                 ║
 ║          Created by uk0 @ 2025-11-18                   ║
 ╚════════════════════════════════════════════════════════╝
 

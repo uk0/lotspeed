@@ -1,23 +1,23 @@
 #!/bin/bash
 #
-# LotSpeed v2.0 - 一键部署脚本
+# LotSpeed v3.1 - 一键部署脚本
 # Author: uk0 @ 2025-11-18 08:10:22
 # GitHub: https://github.com/uk0/lotspeed
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/v3.1/install.sh | sudo bash
 #   or
-#   wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/main/install.sh | sudo bash
+#   wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/v3.1/install.sh | sudo bash
 #
 
 set -e
 
 # 配置
 GITHUB_REPO="uk0/lotspeed"
-GITHUB_BRANCH="main"
+GITHUB_BRANCH="v3.1"
 INSTALL_DIR="/opt/lotspeed"
 MODULE_NAME="lotspeed"
-VERSION="2.0"
+VERSION="3.1"
 CURRENT_TIME="2025-11-18 08:10:22"
 
 # 颜色定义
@@ -334,7 +334,7 @@ safe_stop() {
 # 安全卸载函数
 safe_uninstall() {
     echo -e "${YELLOW}╔════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${YELLOW}║           Uninstalling LotSpeed v2.0                   ║${NC}"
+    echo -e "${YELLOW}║           Uninstalling LotSpeed v3.1                   ║${NC}"
     echo -e "${YELLOW}╚════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
@@ -591,7 +591,7 @@ case "$ACTION" in
         ;;
     *)
         echo "╔════════════════════════════════════════════════════════╗"
-        echo "║          LotSpeed v2.0 Management Tool                 ║"
+        echo "║          LotSpeed v3.1 Management Tool                 ║"
         echo "║          Created by uk0 @ 2025-11-18                   ║"
         echo "╚════════════════════════════════════════════════════════╝"
         echo ""
@@ -634,7 +634,7 @@ SCRIPT_EOF
 show_info() {
     echo ""
     echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}       LotSpeed v2.0 Installation Complete!${NC}"
+    echo -e "${GREEN}       LotSpeed v3.1 Installation Complete!${NC}"
     echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
     echo ""
 

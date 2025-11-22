@@ -449,7 +449,7 @@ show_status() {
 
     # 检查模块状态
     if lsmod | grep -q lotspeed; then
-        print_kv_row "Module Status" "${GREEN}● Loaded${NC}"
+        print_kv_row "Module Status" "${GREEN}● Loaded ${NC}"
 
         REF_COUNT=$(lsmod | grep lotspeed | awk '{print $3}')
         print_kv_row "Reference Count" "${CYAN}$REF_COUNT${NC}"
@@ -468,7 +468,7 @@ show_status() {
     # 检查当前算法
     CURRENT=$(sysctl -n net.ipv4.tcp_congestion_control)
     if [[ "$CURRENT" == "lotspeed" ]]; then
-        print_kv_row "Active Algorithm" "${GREEN}lotspeed ✓${NC}"
+        print_kv_row "Active Algorithm" "${GREEN}lotspeed ✓ ${NC}"
     else
         print_kv_row "Active Algorithm" "${YELLOW}$CURRENT${NC}"
     fi
@@ -716,7 +716,7 @@ case "$ACTION" in
         else
             print_kv_row "Module Unload" "${YELLOW}In Use${NC}" "${MAGENTA}"
             print_box_div "${MAGENTA}"
-            print_box_row "${YELLOW}⚠ Module is still loaded in memory${NC}" "center" "${MAGENTA}"
+            print_box_row "${YELLOW}⚠ Module is still loaded in memory ${NC}" "center" "${MAGENTA}"
             print_box_row "${YELLOW}Active connections are preventing unload${NC}" "center" "${MAGENTA}"
             print_box_div "${MAGENTA}"
         fi

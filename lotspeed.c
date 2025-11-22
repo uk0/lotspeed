@@ -1,12 +1,12 @@
 /*
- * lotspeed_zeta_v5_1.c
- * "公路超跑" Zeta-TCP 深度复刻版 - 内存优化修正版
+ * lotspeed_zeta_v5_2.c
+ * "公路超跑" Zeta-TCP 最终稳定版
  * Author: uk0 (Fixed by Gemini)
  *
- * Fixes:
- * - Solved "BUILD_BUG_ON" compilation error by optimizing struct layout.
- * - Removed non-critical statistics (start_time, bytes_sent) to fit in kernel memory.
- * - Reordered fields to minimize padding.
+ * Changelog v5.2:
+ * - Fixed "defined but not used" warning for RCU callback.
+ * - Fixed "pr_info" format specifier compilation error.
+ * - Maintained v5.1 memory optimization struct layout.
  */
 
 #include <linux/module.h>
@@ -21,6 +21,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/rculist.h>
+#include <linux/compiler.h> // For __maybe_unused
 
 // --- 安全性宏定义 ---
 #define SAFETY_CHECK(ptr, ret) do { \
@@ -83,7 +84,7 @@ static bool lotserver_turbo = false;
 static bool lotserver_verbose = false;
 static bool lotserver_safe_mode = true;
 
-// --- 参数回调 (保持不变) ---
+// --- 参数回调 ---
 static int param_set_rate(const char *val, const struct kernel_param *kp) { return param_set_ulong(val, kp); }
 static int param_set_gain(const char *val, const struct kernel_param *kp) { return param_set_uint(val, kp); }
 static int param_set_min_cwnd(const char *val, const struct kernel_param *kp) {
@@ -168,9 +169,8 @@ static const char* state_to_str(enum lotspeed_state state) {
 }
 
 // --- 私有数据结构 (内存优化版) ---
-// 严禁随意添加字段，否则会导致编译失败 (BUILD_BUG_ON)
 struct lotspeed {
-    // 1. 8字节对齐字段 (u64) - 放在最前面
+    // 1. 8字节对齐字段 (u64)
     u64 target_rate;
     u64 actual_rate;
     u64 last_bw;
@@ -192,17 +192,16 @@ struct lotspeed {
     u32 last_loss_rtt;
     u32 sample_count;
 
-    enum lotspeed_state state; // 通常是4字节
+    enum lotspeed_state state;
 
-    // 3. 1字节对齐字段 (bool) - 放在最后减少padding
+    // 3. 1字节对齐字段 (bool)
     bool ss_mode;
     bool history_hit;
-
-    // 已移除: start_time, bytes_sent (节省16字节)
 };
 
 // --- 安全的历史引擎函数 ---
-static void free_history_entry_rcu(struct rcu_head *head)
+// 修复：添加 __maybe_unused 以防止编译器警告
+static void __maybe_unused free_history_entry_rcu(struct rcu_head *head)
 {
     struct zeta_history_entry *entry = container_of(head, struct zeta_history_entry, rcu);
     kfree(entry);
@@ -243,6 +242,7 @@ static void update_history_safe(u32 daddr, u64 bw, u32 rtt, u32 loss_count)
     }
 
     if (!found) {
+        // 内存保护机制：如果超过最大条目数，删除最旧的
         if (atomic_read(&history_entries_count) >= HISTORY_MAX_ENTRIES) {
             struct zeta_history_entry *tmp;
             hash_for_each_rcu(zeta_history_map, bkt, tmp, node) {
@@ -364,7 +364,7 @@ static void lotspeed_release(struct sock *sk)
     atomic_dec(&active_connections);
     if (ca->loss_count > 0) atomic_add(ca->loss_count, &total_losses);
 
-    // Zeta Learning: 只依赖采样数和速率，不依赖 bytes_sent
+    // Zeta Learning
     if (ca->sample_count >= ZETA_MIN_SAMPLES &&
         ca->actual_rate > 0 &&
         ca->rtt_min > 0 &&
@@ -538,7 +538,7 @@ static void lotspeed_cong_control(struct sock *sk, const struct rate_sample *rs)
 }
 #endif
 
-// --- SSTHRESH: Zeta Loss Differentiation ---
+// --- SSTHRESH ---
 static u32 lotspeed_ssthresh(struct sock *sk)
 {
     struct tcp_sock *tp = tcp_sk(sk);
@@ -556,7 +556,7 @@ static u32 lotspeed_ssthresh(struct sock *sk)
     if (ca->rtt_variance > 0) tolerance += ca->rtt_variance / 2;
 
     if (rtt_us <= tolerance) {
-        // Loss Immunity: 只降5%或不降
+        // Loss Immunity
         ca->last_loss_rtt = rtt_us;
         if (lotserver_safe_mode) new_ssthresh = (tp->snd_cwnd * 95) / 100;
         else new_ssthresh = tp->snd_cwnd;
@@ -631,8 +631,14 @@ static struct tcp_congestion_ops lotspeed_ops __read_mostly = {
 
 static int __init lotspeed_module_init(void)
 {
+    // 修复：使用 %u 和 强制类型转换，确保在所有内核版本上都能安全编译
     BUILD_BUG_ON(sizeof(struct lotspeed) > ICSK_CA_PRIV_SIZE);
-    pr_info("lotspeed v5.1 loaded. Safety mode: %s\n", lotserver_safe_mode ? "ON" : "OFF");
+
+    pr_info("lotspeed v5.2 loaded.\n");
+    pr_info("Struct size: %u bytes (limit: %u)\n",
+            (unsigned int)sizeof(struct lotspeed),
+            (unsigned int)ICSK_CA_PRIV_SIZE);
+
     hash_init(zeta_history_map);
     return tcp_register_congestion_control(&lotspeed_ops);
 }
@@ -653,7 +659,7 @@ static void __exit lotspeed_module_exit(void)
         kfree(entry);
     }
     spin_unlock_bh(&zeta_history_lock);
-    pr_info("lotspeed v5.1 unloaded.\n");
+    pr_info("lotspeed v5.2 unloaded.\n");
 }
 
 module_init(lotspeed_module_init);
@@ -661,6 +667,6 @@ module_exit(lotspeed_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("uk0");
-MODULE_VERSION("5.1");
-MODULE_DESCRIPTION("LotSpeed Zeta - Memory Optimized");
+MODULE_VERSION("5.2");
+MODULE_DESCRIPTION("LotSpeed Zeta - Stable Release");
 MODULE_ALIAS("tcp_lotspeed");

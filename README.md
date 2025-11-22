@@ -1,7 +1,7 @@
-### lotspeed 开心版
+### lotspeed 暴力发包拥塞控制算法 v3.1
 
 <div align=center>
-    <img src="https://github.com/uk0/lotspeed/blob/main/img.png" width="400" height="400" />
+    <img src="https://github.com/uk0/lotspeed/blob/main/logo.png" width="400" height="400" />
 </div>
 
 
@@ -40,13 +40,6 @@ sysctl net.ipv4.tcp_congestion_control
 dmesg -w
 
 ```
-
-* 核心原理与设计哲学
-
-<div align=center>
-    <img src="https://github.com/uk0/lotspeed/blob/v3.1/img_1.png" width="800" height="600" />
-</div>
-
 
 
 * helper

@@ -125,6 +125,12 @@ Note: v3.3 includes ProbeRTT, Smart Startup, ECN support
 ### test iperf3
 
 ```bash
+
+sudo tc qdisc add dev ens3 root netem loss 6%
+
+sudo tc qdisc del dev ens3 root netem 
+
+
  iperf3 -s -p 25201
  iperf3 -c green1 -p 25201 -R -t 30
 ```

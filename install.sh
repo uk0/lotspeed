@@ -5,16 +5,16 @@
 # GitHub: https://github.com/uk0/lotspeed
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/zeta-tcp/install.sh | sudo bash
 #   or
-#   wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/main/install.sh | sudo bash
+#   wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/zeta-tcp/install.sh | sudo bash
 #
 
 set -e
 
 # 配置
 GITHUB_REPO="uk0/lotspeed"
-GITHUB_BRANCH="main"
+GITHUB_BRANCH="zeta-tcp"
 INSTALL_DIR="/opt/lotspeed"
 MODULE_NAME="lotspeed"
 VERSION="3.3"

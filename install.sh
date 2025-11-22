@@ -278,32 +278,6 @@ format_bps() {
     fi
 }
 
-# 计算字符串显示宽度（不含ANSI颜色码）
-strlen_no_ansi() {
-    local str="$1"
-    # 移除ANSI颜色码
-    local clean_str=$(echo -e "$str" | sed 's/\x1b\[[0-9;]*m//g')
-    echo ${#clean_str}
-}
-
-# 对齐打印函数
-print_aligned_row() {
-    local label="$1"
-    local value="$2"
-    local label_width=22
-    local value_width=40
-    local total_width=65
-
-    # 处理带颜色的值
-    local value_display_len=$(strlen_no_ansi "$value")
-    local padding=$((value_width - value_display_len))
-    if [[ $padding -lt 0 ]]; then
-        padding=0
-    fi
-
-    printf "  │ %-${label_width}s : %s%${padding}s │\n" "$label" "$value" ""
-}
-
 # 获取系统默认的拥塞控制算法
 get_default_congestion_control() {
     AVAILABLE=$(sysctl net.ipv4.tcp_available_congestion_control | awk -F= '{print $2}')
@@ -326,22 +300,22 @@ show_status() {
 
     # 检查模块是否加载
     if lsmod | grep -q lotspeed; then
-        print_aligned_row "Module Status" "${GREEN}● Loaded${NC}"
+        printf "  %-24s : ${GREEN}● Loaded${NC}\n" "Module Status"
         REF_COUNT=$(lsmod | grep lotspeed | awk '{print $3}')
-        print_aligned_row "Reference Count" "${CYAN}$REF_COUNT${NC}"
+        printf "  %-24s : ${CYAN}%s${NC}\n" "Reference Count" "$REF_COUNT"
         ACTIVE_CONNS=$(ss -tin 2>/dev/null | grep -c lotspeed 2>/dev/null || echo "0")
-        print_aligned_row "Active Connections" "${CYAN}$ACTIVE_CONNS${NC}"
+        printf "  %-24s : ${CYAN}%s${NC}\n" "Active Connections" "$ACTIVE_CONNS"
     else
-        print_aligned_row "Module Status" "${RED}○ Not Loaded${NC}"
+        printf "  %-24s : ${RED}○ Not Loaded${NC}\n" "Module Status"
         return
     fi
 
     # 检查是否为当前算法
     CURRENT=$(sysctl -n net.ipv4.tcp_congestion_control)
     if [[ "$CURRENT" == "lotspeed" ]]; then
-        print_aligned_row "Active Algorithm" "${GREEN}lotspeed ✓${NC}"
+        printf "  %-24s : ${GREEN}lotspeed ✓${NC}\n" "Active Algorithm"
     else
-        print_aligned_row "Active Algorithm" "${YELLOW}$CURRENT${NC}"
+        printf "  %-24s : ${YELLOW}%s${NC}\n" "Active Algorithm" "$CURRENT"
     fi
 
     echo ""
@@ -361,54 +335,54 @@ show_status() {
                     lotserver_rate)
                         formatted=$(format_bytes $value)
                         bps=$(format_bps $value)
-                        print_aligned_row "Global Rate Limit" "$formatted ($bps)"
+                        printf "  │ %-22s : %-40s │\n" "Global Rate Limit" "$formatted ($bps)"
                         ;;
                     lotserver_start_rate)
                         formatted=$(format_bytes $value)
                         bps=$(format_bps $value)
-                        print_aligned_row "Soft Start Rate" "$formatted ($bps)"
+                        printf "  │ %-22s : %-40s │\n" "Soft Start Rate" "$formatted ($bps)"
                         ;;
                     lotserver_gain)
                         gain_x=$((value / 10))
                         gain_frac=$((value % 10))
-                        print_aligned_row "Gain Factor" "${gain_x}.${gain_frac}x"
+                        printf "  │ %-22s : %-40s │\n" "Gain Factor" "${gain_x}.${gain_frac}x"
                         ;;
                     lotserver_beta)
                         beta_val=$((value * 100 / 1024))
-                        print_aligned_row "Fairness (Beta)" "${beta_val}%"
+                        printf "  │ %-22s : %-40s │\n" "Fairness (Beta)" "${beta_val}%"
                         ;;
                     lotserver_min_cwnd)
-                        print_aligned_row "Min CWND" "$value packets"
+                        printf "  │ %-22s : %-40s │\n" "Min CWND" "$value packets"
                         ;;
                     lotserver_max_cwnd)
-                        print_aligned_row "Max CWND" "$value packets"
+                        printf "  │ %-22s : %-40s │\n" "Max CWND" "$value packets"
                         ;;
                     lotserver_adaptive)
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            print_aligned_row "Adaptive Mode" "${GREEN}Enabled${NC}"
+                            printf "  │ %-22s : ${GREEN}%-40s${NC} │\n" "Adaptive Mode" "Enabled"
                         else
-                            print_aligned_row "Adaptive Mode" "${YELLOW}Disabled${NC}"
+                            printf "  │ %-22s : ${YELLOW}%-40s${NC} │\n" "Adaptive Mode" "Disabled"
                         fi
                         ;;
                     lotserver_turbo)
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            print_aligned_row "Turbo Mode" "${YELLOW}Enabled ⚡${NC}"
+                            printf "  │ %-22s : ${YELLOW}%-40s${NC} │\n" "Turbo Mode" "Enabled ⚡"
                         else
-                            print_aligned_row "Turbo Mode" "Disabled"
+                            printf "  │ %-22s : %-40s │\n" "Turbo Mode" "Disabled"
                         fi
                         ;;
                     lotserver_verbose)
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            print_aligned_row "Verbose Logging" "${CYAN}Enabled${NC}"
+                            printf "  │ %-22s : ${CYAN}%-40s${NC} │\n" "Verbose Logging" "Enabled"
                         else
-                            print_aligned_row "Verbose Logging" "Disabled"
+                            printf "  │ %-22s : %-40s │\n" "Verbose Logging" "Disabled"
                         fi
                         ;;
                     lotserver_safe_mode)
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            print_aligned_row "Safe Mode" "${GREEN}Enabled${NC}"
+                            printf "  │ %-22s : ${GREEN}%-40s${NC} │\n" "Safe Mode" "Enabled"
                         else
-                            print_aligned_row "Safe Mode" "Disabled"
+                            printf "  │ %-22s : %-40s │\n" "Safe Mode" "Disabled"
                         fi
                         ;;
                 esac
@@ -629,15 +603,55 @@ case "$ACTION" in
         ss -tin | grep lotspeed || echo "No active connections"
         ;;
     uninstall)
-        echo -e "${YELLOW}Uninstalling LotSpeed v$VERSION...${NC}"
-        $0 stop 2>/dev/null
+        echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${YELLOW}║               Uninstalling LotSpeed v$VERSION                     ║${NC}"
+        echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+
+        # 停止服务
+        DEFAULT_ALGO=$(get_default_congestion_control)
+        echo -e "${CYAN}Switching to default algorithm: $DEFAULT_ALGO${NC}"
+        sysctl -w net.ipv4.tcp_congestion_control=$DEFAULT_ALGO >/dev/null 2>&1
+
+        # 尝试卸载模块
+        if rmmod lotspeed 2>/dev/null; then
+            echo -e "${GREEN}✓ Module unloaded successfully${NC}"
+        else
+            echo -e "${YELLOW}⚠ Module is still in use by active connections${NC}"
+            echo -e "${YELLOW}  Module will be fully removed after system reboot${NC}"
+        fi
+
+        # 删除文件
+        echo -e "${CYAN}Removing installation files...${NC}"
         rm -rf $INSTALL_DIR
         rm -f /etc/modules-load.d/lotspeed.conf
         rm -f /lib/modules/$(uname -r)/kernel/net/ipv4/lotspeed.ko
         depmod -a
         sed -i '/net.ipv4.tcp_congestion_control=lotspeed/d' /etc/sysctl.conf
+
+        echo -e "${GREEN}✓ Configuration files removed${NC}"
+        echo -e "${GREEN}✓ Startup scripts removed${NC}"
+
+        # 检查是否需要重启
+        if lsmod | grep -q lotspeed; then
+            echo ""
+            echo -e "${MAGENTA}╔═══════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${MAGENTA}║                    REBOOT REQUIRED                           ║${NC}"
+            echo -e "${MAGENTA}╟───────────────────────────────────────────────────────────────╢${NC}"
+            echo -e "${MAGENTA}║${NC} The kernel module is still loaded in memory.                 ${MAGENTA}║${NC}"
+            echo -e "${MAGENTA}║${NC} ${YELLOW}Please REBOOT your system to complete the uninstallation.${NC}    ${MAGENTA}║${NC}"
+            echo -e "${MAGENTA}║${NC}                                                               ${MAGENTA}║${NC}"
+            echo -e "${MAGENTA}║${NC} After reboot, LotSpeed will be completely removed.           ${MAGENTA}║${NC}"
+            echo -e "${MAGENTA}╚═══════════════════════════════════════════════════════════════╝${NC}"
+        else
+            echo ""
+            echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${GREEN}║         LotSpeed v$VERSION Uninstalled Successfully!              ║${NC}"
+            echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+        fi
+
+        # 删除管理脚本（最后删除自己）
         rm -f /usr/local/bin/lotspeed
-        echo -e "${GREEN}✓ LotSpeed v$VERSION uninstalled${NC}"
         ;;
     *)
         echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════╗${NC}"

@@ -572,7 +572,7 @@ apply_preset() {
             print_box_row "Applied: Conservative (1Gbps, 1.5x, Safe)" "left"
             ;;
         balanced)
-            set_val lotserver_rate 125000000
+            set_val lotserver_rate 256000000
             set_val lotserver_start_rate 25000000
             set_val lotserver_gain 20
             set_val lotserver_min_cwnd 16
@@ -581,7 +581,7 @@ apply_preset() {
             set_val lotserver_adaptive 1
             set_val lotserver_turbo 0
             set_val lotserver_safe_mode 1
-            print_box_row "Applied: Balanced (1Gbps, 2.0x, Adaptive)" "left"
+            print_box_row "Applied: Balanced (2.5Gbps, 2.0x, Adaptive)" "left"
             ;;
         *)
             print_box_row "Unknown preset: $PRESET" "left" "${RED}"
@@ -729,8 +729,7 @@ case "$ACTION" in
         print_kv_row "monitor" "Live Logs"
         print_kv_row "uninstall" "Remove Completely"
         print_box_div
-        print_box_row "Presets: conservative, balanced, aggressive" "left"
-        print_box_row "         extreme, vps100m" "left"
+        print_box_row "Presets: conservative, balanced" "left"
         print_box_bottom
         exit 1
         ;;
@@ -779,8 +778,6 @@ show_info() {
     print_box_div "${YELLOW}"
     print_kv_row "VPS/Cloud (<=1Gbps)" "lotspeed preset conservative" "${YELLOW}"
     print_kv_row "VPS/Cloud (>1Gbps)" "lotspeed preset balanced" "${YELLOW}"
-    print_kv_row "Dedicated Server" "lotspeed preset aggressive" "${YELLOW}"
-    print_kv_row "Speed Testing" "lotspeed preset extreme" "${YELLOW}"
     print_box_bottom "${YELLOW}"
     echo ""
 }

@@ -125,15 +125,15 @@ print_banner() {
     cat << "EOF"
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                                                                      ║
-║      _          _   ____                      _                      ║
-║     | |    ___ | |_/ ___| _ __   ___  ___  __| |                     ║
-║     | |   / _ \| __\___ \| '_ \ / _ \/ _ \/ _` |                     ║
-║     | |__| (_) | |_ ___) | |_) |  __/  __/ (_| |                     ║
-║     |_____\___/ \__|____/| .__/ \___|\___|\__,_|                     ║
-║                          |_|                                         ║
+║      _          _   ____                      _                     ║
+║     | |    ___ | |_/ ___| _ __   ___  ___  __| |                    ║
+║     | |   / _ \| __\___ \| '_ \ / _ \/ _ \/ _` |                    ║
+║     | |__| (_) | |_ ___) | |_) |  __/  __/ (_| |                    ║
+║     |_____\___/ \__|____/| .__/ \___|\___|\__,_|                    ║
+║                          |_|                                        ║
 ║                                                                      ║
-║               Zeta-TCP Auto-Scaling Edition                          ║
-║                       Version 5.6                                    ║
+║               Zeta-TCP Auto-Scaling Edition                         ║
+║                       Version 5.6                                   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 EOF
     echo -e "${NC}"
@@ -454,7 +454,10 @@ show_status() {
         REF_COUNT=$(lsmod | grep lotspeed | awk '{print $3}')
         print_kv_row "Reference Count" "${CYAN}$REF_COUNT${NC}"
 
-        ACTIVE_CONNS=$(ss -tin 2>/dev/null | grep -c lotspeed 2>/dev/null || echo "0")
+        # 修复：确保 ACTIVE_CONNS 只是一个数字，没有换行
+        ACTIVE_CONNS=$(ss -tin 2>/dev/null | grep -c lotspeed || echo "0")
+        # 去除可能的换行和空格
+        ACTIVE_CONNS=$(echo $ACTIVE_CONNS | tr -d '\n' | tr -d ' ')
         print_kv_row "Active Connections" "${CYAN}$ACTIVE_CONNS${NC}"
     else
         print_kv_row "Module Status" "${RED}○ Not Loaded${NC}"
@@ -502,6 +505,12 @@ show_status() {
                         beta_val=$((value * 100 / 1024))
                         print_kv_row "Fairness (Beta)" "${beta_val}%"
                         ;;
+                    lotserver_min_cwnd)
+                        print_kv_row "Min CWND" "$value packets"
+                        ;;
+                    lotserver_max_cwnd)
+                        print_kv_row "Max CWND" "$value packets"
+                        ;;
                     lotserver_adaptive)
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
                             print_kv_row "Adaptive Mode" "${GREEN}Enabled${NC}"
@@ -514,6 +523,13 @@ show_status() {
                             print_kv_row "Turbo Mode" "${YELLOW}Enabled ⚡${NC}"
                         else
                             print_kv_row "Turbo Mode" "Disabled"
+                        fi
+                        ;;
+                    lotserver_verbose)
+                        if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
+                            print_kv_row "Verbose Logging" "${CYAN}Enabled${NC}"
+                        else
+                            print_kv_row "Verbose Logging" "Disabled"
                         fi
                         ;;
                     lotserver_safe_mode)
@@ -685,30 +701,52 @@ case "$ACTION" in
         dmesg -w | grep --color=always -i lotspeed
         ;;
     uninstall)
-        print_box_top "${RED}"
-        print_box_row "UNINSTALLATION" "center" "${RED}"
-        print_box_div "${RED}"
+        print_box_top "${MAGENTA}"
+        print_box_row "LotSpeed v$VERSION Uninstaller" "center" "${MAGENTA}"
+        print_box_div "${MAGENTA}"
 
+        # 停止算法
         DEFAULT_ALGO=$(get_default_congestion_control)
+        print_box_row "Switching to $DEFAULT_ALGO..." "left" "${MAGENTA}"
         sysctl -w net.ipv4.tcp_congestion_control=$DEFAULT_ALGO >/dev/null 2>&1
 
+        # 尝试卸载模块
         if rmmod lotspeed 2>/dev/null; then
-             print_kv_row "Module Unloaded" "Success" "${RED}"
+            print_kv_row "Module Unload" "${GREEN}Success${NC}" "${MAGENTA}"
         else
-             print_kv_row "Module Unloaded" "Failed (In Use)" "${RED}"
-             print_box_row "Please reboot to finish cleanup." "center" "${YELLOW}"
+            print_kv_row "Module Unload" "${YELLOW}In Use${NC}" "${MAGENTA}"
+            print_box_div "${MAGENTA}"
+            print_box_row "${YELLOW}⚠ Module is still loaded in memory${NC}" "center" "${MAGENTA}"
+            print_box_row "${YELLOW}Active connections are preventing unload${NC}" "center" "${MAGENTA}"
+            print_box_div "${MAGENTA}"
         fi
 
+        # 删除文件
+        print_box_row "Removing files..." "left" "${MAGENTA}"
         rm -rf $INSTALL_DIR
         rm -f /etc/modules-load.d/lotspeed.conf
         rm -f /lib/modules/$(uname -r)/kernel/net/ipv4/lotspeed.ko
         depmod -a
         sed -i '/net.ipv4.tcp_congestion_control=lotspeed/d' /etc/sysctl.conf
 
-        print_box_div "${RED}"
-        print_box_row "LotSpeed removed successfully." "center" "${RED}"
-        print_box_bottom "${RED}"
+        print_kv_row "Config Files" "${GREEN}Removed${NC}" "${MAGENTA}"
+        print_kv_row "Startup Scripts" "${GREEN}Removed${NC}" "${MAGENTA}"
 
+        # 最终检查
+        print_box_div "${MAGENTA}"
+        if lsmod | grep -q lotspeed; then
+            print_box_row "${RED}╔════════════════════════════════════╗${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}║     REBOOT REQUIRED                ║${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}╟────────────────────────────────────╢${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}║ Module will be completely removed  ║${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}║ after system reboot.               ║${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}╚════════════════════════════════════╝${NC}" "center" "${MAGENTA}"
+        else
+            print_box_row "${GREEN}✅ LotSpeed Completely Uninstalled!${NC}" "center" "${MAGENTA}"
+        fi
+        print_box_bottom "${MAGENTA}"
+
+        # 删除自己
         rm -f /usr/local/bin/lotspeed
         ;;
     *)

@@ -37,14 +37,14 @@ print_banner() {
     cat << "EOF"
 ╔════════════════════════════════════════════════════════════╗
 ║                                                            ║
-║     _          _   ____                      _             ║
-║    | |    ___ | |_/ ___| _ __   ___  ___  __| |            ║
-║    | |   / _ \| __\___ \| '_ \ / _ \/ _ \/ _` |            ║
-║    | |__| (_) | |_ ___) | |_) |  __/  __/ (_| |            ║
-║    |_____\___/ \__|____/| .__/ \___|\___|\__,_|            ║
+║     _          _   ____                      _            ║
+║    | |    ___ | |_/ ___| _ __   ___  ___  __| |           ║
+║    | |   / _ \| __\___ \| '_ \ / _ \/ _ \/ _` |           ║
+║    | |__| (_) | |_ ___) | |_) |  __/  __/ (_| |           ║
+║    |_____\___/ \__|____/| .__/ \___|\___|\__,_|           ║
 ║                         |_|                                ║
 ║                                                            ║
-║              Zeta-TCP Auto-Scaling Edition                 ║
+║              Zeta-TCP Auto-Scaling Edition                ║
 ║                      Version 5.6                           ║
 ║                                                            ║
 ╚════════════════════════════════════════════════════════════╝
@@ -278,6 +278,32 @@ format_bps() {
     fi
 }
 
+# 计算字符串显示宽度（不含ANSI颜色码）
+strlen_no_ansi() {
+    local str="$1"
+    # 移除ANSI颜色码
+    local clean_str=$(echo -e "$str" | sed 's/\x1b\[[0-9;]*m//g')
+    echo ${#clean_str}
+}
+
+# 对齐打印函数
+print_aligned_row() {
+    local label="$1"
+    local value="$2"
+    local label_width=22
+    local value_width=40
+    local total_width=65
+
+    # 处理带颜色的值
+    local value_display_len=$(strlen_no_ansi "$value")
+    local padding=$((value_width - value_display_len))
+    if [[ $padding -lt 0 ]]; then
+        padding=0
+    fi
+
+    printf "  │ %-${label_width}s : %s%${padding}s │\n" "$label" "$value" ""
+}
+
 # 获取系统默认的拥塞控制算法
 get_default_congestion_control() {
     AVAILABLE=$(sysctl net.ipv4.tcp_available_congestion_control | awk -F= '{print $2}')
@@ -293,35 +319,35 @@ get_default_congestion_control() {
 }
 
 show_status() {
-    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║           LotSpeed v$VERSION Status (Zeta-TCP)                  ║${NC}"
-    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║               LotSpeed v$VERSION Status (Zeta-TCP)                    ║${NC}"
+    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
     # 检查模块是否加载
     if lsmod | grep -q lotspeed; then
-        echo -e "  Module Status      : ${GREEN}● Loaded${NC}"
+        print_aligned_row "Module Status" "${GREEN}● Loaded${NC}"
         REF_COUNT=$(lsmod | grep lotspeed | awk '{print $3}')
-        echo -e "  Reference Count    : ${CYAN}$REF_COUNT${NC}"
+        print_aligned_row "Reference Count" "${CYAN}$REF_COUNT${NC}"
         ACTIVE_CONNS=$(ss -tin 2>/dev/null | grep -c lotspeed 2>/dev/null || echo "0")
-        echo -e "  Active Connections : ${CYAN}$ACTIVE_CONNS${NC}"
+        print_aligned_row "Active Connections" "${CYAN}$ACTIVE_CONNS${NC}"
     else
-        echo -e "  Module Status      : ${RED}○ Not Loaded${NC}"
+        print_aligned_row "Module Status" "${RED}○ Not Loaded${NC}"
         return
     fi
 
     # 检查是否为当前算法
     CURRENT=$(sysctl -n net.ipv4.tcp_congestion_control)
     if [[ "$CURRENT" == "lotspeed" ]]; then
-        echo -e "  Active Algorithm   : ${GREEN}lotspeed ✓${NC}"
+        print_aligned_row "Active Algorithm" "${GREEN}lotspeed ✓${NC}"
     else
-        echo -e "  Active Algorithm   : ${YELLOW}$CURRENT${NC}"
+        print_aligned_row "Active Algorithm" "${YELLOW}$CURRENT${NC}"
     fi
 
     echo ""
-    echo -e "${CYAN}┌─────────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${CYAN}│                    Current Parameters                       │${NC}"
-    echo -e "${CYAN}├─────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${CYAN}  ┌───────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}  │                      Current Parameters                      │${NC}"
+    echo -e "${CYAN}  ├───────────────────────────────────────────────────────────────┤${NC}"
 
     if [[ -d /sys/module/lotspeed/parameters ]]; then
         # 读取所有参数
@@ -335,61 +361,61 @@ show_status() {
                     lotserver_rate)
                         formatted=$(format_bytes $value)
                         bps=$(format_bps $value)
-                        printf "  │ %-20s : %-18s (%s)%s│\n" "Global Rate Limit" "$formatted" "$bps" " "
+                        print_aligned_row "Global Rate Limit" "$formatted ($bps)"
                         ;;
                     lotserver_start_rate)
                         formatted=$(format_bytes $value)
                         bps=$(format_bps $value)
-                        printf "  │ %-20s : %-18s (%s)%s│\n" "Soft Start Rate" "$formatted" "$bps" " "
+                        print_aligned_row "Soft Start Rate" "$formatted ($bps)"
                         ;;
                     lotserver_gain)
                         gain_x=$((value / 10))
                         gain_frac=$((value % 10))
-                        printf "  │ %-20s : %-38s │\n" "Gain Factor" "${gain_x}.${gain_frac}x"
+                        print_aligned_row "Gain Factor" "${gain_x}.${gain_frac}x"
                         ;;
                     lotserver_beta)
                         beta_val=$((value * 100 / 1024))
-                        printf "  │ %-20s : %-38s │\n" "Fairness (Beta)" "${beta_val}%"
+                        print_aligned_row "Fairness (Beta)" "${beta_val}%"
                         ;;
                     lotserver_min_cwnd)
-                        printf "  │ %-20s : %-38s │\n" "Min CWND" "$value packets"
+                        print_aligned_row "Min CWND" "$value packets"
                         ;;
                     lotserver_max_cwnd)
-                        printf "  │ %-20s : %-38s │\n" "Max CWND" "$value packets"
+                        print_aligned_row "Max CWND" "$value packets"
                         ;;
                     lotserver_adaptive)
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            printf "  │ %-20s : ${GREEN}%-38s${NC} │\n" "Adaptive Mode" "Enabled"
+                            print_aligned_row "Adaptive Mode" "${GREEN}Enabled${NC}"
                         else
-                            printf "  │ %-20s : ${YELLOW}%-38s${NC} │\n" "Adaptive Mode" "Disabled"
+                            print_aligned_row "Adaptive Mode" "${YELLOW}Disabled${NC}"
                         fi
                         ;;
                     lotserver_turbo)
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            printf "  │ %-20s : ${YELLOW}%-38s${NC} │\n" "Turbo Mode" "Enabled ⚡"
+                            print_aligned_row "Turbo Mode" "${YELLOW}Enabled ⚡${NC}"
                         else
-                            printf "  │ %-20s : %-38s │\n" "Turbo Mode" "Disabled"
+                            print_aligned_row "Turbo Mode" "Disabled"
                         fi
                         ;;
                     lotserver_verbose)
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            printf "  │ %-20s : ${CYAN}%-38s${NC} │\n" "Verbose Logging" "Enabled"
+                            print_aligned_row "Verbose Logging" "${CYAN}Enabled${NC}"
                         else
-                            printf "  │ %-20s : %-38s │\n" "Verbose Logging" "Disabled"
+                            print_aligned_row "Verbose Logging" "Disabled"
                         fi
                         ;;
                     lotserver_safe_mode)
                         if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
-                            printf "  │ %-20s : ${GREEN}%-38s${NC} │\n" "Safe Mode" "Enabled"
+                            print_aligned_row "Safe Mode" "${GREEN}Enabled${NC}"
                         else
-                            printf "  │ %-20s : %-38s │\n" "Safe Mode" "Disabled"
+                            print_aligned_row "Safe Mode" "Disabled"
                         fi
                         ;;
                 esac
             fi
         done
     fi
-    echo -e "${CYAN}└─────────────────────────────────────────────────────────────┘${NC}"
+    echo -e "${CYAN}  └───────────────────────────────────────────────────────────────┘${NC}"
 }
 
 apply_preset() {
@@ -672,31 +698,31 @@ show_info() {
     echo -e "${CYAN}┌─────────────────────────────────────────────────────────────┐${NC}"
     echo -e "${CYAN}│                    Quick Start Guide                        │${NC}"
     echo -e "${CYAN}├─────────────────────────────────────────────────────────────┤${NC}"
-    echo -e "${CYAN}│${NC} ${WHITE}lotspeed status${NC}           - Check current status            ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC} ${WHITE}lotspeed preset balanced${NC}  - Apply balanced preset (5Gbps)  ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC} ${WHITE}lotspeed preset vps100m${NC}   - For 100Mbps VPS                ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC} ${WHITE}lotspeed monitor${NC}          - Monitor real-time logs         ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC} ${WHITE}lotspeed set${NC}              - View all parameters            ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} ${WHITE}lotspeed status${NC}           - Check current status           ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} ${WHITE}lotspeed preset balanced${NC}  - Apply balanced preset (5Gbps) ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} ${WHITE}lotspeed preset vps100m${NC}   - For 100Mbps VPS               ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} ${WHITE}lotspeed monitor${NC}          - Monitor real-time logs        ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} ${WHITE}lotspeed set${NC}              - View all parameters           ${CYAN}│${NC}"
     echo -e "${CYAN}└─────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
     echo -e "${YELLOW}│                  Recommended Settings                       │${NC}"
     echo -e "${YELLOW}├─────────────────────────────────────────────────────────────┤${NC}"
-    echo -e "${YELLOW}│${NC} • VPS/Cloud (≤1Gbps):  ${GREEN}lotspeed preset conservative${NC}        ${YELLOW}│${NC}"
-    echo -e "${YELLOW}│${NC} • VPS/Cloud (>1Gbps):  ${GREEN}lotspeed preset balanced${NC}            ${YELLOW}│${NC}"
-    echo -e "${YELLOW}│${NC} • Dedicated Server:    ${GREEN}lotspeed preset aggressive${NC}          ${YELLOW}│${NC}"
-    echo -e "${YELLOW}│${NC} • Speed Testing:       ${GREEN}lotspeed preset extreme${NC}             ${YELLOW}│${NC}"
-    echo -e "${YELLOW}│${NC} • Debug Issues:        ${GREEN}lotspeed preset debug${NC}               ${YELLOW}│${NC}"
+    echo -e "${YELLOW}│${NC} • VPS/Cloud (≤1Gbps):  ${GREEN}lotspeed preset conservative${NC}       ${YELLOW}│${NC}"
+    echo -e "${YELLOW}│${NC} • VPS/Cloud (>1Gbps):  ${GREEN}lotspeed preset balanced${NC}           ${YELLOW}│${NC}"
+    echo -e "${YELLOW}│${NC} • Dedicated Server:    ${GREEN}lotspeed preset aggressive${NC}         ${YELLOW}│${NC}"
+    echo -e "${YELLOW}│${NC} • Speed Testing:       ${GREEN}lotspeed preset extreme${NC}            ${YELLOW}│${NC}"
+    echo -e "${YELLOW}│${NC} • Debug Issues:        ${GREEN}lotspeed preset debug${NC}              ${YELLOW}│${NC}"
     echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     echo -e "${MAGENTA}┌─────────────────────────────────────────────────────────────┐${NC}"
     echo -e "${MAGENTA}│              What's New in Version 5.6                      │${NC}"
     echo -e "${MAGENTA}├─────────────────────────────────────────────────────────────┤${NC}"
-    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Auto-Scaling${NC}: Automatically climbs to find true limit   ${MAGENTA}│${NC}"
-    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Soft Start${NC}: Begins at 50Mbps, protects slow clients    ${MAGENTA}│${NC}"
-    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Smart Guard${NC}: Loss rate cap (15%) & BDP protection      ${MAGENTA}│${NC}"
-    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Zeta Learning${NC}: AI-powered destination memory           ${MAGENTA}│${NC}"
-    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Safe Mode${NC}: New protection against network storms       ${MAGENTA}│${NC}"
+    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Auto-Scaling${NC}: Automatically climbs to find true limit  ${MAGENTA}│${NC}"
+    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Soft Start${NC}: Begins at 50Mbps, protects slow clients   ${MAGENTA}│${NC}"
+    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Smart Guard${NC}: Loss rate cap (15%) & BDP protection     ${MAGENTA}│${NC}"
+    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Zeta Learning${NC}: AI-powered destination memory          ${MAGENTA}│${NC}"
+    echo -e "${MAGENTA}│${NC} ✨ ${WHITE}Safe Mode${NC}: New protection against network storms      ${MAGENTA}│${NC}"
     echo -e "${MAGENTA}└─────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     echo -e "${GREEN}Installation Details:${NC}"

@@ -125,15 +125,15 @@ print_banner() {
     cat << "EOF"
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                                                                      ║
-║      _          _   ____                      _                     ║
-║     | |    ___ | |_/ ___| _ __   ___  ___  __| |                    ║
-║     | |   / _ \| __\___ \| '_ \ / _ \/ _ \/ _` |                    ║
-║     | |__| (_) | |_ ___) | |_) |  __/  __/ (_| |                    ║
-║     |_____\___/ \__|____/| .__/ \___|\___|\__,_|                    ║
-║                          |_|                                        ║
+║      _          _   ____                      _                      ║
+║     | |    ___ | |_/ ___| _ __   ___  ___  __| |                     ║
+║     | |   / _ \| __\___ \| '_ \ / _ \/ _ \/ _` |                     ║
+║     | |__| (_) | |_ ___) | |_) |  __/  __/ (_| |                     ║
+║     |_____\___/ \__|____/| .__/ \___|\___|\__,_|                     ║
+║                          |_|                                         ║
 ║                                                                      ║
-║               Zeta-TCP Auto-Scaling Edition                         ║
-║                       Version 5.6                                   ║
+║               Zeta-TCP Auto-Scaling Edition                          ║
+║                       Version 5.6rc                                  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 EOF
     echo -e "${NC}"
@@ -449,7 +449,7 @@ show_status() {
 
     # 检查模块状态
     if lsmod | grep -q lotspeed; then
-        print_kv_row "Module Status" "${GREEN}● Loaded ${NC}"
+        print_kv_row "Module Status" "${GREEN}Loaded${NC}"
 
         REF_COUNT=$(lsmod | grep lotspeed | awk '{print $3}')
         print_kv_row "Reference Count" "${CYAN}$REF_COUNT${NC}"
@@ -468,7 +468,7 @@ show_status() {
     # 检查当前算法
     CURRENT=$(sysctl -n net.ipv4.tcp_congestion_control)
     if [[ "$CURRENT" == "lotspeed" ]]; then
-        print_kv_row "Active Algorithm" "${GREEN}lotspeed ✓ ${NC}"
+        print_kv_row "Active Algorithm" "${GREEN}lotspeed${NC}"
     else
         print_kv_row "Active Algorithm" "${YELLOW}$CURRENT${NC}"
     fi
@@ -561,10 +561,10 @@ apply_preset() {
     case $PRESET in
         conservative)
             set_val lotserver_rate 125000000
-            set_val lotserver_start_rate 6250000
+            set_val lotserver_start_rate 12500000
             set_val lotserver_gain 15
             set_val lotserver_min_cwnd 16
-            set_val lotserver_max_cwnd 2000
+            set_val lotserver_max_cwnd 4000
             set_val lotserver_beta 717
             set_val lotserver_adaptive 1
             set_val lotserver_turbo 0
@@ -572,8 +572,8 @@ apply_preset() {
             print_box_row "Applied: Conservative (1Gbps, 1.5x, Safe)" "left"
             ;;
         balanced)
-            set_val lotserver_rate 625000000
-            set_val lotserver_start_rate 12500000
+            set_val lotserver_rate 125000000
+            set_val lotserver_start_rate 25000000
             set_val lotserver_gain 20
             set_val lotserver_min_cwnd 16
             set_val lotserver_max_cwnd 5000
@@ -583,47 +583,10 @@ apply_preset() {
             set_val lotserver_safe_mode 1
             print_box_row "Applied: Balanced (5Gbps, 2.0x, Adaptive)" "left"
             ;;
-        aggressive)
-            set_val lotserver_rate 1250000000
-            set_val lotserver_start_rate 62500000
-            set_val lotserver_gain 30
-            set_val lotserver_min_cwnd 32
-            set_val lotserver_max_cwnd 8000
-            set_val lotserver_beta 819
-            set_val lotserver_adaptive 1
-            set_val lotserver_turbo 0
-            set_val lotserver_safe_mode 0
-            print_box_row "Applied: Aggressive (10Gbps, 3.0x, No Safe)" "left"
-            ;;
-        extreme)
-            set_val lotserver_rate 2500000000
-            set_val lotserver_start_rate 125000000
-            set_val lotserver_gain 50
-            set_val lotserver_min_cwnd 50
-            set_val lotserver_max_cwnd 15000
-            set_val lotserver_beta 921
-            set_val lotserver_adaptive 0
-            set_val lotserver_turbo 1
-            set_val lotserver_safe_mode 0
-            print_box_row "Applied: EXTREME (20Gbps, 5.0x, TURBO)" "left" "${YELLOW}"
-            ;;
-        vps100m)
-            set_val lotserver_rate 12500000
-            set_val lotserver_start_rate 1250000
-            set_val lotserver_gain 18
-            set_val lotserver_min_cwnd 10
-            set_val lotserver_max_cwnd 1000
-            set_val lotserver_beta 717
-            set_val lotserver_adaptive 1
-            set_val lotserver_turbo 0
-            set_val lotserver_safe_mode 1
-            print_box_row "Applied: VPS 100M (100Mbps, 1.8x)" "left"
-            ;;
         *)
             print_box_row "Unknown preset: $PRESET" "left" "${RED}"
             print_box_div
-            print_box_row "Available: conservative, balanced, aggressive," "left"
-            print_box_row "           extreme, vps100m" "left"
+            print_box_row "Available: conservative, balanced," "left"
             print_box_bottom
             exit 1
             ;;
@@ -716,8 +679,9 @@ case "$ACTION" in
         else
             print_kv_row "Module Unload" "${YELLOW}In Use${NC}" "${MAGENTA}"
             print_box_div "${MAGENTA}"
-            print_box_row "${YELLOW}⚠ Module is still loaded in memory ${NC}" "center" "${MAGENTA}"
+            print_box_row "${YELLOW}Module is still loaded in memory ${NC}" "center" "${MAGENTA}"
             print_box_row "${YELLOW}Active connections are preventing unload${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}Clean everything after reboot${NC}" "center" "${MAGENTA}"
             print_box_div "${MAGENTA}"
         fi
 

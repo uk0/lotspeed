@@ -122,6 +122,13 @@ Note: v3.3 includes ProbeRTT, Smart Startup, ECN support
 </div>
 
 
+### test iperf3
+
+```bash
+ iperf3 -s -p 25201
+ iperf3 -c green1 -p 25201 -R -t 30
+```
+
 
 ### changelog
 * 支持 `debian`,`ubunut` 5.x.x ,6.x.x 内核

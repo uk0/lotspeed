@@ -7,7 +7,7 @@
 
 ### branch explanation
 
-* `zeta-tcp`: lotspeed zeta-tcp 参考AppEx Networking TCP算法优化版本
+* `zeta-tcp`: lotspeed zeta-tcp 版本([Appex Networking zeta-tcp](https://appexnetworks.com/wp-content/uploads/2024/02/ZetaTCP-Whitepaper-V2.0.pdf))
 
 
 * auto install

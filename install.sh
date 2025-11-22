@@ -602,7 +602,14 @@ set_param() {
         print_box_row "Parameter Set Error" "center" "${RED}"
         print_box_div
         print_box_row "Usage: lotspeed set <parameter> <value>" "left"
-        print_box_row "Example: lotspeed set lotserver_gain 25" "left"
+        print_box_row "Example: lotspeed set lotserver_gain 20" "left"
+        print_box_row "Example: lotspeed set lotserver_start_rate 10000000" "left"
+        print_box_row "Example: lotspeed set lotserver_rate 125000000" "left"
+        print_box_row "Example: lotspeed set lotserver_min_cwnd 16" "left"
+        print_box_row "Example: lotspeed set lotserver_max_cwnd 15000" "left"
+        print_box_row "Example: lotspeed set lotserver_beta 717" "left"
+        print_box_row "Example: lotspeed set lotserver_verbose 1/0" "left"
+        print_box_row "Example: lotspeed set lotserver_safe_mode 1/0" "left"
         print_box_bottom
         exit 1
     fi
@@ -701,12 +708,10 @@ case "$ACTION" in
         if lsmod | grep -q lotspeed; then
             # 内嵌的重启提示框
             print_box_row "" "center" "${MAGENTA}"
-            print_box_row "${RED}        ╔════════════════════════════════════╗        ${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}        ║        REBOOT REQUIRED             ║        ${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}        ╟────────────────────────────────────╢        ${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}        ║  Module will be completely removed ║        ${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}        ║  after system reboot.              ║        ${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}        ╚════════════════════════════════════╝        ${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED} ${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}REBOOT REQUIRED{NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}Module will be completely removed${NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}after system reboot.${NC}" "center" "${MAGENTA}"
             print_box_row "" "center" "${MAGENTA}"
         else
             print_box_row "${GREEN}✅ LotSpeed Completely Uninstalled!${NC}" "center" "${MAGENTA}"

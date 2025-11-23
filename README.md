@@ -78,12 +78,26 @@ root@racknerd-6bf1e7b:~# lotspeed
 ### test iperf3 loss
 
 ```bash
-
+# disable lro
+ethtool -K eth0 lro off
+# 丢包16%
 sudo tc qdisc add dev ens3 root netem loss 16%
+sudo tc qdisc add dev eth0 root netem loss 16%
 
+#取消丢包
 sudo tc qdisc del dev ens3 root netem 
+sudo tc qdisc del dev eth0 root netem 
 
-
+# test command
 iperf3 -s -p 25201
 iperf3 -c green1 -p 25201 -R -t 30
 ```
+
+
+### todo
+
+✅ 基于“时延+丢包”混合驱动的拥塞控制
+✅ 学习型状态机
+❌ 概率性丢包检测
+❌ 反向控制
+

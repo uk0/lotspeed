@@ -15,7 +15,9 @@
 *.ilk
 *.map
 *.exp
-
+exp
+dump_func
+.idea
 kernel
 
 # Precompiled Headers

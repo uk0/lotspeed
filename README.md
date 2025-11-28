@@ -89,8 +89,8 @@ sudo tc qdisc del dev ens3 root netem
 sudo tc qdisc del dev eth0 root netem 
 
 # test command
-iperf3 -s -p 25201
-iperf3 -c green1 -p 25201 -R -t 30
+iperf3 -4 -s -p 35201
+iperf3 -c green1 -p 35201 -R -t 30
 ```
 
 
@@ -101,3 +101,8 @@ iperf3 -c green1 -p 25201 -R -t 30
 ❌ 概率性丢包检测
 ❌ 反向控制
 
+
+PAC (Proactive ACK Control) for TCP Incast Congestion
+==========================================
+
+* https://github.com/uk0/TCP-Incast/tree/zeta-tcp 

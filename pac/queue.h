@@ -5,7 +5,7 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include <linux/string.h>
-#include <net/net_namespace.h>
+#include <net/net_namespace.h>  // 必须添加，用于 init_net
 
 // okfn 签名在 4.4+ 内核中改变
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
@@ -78,10 +78,7 @@ static int Enqueue_PacketQueue(struct PacketQueue* q, struct sk_buff *skb,
     return 1;
 }
 
-// 只获取包信息，不直接发送（用于 tasklet 方案）
-static int Dequeue_PacketQueue_GetPacket(struct PacketQueue* q,
-                                          struct sk_buff **skb_out,
-                                          okfn_t *okfn_out)
+static int Dequeue_PacketQueue(struct PacketQueue* q)
 {
     struct Packet *pkt;
 
@@ -90,8 +87,13 @@ static int Dequeue_PacketQueue_GetPacket(struct PacketQueue* q,
 
     pkt = &q->packets[q->head];
 
-    *skb_out = pkt->skb;
-    *okfn_out = pkt->okfn;
+    if (pkt->okfn && pkt->skb) {
+#if defined(OKFN_NEW_API)
+        pkt->okfn(&init_net, NULL, pkt->skb);
+#else
+        pkt->okfn(pkt->skb);
+#endif
+    }
 
     // 清理
     pkt->skb = NULL;

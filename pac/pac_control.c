@@ -14,6 +14,17 @@ enum {
 	T_STRING // char[]
 };
 
+/*
+ * 兼容性处理：PDE_DATA 在内核 5.17+ 被移除
+ * 5.17+ 使用 pde_data() 函数
+ * 旧版本使用 PDE_DATA() 宏
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
+#define PAC_PDE_DATA(inode) pde_data(inode)
+#else
+#define PAC_PDE_DATA(inode) PDE_DATA(inode)
+#endif
+
 // 映射表结构
 struct pac_param_map {
     const char *name;
@@ -62,7 +73,7 @@ static int pac_show(struct seq_file *m, void *v)
 
 static int pac_open(struct inode *inode, struct file *file)
 {
-    return single_open(file, pac_show, PDE_DATA(inode));
+    return single_open(file, pac_show, PAC_PDE_DATA(inode));
 }
 
 // --- Write (SET) ---

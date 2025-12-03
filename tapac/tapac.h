@@ -36,17 +36,14 @@
     #define TAPAC_USE_PROC_OPS 1
 #endif
 
-/* ============ 时间工具 ============ */
-#define TAPAC_TIME_SHIFT    10
-
 static inline u32 tapac_get_time_us(void)
 {
-    return (u32)(ktime_to_ns(ktime_get()) >> TAPAC_TIME_SHIFT);
+    return (u32)(ktime_to_ns(ktime_get()) / 1000ULL);
 }
 
 static inline u32 tapac_get_time_ms(void)
 {
-    return tapac_get_time_us() / 1000;
+    return (u32)(ktime_to_ns(ktime_get()) / 1000000ULL);
 }
 
 /* ============ 单位转换 ============ */
@@ -100,7 +97,7 @@ static inline u32 tapac_get_time_ms(void)
 #define FLOW_MAX_COUNT      10240
 
 /* ============ 包队列参数 ============ */
-#define PKT_QUEUE_SIZE      131072
+#define PKT_QUEUE_SIZE      2500000
 
 /* ============ RTT 历史记录 ============ */
 #define RTT_HISTORY_SIZE    8

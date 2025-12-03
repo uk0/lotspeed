@@ -1,5 +1,5 @@
 /*
- * tapac_standalone.c - TCP Acceleration PAC v4. 0
+ * tapac_standalone.c - TCP Acceleration PAC v4.0
  *
  * 独立的内核 TCP 加速模块，包含：
  *   - 双向流分离 + 动态窗口放大
@@ -490,7 +490,7 @@ module_param(param_dev, charp, 0);
  * 日志宏
  * ============================================================ */
 
-#define TAPAC_LOG(eng, fmt, .. .) do { \
+#define TAPAC_LOG(eng, fmt, ...) do { \
     if ((eng)->params.debug) \
         printk(KERN_DEBUG "TAPAC: " fmt, ##__VA_ARGS__); \
 } while(0)
@@ -498,7 +498,7 @@ module_param(param_dev, charp, 0);
 #define TAPAC_INFO(fmt, ...) \
     printk(KERN_INFO "TAPAC: " fmt, ##__VA_ARGS__)
 
-#define TAPAC_ERR(fmt, .. .) \
+#define TAPAC_ERR(fmt, ...) \
     printk(KERN_ERR "TAPAC: " fmt, ##__VA_ARGS__)
 
 /* ============================================================
@@ -621,7 +621,7 @@ static int tapac_queue_enqueue(struct tapac_pkt_queue *q, struct sk_buff *skb,
     }
 
     q->ring[q->tail].skb = skb;
-    q->ring[q->tail]. okfn = okfn;
+    q->ring[q->tail].okfn = okfn;
     q->ring[q->tail].trigger = trigger;
     q->ring[q->tail].enqueue_time = enqueue_time;
 
@@ -775,13 +775,13 @@ static struct tapac_flow *tapac_flow_create(struct tapac_flow_table *ft,
     flow->local_port = sport;
     flow->remote_port = dport;
 
-    flow->info. direction = direction;
-    flow->info. phase = PHASE_SLOW_START;
+    flow->info.direction = direction;
+    flow->info.phase = PHASE_SLOW_START;
     flow->info.srtt = min_rtt;
     flow->info.last_update = tapac_get_time_us();
     flow->info.default_win = 65535;
 
-    flow->info.ackq. bucket_idx = ((__force u16)sport ^ (__force u16)dport) & (ACK_BUCKETS - 1);
+    flow->info.ackq.bucket_idx = ((__force u16)sport ^ (__force u16)dport) & (ACK_BUCKETS - 1);
 
     tapac_bidir_init(&flow->info);
 
@@ -829,7 +829,7 @@ static int tapac_flow_cleanup_timeout(struct tapac_flow_table *ft, u32 timeout_u
 
     for (i = 0; i < FLOW_TABLE_SIZE; i++) {
         list_for_each_entry_safe(flow, tmp, &ft->buckets[i], list) {
-            if (now - flow->info. last_update > timeout_us) {
+            if (now - flow->info.last_update > timeout_us) {
                 list_del(&flow->list);
                 if (ft->count > 0)
                     ft->count--;
@@ -1053,11 +1053,11 @@ static void tapac_sack_merge_blocks(struct tapac_sack_info *sack)
         merged = false;
         for (i = 0; i < sack->num_blocks && !merged; i++) {
             for (j = i + 1; j < sack->num_blocks; j++) {
-                if (sack->blocks[i]. end >= sack->blocks[j].start &&
-                    sack->blocks[i]. start <= sack->blocks[j].end) {
+                if (sack->blocks[i].end >= sack->blocks[j].start &&
+                    sack->blocks[i].start <= sack->blocks[j].end) {
                     if (tapac_seq_lt(sack->blocks[j].start, sack->blocks[i].start))
-                        sack->blocks[i].start = sack->blocks[j]. start;
-                    if (tapac_seq_gt(sack->blocks[j].end, sack->blocks[i]. end))
+                        sack->blocks[i].start = sack->blocks[j].start;
+                    if (tapac_seq_gt(sack->blocks[j].end, sack->blocks[i].end))
                         sack->blocks[i].end = sack->blocks[j].end;
                     for (k = j; k < sack->num_blocks - 1; k++)
                         sack->blocks[k] = sack->blocks[k + 1];
@@ -1080,7 +1080,7 @@ static void tapac_sack_sort_blocks(struct tapac_sack_info *sack)
 
     for (i = 0; i < sack->num_blocks - 1; i++) {
         for (j = i + 1; j < sack->num_blocks; j++) {
-            if (tapac_seq_gt(sack->blocks[i].start, sack->blocks[j]. start)) {
+            if (tapac_seq_gt(sack->blocks[i].start, sack->blocks[j].start)) {
                 tmp = sack->blocks[i];
                 sack->blocks[i] = sack->blocks[j];
                 sack->blocks[j] = tmp;
@@ -1148,14 +1148,14 @@ static void tapac_update_sack_blocks(struct tapac_flow_info *info, u32 seq, u32 
             if (tapac_seq_lt(seq, sack->blocks[i].start))
                 sack->blocks[i].start = seq;
             if (tapac_seq_gt(seq_end, sack->blocks[i].end))
-                sack->blocks[i]. end = seq_end;
+                sack->blocks[i].end = seq_end;
             tapac_sack_merge_blocks(sack);
             return;
         }
     }
 
     if (sack->num_blocks < MAX_SACK_BLOCKS) {
-        sack->blocks[sack->num_blocks]. start = seq;
+        sack->blocks[sack->num_blocks].start = seq;
         sack->blocks[sack->num_blocks].end = seq_end;
         sack->num_blocks++;
         tapac_sack_sort_blocks(sack);
@@ -1253,7 +1253,7 @@ static void tapac_bucket_unlink_node(struct tapac_engine *eng,
         ackq->depth--;
 
     if (flow->info.queued_acks > 0)
-        flow->info. queued_acks--;
+        flow->info.queued_acks--;
 
     /* 从 bucket 链表摘除 */
     if (n->sched_prev)
@@ -1284,7 +1284,7 @@ static void tapac_ack_init(struct tapac_engine *eng)
 
     for (i = 0; i < ACK_BUCKETS; i++) {
         eng->ack_buckets[i].head = NULL;
-        eng->ack_buckets[i]. tail = NULL;
+        eng->ack_buckets[i].tail = NULL;
     }
 
     eng->ack_cursor = 0;
@@ -1307,7 +1307,7 @@ static void tapac_ack_cleanup(struct tapac_engine *eng)
             tapac_free_ack_node(n);
             n = next;
         }
-        eng->ack_buckets[i]. head = NULL;
+        eng->ack_buckets[i].head = NULL;
         eng->ack_buckets[i].tail = NULL;
     }
 
@@ -1390,7 +1390,7 @@ static int tapac_ack_queue(struct tapac_engine *eng, struct tapac_flow *flow,
 
     /* 队列已满 */
     if (ackq->depth >= ACK_MAX_QUEUE_DEPTH) {
-        eng->stats. ack_queue_full++;
+        eng->stats.ack_queue_full++;
         spin_unlock_irqrestore(&eng->ack_lock, flags);
         return -ENOMEM;
     }
@@ -1478,7 +1478,7 @@ static int tapac_send_ack_node(struct tapac_engine *eng, struct tapac_ack_node *
 
     flow = n->flow;
 
-    ndev = dev_get_by_name(&init_net, eng->params. nic);
+    ndev = dev_get_by_name(&init_net, eng->params.nic);
     if (!ndev)
         return -ENODEV;
 
@@ -1636,22 +1636,22 @@ static void tapac_ack_schedule(struct tapac_engine *eng)
 
 static void tapac_rate_init(struct tapac_engine *eng)
 {
-    eng->rate. current_rate = (u64)eng->params. bucket_size * 8;
+    eng->rate.current_rate = (u64)eng->params.bucket_size * 8;
     eng->rate.target_rate = eng->rate.current_rate;
     eng->rate.min_rate = RATE_MIN_BPS;
     eng->rate.max_rate = RATE_MAX_BPS;
-    eng->rate. cwnd = 500;
-    eng->rate. ssthresh = 1000;
+    eng->rate.cwnd = 500;
+    eng->rate.ssthresh = 1000;
     eng->rate.base_rtt = eng->params.min_rtt;
-    eng->rate. last_rtt = eng->params.min_rtt;
+    eng->rate.last_rtt = eng->params.min_rtt;
     eng->rate.in_slow_start = 1;
-    eng->rate.state = NET_STATE
+    eng->rate.state = NET_STATE_UNKNOWN;
     eng->rate.last_update = tapac_get_time_us();
     eng->rate.pacing_rate = eng->rate.current_rate / 8;
-    eng->rate. next_send_ns = ktime_to_ns(ktime_get());
+    eng->rate.next_send_ns = ktime_to_ns(ktime_get());
     eng->rate.pacing_gain = 1000;
 
-    spin_lock_init(&eng->rate. lock);
+    spin_lock_init(&eng->rate.lock);
 }
 
 static void tapac_rate_update_loss(struct tapac_engine *eng, bool is_loss)
@@ -1670,7 +1670,7 @@ static void tapac_rate_update_loss(struct tapac_engine *eng, bool is_loss)
     if (eng->rate.total_packets >= 1000) {
         eng->rate.loss_rate = (eng->rate.loss_count * 1000) / eng->rate.total_packets;
         eng->rate.loss_count = 0;
-        eng->rate. total_packets = 0;
+        eng->rate.total_packets = 0;
     }
 
     spin_unlock_irqrestore(&eng->rate.lock, flags);
@@ -1690,8 +1690,8 @@ static void tapac_rate_update_rtt(struct tapac_engine *eng, u32 rtt_us)
         eng->rate.base_rtt = rtt_us;
 
     trend = (s32)rtt_us - (s32)eng->rate.last_rtt;
-    eng->rate. rtt_trend = (eng->rate.rtt_trend * 7 + trend) / 8;
-    eng->rate. last_rtt = rtt_us;
+    eng->rate.rtt_trend = (eng->rate.rtt_trend * 7 + trend) / 8;
+    eng->rate.last_rtt = rtt_us;
 
     spin_unlock_irqrestore(&eng->rate.lock, flags);
 }
@@ -1713,10 +1713,10 @@ static enum tapac_net_state tapac_detect_net_state(struct tapac_engine *eng)
             return NET_STATE_CONGESTED;
     }
 
-    if (eng->rate. rtt_trend > (s32)(eng->rate.base_rtt / 4))
+    if (eng->rate.rtt_trend > (s32)(eng->rate.base_rtt / 4))
         return NET_STATE_CONGESTED;
 
-    if (eng->rate. loss_rate >= 50)
+    if (eng->rate.loss_rate >= 50)
         return NET_STATE_CONGESTED;
 
     return NET_STATE_HEALTHY;
@@ -1764,8 +1764,8 @@ static void tapac_rate_adjust(struct tapac_engine *eng)
     case NET_STATE_SEVERE_CONGESTION:
     case NET_STATE_LOSS_DETECTED:
         new_rate = new_rate * RATE_DECREASE_FACTOR / 1000;
-        eng->rate. ssthresh = eng->rate.cwnd / 2;
-        if (eng->rate. ssthresh < 4)
+        eng->rate.ssthresh = eng->rate.cwnd / 2;
+        if (eng->rate.ssthresh < 4)
             eng->rate.ssthresh = 4;
         eng->rate.in_slow_start = (state == NET_STATE_LOSS_DETECTED) ? 1 : 0;
         break;
@@ -1849,7 +1849,7 @@ static void tapac_update_win_factor(struct tapac_engine *eng,
             } else {
                 new_factor = bidir->target_win_factor;
             }
-        } else if (eng->rate. state == NET_STATE_CONGESTED) {
+        } else if (eng->rate.state == NET_STATE_CONGESTED) {
             new_factor = bidir->target_win_factor * 950 / 1000;
         } else {
             new_factor = bidir->target_win_factor * 800 / 1000;
@@ -1890,7 +1890,7 @@ static u16 tapac_inflate_window(struct tapac_engine *eng,
         bidir->target_win_factor = 2000;
     }
 
-    real_win = (u32)orig_win << info->win. rcv_wscale;
+    real_win = (u32)orig_win << info->win.rcv_wscale;
 
     if (bidir->dl_loss_detected)
         return orig_win;
@@ -1962,7 +1962,7 @@ static void tapac_modify_ack_window(struct sk_buff *skb,
 
     th->window = htons(new_win);
     info->win.advertised_win = new_win;
-    info->win. last_win_update = tapac_get_time_us();
+    info->win.last_win_update = tapac_get_time_us();
     eng->stats.win_inflated++;
 }
 
@@ -2070,8 +2070,8 @@ static u32 tapac_measure_rtt(struct sk_buff *skb, struct tapac_flow *flow,
     tsval = ntohl(*(u32 *)(ts_opt + 2));
     tsecr = ntohl(*(u32 *)(ts_opt + 6));
 
-    if (tsecr != 0 && info->rtt. last_tsval != 0) {
-        if (tsecr == info->rtt. last_tsval) {
+    if (tsecr != 0 && info->rtt.last_tsval != 0) {
+        if (tsecr == info->rtt.last_tsval) {
             rtt = tapac_get_time_us() - info->rtt.last_tsval_time;
         } else {
             u32 now = tapac_get_time_us();
@@ -2088,7 +2088,7 @@ static u32 tapac_measure_rtt(struct sk_buff *skb, struct tapac_flow *flow,
             info->srtt = (info->srtt * 875 + rtt * 125) / 1000;
         }
 
-        if (rtt < info->rtt.min_rtt || info->rtt. min_rtt == 0)
+        if (rtt < info->rtt.min_rtt || info->rtt.min_rtt == 0)
             info->rtt.min_rtt = rtt;
         if (rtt > info->rtt.max_rtt)
             info->rtt.max_rtt = rtt;
@@ -2201,7 +2201,7 @@ static bool tapac_dl_token_try_get(struct tapac_engine *eng, u32 amount)
     if (max_tokens < 1024 * 1024)
         max_tokens = 1024 * 1024;
     if (max_tokens > eng->params.bucket_size)
-        max_tokens = eng->params. bucket_size;
+        max_tokens = eng->params.bucket_size;
 
     if (eng->dl_tokens + amount <= max_tokens) {
         eng->dl_tokens += amount;
@@ -2398,7 +2398,7 @@ static int tapac_send_sack_ack(struct tapac_engine *eng, struct tapac_flow *flow
 
     info = &flow->info;
 
-    if (info->rcv_sack. num_blocks < SACK_INJECT_MIN_BLOCKS)
+    if (info->rcv_sack.num_blocks < SACK_INJECT_MIN_BLOCKS)
         return 0;
 
     if (! info->sack_permitted)
@@ -2412,7 +2412,7 @@ static int tapac_send_sack_ack(struct tapac_engine *eng, struct tapac_flow *flow
     if (sack_len == 0)
         return 0;
 
-    ndev = dev_get_by_name(&init_net, eng->params. nic);
+    ndev = dev_get_by_name(&init_net, eng->params.nic);
     if (!ndev)
         return -ENODEV;
 
@@ -2512,7 +2512,7 @@ static int tapac_send_sack_ack(struct tapac_engine *eng, struct tapac_flow *flow
 
     last_sack_ack_time = now;
     eng->stats.sack_generated++;
-    eng->stats. ack_real_sent++;
+    eng->stats.ack_real_sent++;
 
     return 1;
 }
@@ -2644,7 +2644,7 @@ static unsigned int tapac_hook_in(unsigned int hooknum, struct sk_buff *skb,
 
     /* SYN 处理：客户端发起连接 */
     if (th->syn && !th->ack) {
-        spin_lock_irqsave(&eng->ft. lock, flags);
+        spin_lock_irqsave(&eng->ft.lock, flags);
         flow = tapac_flow_lookup(&eng->ft, iph->daddr, iph->saddr,
                                  th->dest, th->source);
         if (! flow) {
@@ -2653,13 +2653,13 @@ static unsigned int tapac_hook_in(unsigned int hooknum, struct sk_buff *skb,
                                      th->dest, th->source,
                                      FLOW_DIR_SERVER, eng->params.min_rtt);
             if (flow) {
-                flow->info. last_update = now;
+                flow->info.last_update = now;
                 if (tapac_check_sack_permitted(th, tcp_hdr_len)) {
                     flow->info.sack_permitted = 1;
                     flow->info.flags |= FLOW_FLAG_SACK_PERMITTED;
                 }
-                tapac_parse_win_scale(th, tcp_hdr_len, &flow->info. win);
-                flow->info.bidir. ul_rcv_nxt = seq + 1;
+                tapac_parse_win_scale(th, tcp_hdr_len, &flow->info.win);
+                flow->info.bidir.ul_rcv_nxt = seq + 1;
                 eng->stats.flows_created++;
             }
         } else {
@@ -2682,7 +2682,7 @@ static unsigned int tapac_hook_in(unsigned int hooknum, struct sk_buff *skb,
                 info->flags |= FLOW_FLAG_SACK_PERMITTED;
             }
             tapac_parse_win_scale(th, tcp_hdr_len, &info->win);
-            info->bidir. dl_last_data_seq = seq;
+            info->bidir.dl_last_data_seq = seq;
             info->last_update = now;
         }
         return NF_ACCEPT;
@@ -2774,7 +2774,7 @@ static unsigned int tapac_hook_in(unsigned int hooknum, struct sk_buff *skb,
 
         if (eng->params.generate_sack && info->sack_permitted) {
             tapac_update_sack_blocks(info, seq, payload_len);
-            if (is_ooo && info->rcv_sack. num_blocks > 0) {
+            if (is_ooo && info->rcv_sack.num_blocks > 0) {
                 bidir->ul_need_ack = 1;
                 bidir->ul_pending_acks++;
             }
@@ -2816,7 +2816,7 @@ static unsigned int tapac_hook_in(unsigned int hooknum, struct sk_buff *skb,
 
     /* 触发独立 SACK ACK */
     if (is_ooo && eng->params.generate_sack && info->sack_permitted &&
-        info->rcv_sack. num_blocks >= 1 && bidir->ul_ooo_count >= 5) {
+        info->rcv_sack.num_blocks >= 1 && bidir->ul_ooo_count >= 5) {
         tapac_send_sack_ack(eng, flow);
         bidir->ul_ooo_count = 0;
         bidir->ul_need_ack = 0;
@@ -2887,7 +2887,7 @@ static unsigned int tapac_hook_out(unsigned int hooknum, struct sk_buff *skb,
         if (! th->ack) {
             flow = tapac_flow_create(&eng->ft, iph->saddr, iph->daddr,
                                      th->source, th->dest,
-                                     FLOW_DIR_CLIENT, eng->params. min_rtt);
+                                     FLOW_DIR_CLIENT, eng->params.min_rtt);
             if (flow) {
                 flow->info.last_data_seq = ntohl(th->seq);
                 flow->info.my_seq = ntohl(th->seq);
@@ -2905,7 +2905,7 @@ static unsigned int tapac_hook_out(unsigned int hooknum, struct sk_buff *skb,
                                      FLOW_DIR_SERVER, eng->params.min_rtt);
             if (flow) {
                 flow->info.last_ack_seq = ntohl(th->ack_seq);
-                flow->info. my_seq = ntohl(th->seq);
+                flow->info.my_seq = ntohl(th->seq);
                 flow->info.last_update = tapac_get_time_us();
                 tapac_parse_win_scale(th, th->doff * 4, &flow->info.win);
                 if (tapac_check_sack_permitted(th, th->doff * 4)) {
@@ -2960,7 +2960,7 @@ static unsigned int tapac_hook_out(unsigned int hooknum, struct sk_buff *skb,
         if (tapac_seq_gt(ack, bidir->ul_last_ack_seq)) {
             bidir->ul_last_ack_seq = ack;
             info->last_ack_seq = ack;
-            eng->stats. ack_created++;
+            eng->stats.ack_created++;
         }
 
         tapac_stamp_tsval(skb, tsval);
@@ -3060,7 +3060,7 @@ static enum hrtimer_restart tapac_timer_callback(struct hrtimer *timer)
         if (eng->avg_rtt < eng->params.min_rtt)
             eng->avg_rtt = eng->params.min_rtt;
         if (eng->avg_rtt > eng->params.max_rtt)
-            eng->avg_rtt = eng->params. max_rtt;
+            eng->avg_rtt = eng->params.max_rtt;
     }
 
     eng->traffic = 0;
@@ -3084,7 +3084,7 @@ static enum hrtimer_restart tapac_timer_callback(struct hrtimer *timer)
         cleanup_counter = 0;
     }
 
-    interval = ktime_set(0, US_TO_NS(eng->params. timer_interval_us));
+    interval = ktime_set(0, US_TO_NS(eng->params.timer_interval_us));
     hrtimer_forward_now(timer, interval);
 
     return HRTIMER_RESTART;
@@ -3102,21 +3102,21 @@ static int tapac_stats_show(struct seq_file *m, void *v)
         return 0;
 
     seq_printf(m, "=== TAPAC Statistics v4.0 ===\n");
-    seq_printf(m, "Interface: %s\n", eng->params. nic);
+    seq_printf(m, "Interface: %s\n", eng->params.nic);
     seq_printf(m, "Running: %s\n", eng->running ? "YES" : "NO");
     seq_printf(m, "Flows: %u / %u\n", eng->ft.count, FLOW_MAX_COUNT);
 
     seq_printf(m, "\n--- ACK Scheduler ---\n");
-    seq_printf(m, "Enabled: %s\n", eng->params. use_ack_scheduler ? "YES" : "NO");
+    seq_printf(m, "Enabled: %s\n", eng->params.use_ack_scheduler ? "YES" : "NO");
     seq_printf(m, "Scheduled flows: %u\n", eng->ack_scheduled_flows);
-    seq_printf(m, "Created: %llu\n", eng->stats. ack_created);
+    seq_printf(m, "Created: %llu\n", eng->stats.ack_created);
     seq_printf(m, "Merged: %llu\n", eng->stats.ack_merged);
     seq_printf(m, "Scheduled: %llu\n", eng->stats.ack_scheduled);
-    seq_printf(m, "Real sent: %llu\n", eng->stats. ack_real_sent);
-    seq_printf(m, "Queue full: %llu\n", eng->stats. ack_queue_full);
+    seq_printf(m, "Real sent: %llu\n", eng->stats.ack_real_sent);
+    seq_printf(m, "Queue full: %llu\n", eng->stats.ack_queue_full);
 
     seq_printf(m, "\n--- SACK ---\n");
-    seq_printf(m, "Generate: %s\n", eng->params. generate_sack ?  "YES" : "NO");
+    seq_printf(m, "Generate: %s\n", eng->params.generate_sack ?  "YES" : "NO");
     seq_printf(m, "Parsed: %llu\n", eng->stats.sack_parsed);
     seq_printf(m, "Generated: %llu\n", eng->stats.sack_generated);
 
@@ -3139,18 +3139,18 @@ static int tapac_stats_show(struct seq_file *m, void *v)
 
     seq_printf(m, "\n--- RTT ---\n");
     seq_printf(m, "Samples: %llu\n", eng->stats.rtt_samples);
-    seq_printf(m, "Avg RTT: %u us (%u. %02u ms)\n",
+    seq_printf(m, "Avg RTT: %u us (%u.%02u ms)\n",
                eng->avg_rtt, eng->avg_rtt / 1000, (eng->avg_rtt % 1000) / 10);
 
     seq_printf(m, "\n--- Flows ---\n");
     seq_printf(m, "Created: %llu\n", eng->stats.flows_created);
-    seq_printf(m, "Destroyed: %llu\n", eng->stats. flows_destroyed);
+    seq_printf(m, "Destroyed: %llu\n", eng->stats.flows_destroyed);
 
     seq_printf(m, "\n--- Packets ---\n");
     seq_printf(m, "RX: %llu\n", eng->stats.pkts_rx);
-    seq_printf(m, "TX: %llu\n", eng->stats. pkts_tx);
+    seq_printf(m, "TX: %llu\n", eng->stats.pkts_tx);
     seq_printf(m, "Queued: %llu\n", eng->stats.pkts_queued);
-    seq_printf(m, "Dropped: %llu\n", eng->stats. pkts_dropped);
+    seq_printf(m, "Dropped: %llu\n", eng->stats.pkts_dropped);
 
     seq_printf(m, "\n--- Traffic ---\n");
     seq_printf(m, "Bytes RX: %llu\n", eng->stats.bytes_rx);
@@ -3164,11 +3164,11 @@ static int tapac_stats_show(struct seq_file *m, void *v)
                eng->q_low ? eng->q_low->size : 0, PKT_QUEUE_SIZE);
 
     seq_printf(m, "\n--- Token Buckets ---\n");
-    seq_printf(m, "DL Tokens: %llu / %u\n", eng->dl_tokens, eng->params. bucket_size);
+    seq_printf(m, "DL Tokens: %llu / %u\n", eng->dl_tokens, eng->params.bucket_size);
     seq_printf(m, "UL Tokens: %llu\n", eng->ul_tokens);
 
     seq_printf(m, "\n--- Rate Control ---\n");
-    seq_printf(m, "Current rate: %llu bps\n", eng->rate. current_rate);
+    seq_printf(m, "Current rate: %llu bps\n", eng->rate.current_rate);
     seq_printf(m, "Target rate: %llu bps\n", eng->rate.target_rate);
     seq_printf(m, "CWND: %u\n", eng->rate.cwnd);
     seq_printf(m, "SSThresh: %u\n", eng->rate.ssthresh);
@@ -3183,12 +3183,12 @@ static int tapac_stats_show(struct seq_file *m, void *v)
     seq_printf(m, "\n--- Parameters ---\n");
     seq_printf(m, "MSS: %u\n", eng->params.mss);
     seq_printf(m, "Min RTT: %u us\n", eng->params.min_rtt);
-    seq_printf(m, "Max RTT: %u us\n", eng->params. max_rtt);
+    seq_printf(m, "Max RTT: %u us\n", eng->params.max_rtt);
     seq_printf(m, "Max delay: %u us\n", eng->params.max_delay);
     seq_printf(m, "Bucket size: %u\n", eng->params.bucket_size);
     seq_printf(m, "ACK delay: %u ms\n", eng->params.ack_delay_ms);
-    seq_printf(m, "Win inflate factor: %u\n", eng->params. win_inflate_factor);
-    seq_printf(m, "Upload accel thresh: %u\n", eng->params. upload_accel_thresh);
+    seq_printf(m, "Win inflate factor: %u\n", eng->params.win_inflate_factor);
+    seq_printf(m, "Upload accel thresh: %u\n", eng->params.upload_accel_thresh);
 
     return 0;
 }
@@ -3230,7 +3230,7 @@ static int tapac_param_show(struct seq_file *m, void *v)
     else if (strcmp(name, "use_ack_scheduler") == 0)
         seq_printf(m, "%u\n", eng->params.use_ack_scheduler);
     else if (strcmp(name, "generate_sack") == 0)
-        seq_printf(m, "%u\n", eng->params. generate_sack);
+        seq_printf(m, "%u\n", eng->params.generate_sack);
 
     return 0;
 }
@@ -3267,8 +3267,8 @@ static ssize_t tapac_param_write(struct file *file, const char __user *buf,
         *p = '\0';
 
     if (strcmp(name, "nic") == 0) {
-        strncpy(eng->params.nic, kbuf, sizeof(eng->params. nic) - 1);
-        eng->params. nic[sizeof(eng->params. nic) - 1] = '\0';
+        strncpy(eng->params.nic, kbuf, sizeof(eng->params.nic) - 1);
+        eng->params.nic[sizeof(eng->params.nic) - 1] = '\0';
         return count;
     }
 
@@ -3281,21 +3281,21 @@ static ssize_t tapac_param_write(struct file *file, const char __user *buf,
     else if (strcmp(name, "mss") == 0)
         eng->params.mss = (u32)val;
     else if (strcmp(name, "min_rtt") == 0)
-        eng->params. min_rtt = (u32)val;
+        eng->params.min_rtt = (u32)val;
     else if (strcmp(name, "max_rtt") == 0)
         eng->params.max_rtt = (u32)val;
     else if (strcmp(name, "max_delay") == 0)
         eng->params.max_delay = (u32)val;
     else if (strcmp(name, "bucket_size") == 0)
-        eng->params. bucket_size = (u32)val;
+        eng->params.bucket_size = (u32)val;
     else if (strcmp(name, "ack_delay_ms") == 0)
         eng->params.ack_delay_ms = (u32)val;
     else if (strcmp(name, "win_inflate_factor") == 0)
         eng->params.win_inflate_factor = (u32)val;
     else if (strcmp(name, "upload_accel_thresh") == 0)
-        eng->params. upload_accel_thresh = (u32)val;
+        eng->params.upload_accel_thresh = (u32)val;
     else if (strcmp(name, "use_ack_scheduler") == 0)
-        eng->params. use_ack_scheduler = (u32)val;
+        eng->params.use_ack_scheduler = (u32)val;
     else if (strcmp(name, "generate_sack") == 0)
         eng->params.generate_sack = (u32)val;
 
@@ -3305,14 +3305,14 @@ static ssize_t tapac_param_write(struct file *file, const char __user *buf,
 #if defined(TAPAC_USE_PROC_OPS)
 static const struct proc_ops tapac_stats_fops = {
     .proc_open = tapac_stats_open,
-    . proc_read = seq_read,
+    .proc_read = seq_read,
     .proc_lseek = seq_lseek,
     .proc_release = single_release,
 };
 
 static const struct proc_ops tapac_param_fops = {
     .proc_open = tapac_param_open,
-    . proc_read = seq_read,
+    .proc_read = seq_read,
     .proc_lseek = seq_lseek,
     .proc_release = single_release,
     .proc_write = tapac_param_write,
@@ -3328,7 +3328,7 @@ static const struct file_operations tapac_stats_fops = {
 static const struct file_operations tapac_param_fops = {
     .open = tapac_param_open,
     .read = seq_read,
-    . llseek = seq_lseek,
+    .llseek = seq_lseek,
     .release = single_release,
     .write = tapac_param_write,
 };
@@ -3420,13 +3420,13 @@ static int tapac_engine_init(struct tapac_engine *eng)
     tapac_params_default(&eng->params);
 
     if (param_dev && strlen(param_dev) > 0) {
-        strncpy(eng->params.nic, param_dev, sizeof(eng->params. nic) - 1);
+        strncpy(eng->params.nic, param_dev, sizeof(eng->params.nic) - 1);
         eng->params.nic[sizeof(eng->params.nic) - 1] = '\0';
     }
 
     /* 清理换行符 */
-    for (i = 0; i < (int)sizeof(eng->params. nic) && eng->params. nic[i]; i++) {
-        if (eng->params. nic[i] == '\n') {
+    for (i = 0; i < (int)sizeof(eng->params.nic) && eng->params.nic[i]; i++) {
+        if (eng->params.nic[i] == '\n') {
             eng->params.nic[i] = '\0';
             break;
         }
@@ -3521,7 +3521,7 @@ static int __init tapac_init(void)
 
     tapac_proc_init(g_engine);
 
-    nfho_in. hook = tapac_hook_in;
+    nfho_in.hook = tapac_hook_in;
     nfho_in.hooknum = NF_INET_PRE_ROUTING;
     nfho_in.pf = PF_INET;
     nfho_in.priority = NF_IP_PRI_FIRST;

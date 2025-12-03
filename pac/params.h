@@ -37,7 +37,7 @@ static unsigned int MIN_WIN = 32;
 
 // ============ 定时器参数 ============
 // 定时器间隔：5ms（广域网不需要微秒级精度）
-static unsigned long DELAY_IN_US = 5000L;
+static unsigned long DELAY_IN_US = 1000L;
 
 // ============ RTT 参数 ============
 // 基础 RTT：166ms = 166000us
@@ -69,7 +69,7 @@ static unsigned int RTT_SMOOTH = 900;
 static unsigned int ALPHA = 600;
 
 // 连续下降次数阈值：需要连续 5 次才切换到拥塞避免
-static unsigned short int REDUCTION_THRESH = 5;
+static unsigned short int REDUCTION_THRESH = 3;
 
 // ============ 流分类参数 ============
 // 短流阈值：10MB 以下为高优先级

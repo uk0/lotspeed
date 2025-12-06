@@ -1,5 +1,6 @@
 /*
- * zeta_ack_control.c - ACK Control (Stabilized Version)
+ * zeta_ack_control.c - ACK Control with ACK Splitting
+ * High-performance ACK manipulation
  * Author: uk0
  */
 
@@ -12,36 +13,154 @@
 #include "zeta_core.h"
 
 /* ========== 稳定性配置 ========== */
-#define ZETA_MIN_RWND           8760    /* 最小窗口: 6 MSS，防止卡住 */
-#define ZETA_SCALE_SMOOTH_UP    8       /* 向上平滑步长 */
-#define ZETA_SCALE_SMOOTH_DOWN  3       /* 向下平滑步长（更保守）*/
+#define ZETA_SCALE_SMOOTH_UP    8
+#define ZETA_SCALE_SMOOTH_DOWN  3
 
 /* ========== 前向声明 ========== */
 static void zeta_ack_update_dupack_thresh(struct zeta_conn *conn);
 static u32 zeta_smooth_scale(struct zeta_conn *conn, u32 target_scale);
 
+/* ========== ACK Splitting 初始化 ========== */
+void zeta_ack_split_init(struct zeta_conn *conn)
+{
+    struct zeta_ack_split *split = &conn->ack_split;
+
+    split->pending_acks = 0;
+    split->last_ack_seq = 0;
+    split->last_ack_time_us = 0;
+    split->split_ratio = ZETA_ACK_SPLIT_RATIO;
+    split->accumulated_bytes = 0;
+    split->enabled = (g_zeta && g_zeta->ack_split_enabled);
+}
+
+/* ========== ACK Splitting 处理 ========== */
+/*
+ * ACK Splitting: 将多个小 ACK 合并成一个，或将一个大 ACK 分割成多个
+ * 目的是更精细地控制发送端的发送速率
+ * 
+ * 返回值:
+ *   0 - 继续正常处理
+ *   1 - ACK 已被延迟/合并，不发送
+ *   2 - 需要发送额外的 ACK
+ */
+int zeta_ack_split_process(struct zeta_conn *conn, struct sk_buff *skb,
+                           struct tcphdr *th, int payload_len)
+{
+    struct zeta_ack_split *split = &conn->ack_split;
+    u64 now_us = zeta_now_us();
+    u32 ack_seq = ntohl(th->ack_seq);
+    u32 bytes_acked;
+    int result = 0;
+
+    if (!split->enabled)
+        return 0;
+
+    /* 计算本次确认的字节数 */
+    if (split->last_ack_seq != 0 && zeta_seq_after(ack_seq, split->last_ack_seq)) {
+        bytes_acked = ack_seq - split->last_ack_seq;
+    } else {
+        bytes_acked = 0;
+    }
+
+    split->accumulated_bytes += bytes_acked;
+    split->pending_acks++;
+
+    /* 根据拥塞状态调整分割策略 */
+    switch (conn->state) {
+        case ZETA_STATE_NORMAL:
+        case ZETA_STATE_STABLE_DELAY:
+            /* 正常情况：允许较快的 ACK */
+            split->split_ratio = 1;
+            break;
+
+        case ZETA_STATE_DELAY_RISING:
+            /* 延迟上升：适度延迟 ACK */
+            split->split_ratio = 2;
+            break;
+
+        case ZETA_STATE_BURST_LOSS:
+        case ZETA_STATE_RANDOM_LOSS:
+            /* 丢包情况：更多 ACK 帮助恢复 */
+            split->split_ratio = 1;
+            break;
+
+        default:
+            split->split_ratio = ZETA_ACK_SPLIT_RATIO;
+    }
+
+    /* 决定是否发送 ACK */
+    if (split->pending_acks >= split->split_ratio) {
+        /* 达到分割阈值，发送 ACK */
+        split->pending_acks = 0;
+        split->accumulated_bytes = 0;
+        split->last_ack_seq = ack_seq;
+        split->last_ack_time_us = now_us;
+        result = 0;  /* 正常发送 */
+        
+        /* 更新统计 */
+        if (g_zeta && g_zeta->percpu_stats) {
+            struct zeta_percpu_stats *stats = this_cpu_ptr(g_zeta->percpu_stats);
+            stats->acks_split++;
+        }
+    } else {
+        /* 超时检查：即使没达到阈值，超时也要发送 */
+        u64 elapsed_us = now_us - split->last_ack_time_us;
+        
+        if (elapsed_us > 50000) {  /* 50ms 超时 */
+            split->pending_acks = 0;
+            split->accumulated_bytes = 0;
+            split->last_ack_seq = ack_seq;
+            split->last_ack_time_us = now_us;
+            result = 0;
+        } else {
+            /* 延迟此 ACK */
+            result = 1;
+        }
+    }
+
+    if (g_zeta && g_zeta->verbose && result == 1) {
+        ZETA_LOG("[%pI4:%u] ACK SPLIT: delayed (pending=%u ratio=%u)\n",
+                 &conn->daddr, ntohs(conn->dport),
+                 split->pending_acks, split->split_ratio);
+    }
+
+    return result;
+}
+
+/* ========== 强制刷新 ACK ========== */
+void zeta_ack_split_flush(struct zeta_conn *conn, struct sk_buff *skb)
+{
+    struct zeta_ack_split *split = &conn->ack_split;
+
+    if (!split->enabled)
+        return;
+
+    /* 重置状态 */
+    split->pending_acks = 0;
+    split->accumulated_bytes = 0;
+    split->last_ack_time_us = zeta_now_us();
+}
+
 /* ========== 平滑缩放计算 ========== */
 static u32 zeta_smooth_scale(struct zeta_conn *conn, u32 target_scale)
 {
-    u32 cur_scale = conn->ack_rwnd_scale;  /* 修复：不要用 current 作为变量名 */
-    
+    u32 cur_scale = conn->ack_rwnd_scale;
+
     if (cur_scale == 0)
         cur_scale = 100;
-    
+
     if (target_scale > cur_scale) {
-        /* 向上恢复：较快 */
         u32 step = min_t(u32, target_scale - cur_scale, ZETA_SCALE_SMOOTH_UP);
         return cur_scale + step;
     } else if (target_scale < cur_scale) {
-        /* 向下压缩：较慢，避免突变 */
         u32 step = min_t(u32, cur_scale - target_scale, ZETA_SCALE_SMOOTH_DOWN);
         return cur_scale - step;
     }
-    
+
     return cur_scale;
 }
 
-/* ========== RWND 修改策略 (稳定版) ========== */
+/* ========== RWND 修改策略 ========== */
 void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
 {
     u16 orig_rwnd = ntohs(th->window);
@@ -51,23 +170,21 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
     const char *reason = "default";
 
     if (g_zeta && g_zeta->verbose) {
-        ZETA_LOG("[%pI4:%u] modify_rwnd: orig=%u state=%d score=%u loss=%u cur_scale=%u\n",
+        ZETA_LOG("[%pI4:%u] modify_rwnd: orig=%u state=%d score=%u loss=%u\n",
                  &conn->daddr, ntohs(conn->dport),
                  orig_rwnd, conn->state,
                  conn->features.congestion_score,
-                 conn->features.loss_total,
-                 conn->ack_rwnd_scale);
+                 conn->features.loss_total);
     }
 
-    /* 根据状态计算目标缩放因子 */
     switch (conn->state) {
         case ZETA_STATE_NORMAL:
             if (conn->features.loss_total > 5) {
                 target_scale = 80;
-                reason = "NORMAL+loss>5";
+                reason = "NORMAL+loss";
             } else if (conn->features.congestion_score > 40) {
                 target_scale = 90;
-                reason = "NORMAL+score>40";
+                reason = "NORMAL+score";
             } else {
                 target_scale = 100;
                 reason = "NORMAL";
@@ -75,7 +192,6 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
             break;
 
         case ZETA_STATE_RANDOM_LOSS:
-            /* 随机丢包：更保守处理 */
             if (conn->features.loss_total > 15) {
                 target_scale = 65;
             } else if (conn->features.loss_total > 8) {
@@ -89,16 +205,11 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
             break;
 
         case ZETA_STATE_STABLE_DELAY:
-            if (conn->features.congestion_score > 60) {
-                target_scale = 80;
-            } else {
-                target_scale = 90;
-            }
+            target_scale = (conn->features.congestion_score > 60) ? 80 : 90;
             reason = "STABLE_DELAY";
             break;
 
         case ZETA_STATE_DELAY_RISING:
-            /* 延迟上升：中等限制 */
             if (conn->features.congestion_score >= 90) {
                 target_scale = 40;
             } else if (conn->features.congestion_score >= 70) {
@@ -112,7 +223,6 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
             break;
 
         case ZETA_STATE_BURST_LOSS:
-            /* 阵发丢包：更保守（提高最低值）*/
             if (conn->features.congestion_score >= 95) {
                 target_scale = 30;
             } else if (conn->features.congestion_score >= 80) {
@@ -135,71 +245,58 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
             reason = "UNKNOWN";
     }
 
-    /* 额外检查：有丢包且高分数时进一步限制，但不要太激进 */
+    /* 额外检查 */
     if (conn->features.loss_total > 0 && conn->features.congestion_score > 70) {
-        u32 old_scale = target_scale;
         target_scale = min_t(u32, target_scale, 55);
-        if (target_scale != old_scale) {
-            reason = "EXTRA_CHECK";
-        }
+        reason = "EXTRA_CHECK";
     }
 
     /* 应用平滑处理 */
     smooth_scale_val = zeta_smooth_scale(conn, target_scale);
 
-    if (g_zeta && g_zeta->verbose) {
-        ZETA_LOG("[%pI4:%u] target=%u smooth=%u reason=%s\n",
-                 &conn->daddr, ntohs(conn->dport),
-                 target_scale, smooth_scale_val, reason);
-    }
-
     /* 计算新窗口 */
     new_rwnd = (u16)zeta_div32((u32)orig_rwnd * smooth_scale_val, 100);
 
-    /* 保证最小窗口（关键：防止传输卡住）*/
+    /* 保证最小窗口 */
     if (new_rwnd < ZETA_MIN_RWND)
         new_rwnd = ZETA_MIN_RWND;
 
-    /* 更新记录 */
     conn->ack_rwnd_scale = (u16)smooth_scale_val;
 
-    /* 写入新窗口 */
     if (new_rwnd != orig_rwnd) {
         th->window = htons(new_rwnd);
-        
+
         if (g_zeta && g_zeta->verbose) {
-            ZETA_LOG("[%pI4:%u] *** RWND CHANGED *** %u -> %u (smooth=%u%% reason=%s)\n",
+            ZETA_LOG("[%pI4:%u] RWND: %u -> %u (scale=%u%% reason=%s)\n",
                      &conn->daddr, ntohs(conn->dport),
                      orig_rwnd, new_rwnd, smooth_scale_val, reason);
-        }
-    } else {
-        if (g_zeta && g_zeta->verbose) {
-            ZETA_LOG("[%pI4:%u] RWND unchanged: %u\n",
-                     &conn->daddr, ntohs(conn->dport), orig_rwnd);
         }
     }
 }
 
-/* ========== ACK 抑制判断（更保守）========== */
+/* ========== ACK 抑制判断 ========== */
 bool zeta_ack_should_suppress(struct zeta_conn *conn)
 {
     if (conn->state != ZETA_STATE_BURST_LOSS)
         return false;
 
-    /* 限制抑制次数（减少抑制）*/
     if (conn->ack_suppress_count >= 2)
         return false;
 
-    /* 只在极高拥塞分数时抑制 */
     if (conn->features.congestion_score >= 99) {
         conn->ack_suppress_count++;
-        ZETA_LOG("[%pI4:%u] ACK SUPPRESSED!  count=%u score=%u\n",
+        
+        if (g_zeta && g_zeta->percpu_stats) {
+            struct zeta_percpu_stats *stats = this_cpu_ptr(g_zeta->percpu_stats);
+            stats->acks_suppressed++;
+        }
+        
+        ZETA_LOG("[%pI4:%u] ACK SUPPRESSED count=%u\n",
                  &conn->daddr, ntohs(conn->dport),
-                 conn->ack_suppress_count,
-                 conn->features.congestion_score);
+                 conn->ack_suppress_count);
         return true;
     }
-    
+
     return false;
 }
 
@@ -226,15 +323,8 @@ int zeta_ack_process(struct zeta_conn *conn, struct sk_buff *skb,
     u16 new_rwnd;
     int modified = 0;
 
-    if (! conn || !th) {
-        ZETA_LOG("zeta_ack_process: NULL conn or th!\n");
+    if (!conn || !th)
         return 0;
-    }
-
-    if (g_zeta && g_zeta->verbose) {
-        ZETA_LOG("[%pI4:%u] >>> zeta_ack_process START\n",
-                 &conn->daddr, ntohs(conn->dport));
-    }
 
     /* 1.抑制检查 */
     if (zeta_ack_should_suppress(conn)) {
@@ -252,18 +342,14 @@ int zeta_ack_process(struct zeta_conn *conn, struct sk_buff *skb,
 
     /* 5.检查修改 */
     new_rwnd = ntohs(th->window);
-    
-    if (g_zeta && g_zeta->verbose) {
-        ZETA_LOG("[%pI4:%u] COMPARE: orig=%u new=%u\n",
-                 &conn->daddr, ntohs(conn->dport),
-                 orig_rwnd, new_rwnd);
-    }
-    
+
     if (new_rwnd != orig_rwnd) {
         modified = 1;
-        if (g_zeta && g_zeta->verbose) {
-            ZETA_LOG("[%pI4:%u] >>> MODIFIED=1\n",
-                     &conn->daddr, ntohs(conn->dport));
+        
+        /* 更新 per-CPU 统计 */
+        if (g_zeta && g_zeta->percpu_stats) {
+            struct zeta_percpu_stats *stats = this_cpu_ptr(g_zeta->percpu_stats);
+            stats->pkts_modified++;
         }
     }
 
@@ -272,14 +358,9 @@ int zeta_ack_process(struct zeta_conn *conn, struct sk_buff *skb,
         conn->ack_suppress_count = 0;
     }
 
-    /* 7.统计 */
+    /* 7.更新全局统计 */
     if (modified) {
         atomic64_inc(&g_zeta->stats.cwnd_reductions);
-    }
-
-    if (g_zeta && g_zeta->verbose) {
-        ZETA_LOG("[%pI4:%u] <<< zeta_ack_process END, return %d\n",
-                 &conn->daddr, ntohs(conn->dport), modified);
     }
 
     return modified;
@@ -350,7 +431,7 @@ void zeta_ack_generate_dupack(struct zeta_conn *conn, struct sk_buff *orig_skb)
     skb_dst_set(nskb, dst_clone(skb_dst(orig_skb)));
 
     ip_local_out(&init_net, NULL, nskb);
-    
+
     if (g_zeta && g_zeta->verbose) {
         ZETA_LOG("[%pI4:%u] DupACK generated\n",
                  &conn->daddr, ntohs(conn->dport));
@@ -362,27 +443,17 @@ void zeta_ack_handle_ecn(struct zeta_conn *conn, struct tcphdr *th,
                          struct iphdr *iph)
 {
     u8 ecn = iph->tos & INET_ECN_MASK;
-    
+
     if (ecn == INET_ECN_CE) {
         conn->features.congestion_score = min_t(u32,
             conn->features.congestion_score + 15, 100);
-        if (g_zeta && g_zeta->verbose) {
-            ZETA_LOG("[%pI4:%u] ECN CE received, score=%u\n",
-                     &conn->daddr, ntohs(conn->dport),
-                     conn->features.congestion_score);
-        }
     }
-    
+
     if (th->ece) {
         conn->features.congestion_score = min_t(u32,
             conn->features.congestion_score + 20, 100);
         if (conn->state == ZETA_STATE_NORMAL) {
             conn->state = ZETA_STATE_DELAY_RISING;
-        }
-        if (g_zeta && g_zeta->verbose) {
-            ZETA_LOG("[%pI4:%u] TCP ECE received, score=%u state=%d\n",
-                     &conn->daddr, ntohs(conn->dport),
-                     conn->features.congestion_score, conn->state);
         }
     }
 }
@@ -395,7 +466,7 @@ void zeta_ack_emergency_brake(struct zeta_conn *conn, struct tcphdr *th)
     conn->state = ZETA_STATE_BURST_LOSS;
     conn->features.congestion_score = 100;
     atomic64_inc(&g_zeta->stats.cwnd_reductions);
-    
-    ZETA_LOG("[%pI4:%u] EMERGENCY BRAKE activated!\n",
+
+    ZETA_LOG("[%pI4:%u] EMERGENCY BRAKE!\n",
              &conn->daddr, ntohs(conn->dport));
 }

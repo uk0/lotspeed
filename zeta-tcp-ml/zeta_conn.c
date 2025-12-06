@@ -1,6 +1,5 @@
 /*
- * zeta_conn.c - Connection Tracking Management
- * Hash table based connection management with RCU
+ * zeta_conn.c - Connection Tracking with SLAB Cache
  * Author: uk0
  */
 
@@ -9,6 +8,39 @@
 #include <linux/hash.h>
 #include <linux/jhash.h>
 #include "zeta_core.h"
+
+/* SLAB 缓存 */
+static struct kmem_cache *zeta_conn_cachep = NULL;
+
+/* ========== 初始化连接缓存 ========== */
+int zeta_conn_cache_init(void)
+{
+    /* 创建专用 SLAB 缓存，提高分配效率 */
+    zeta_conn_cachep = kmem_cache_create(
+        "zeta_conn_cache",
+        sizeof(struct zeta_conn),
+        0,                              /* 对齐 */
+        SLAB_HWCACHE_ALIGN | SLAB_PANIC,  /* 缓存行对齐 */
+        NULL                            /* 构造函数 */
+    );
+    
+    if (! zeta_conn_cachep) {
+        ZETA_WARN("Failed to create connection cache\n");
+        return -ENOMEM;
+    }
+    
+    ZETA_LOG("Connection SLAB cache created (obj_size=%zu)\n",
+             sizeof(struct zeta_conn));
+    return 0;
+}
+
+void zeta_conn_cache_destroy(void)
+{
+    if (zeta_conn_cachep) {
+        kmem_cache_destroy(zeta_conn_cachep);
+        zeta_conn_cachep = NULL;
+    }
+}
 
 /* ========== 哈希函数 ========== */
 static inline u32 zeta_conn_hash(__be32 saddr, __be32 daddr,
@@ -22,7 +54,11 @@ static inline u32 zeta_conn_hash(__be32 saddr, __be32 daddr,
 static void zeta_conn_free_rcu(struct rcu_head *head)
 {
     struct zeta_conn *conn = container_of(head, struct zeta_conn, rcu);
-    kfree(conn);
+    
+    if (zeta_conn_cachep)
+        kmem_cache_free(zeta_conn_cachep, conn);
+    else
+        kfree(conn);
 }
 
 /* ========== 查找连接 ========== */
@@ -50,24 +86,28 @@ struct zeta_conn *zeta_conn_find(__be32 saddr, __be32 daddr,
     return NULL;
 }
 
-/* ========== 创建连接 ========== */
+/* ========== 创建连接（使用 SLAB 缓存）========== */
 struct zeta_conn *zeta_conn_create(__be32 saddr, __be32 daddr,
                                     __be16 sport, __be16 dport)
 {
     struct zeta_conn *conn;
     u32 hash;
+    u64 now_us = zeta_now_us();
 
-    if (! g_zeta)
+    if (!g_zeta)
         return NULL;
 
-    /* 检查连接数限制 */
     if (atomic_read(&g_zeta->conn_count) >= ZETA_MAX_CONNECTIONS) {
         ZETA_WARN("Max connections reached (%d)\n", ZETA_MAX_CONNECTIONS);
         return NULL;
     }
 
-    /* 分配新连接 */
-    conn = kzalloc(sizeof(*conn), GFP_ATOMIC);
+    /* 使用 SLAB 缓存分配 */
+    if (zeta_conn_cachep)
+        conn = kmem_cache_zalloc(zeta_conn_cachep, GFP_ATOMIC);
+    else
+        conn = kzalloc(sizeof(*conn), GFP_ATOMIC);
+    
     if (! conn) {
         ZETA_WARN("Failed to allocate connection\n");
         return NULL;
@@ -85,20 +125,19 @@ struct zeta_conn *zeta_conn_create(__be32 saddr, __be32 daddr,
     conn->state = ZETA_STATE_NORMAL;
     conn->loss_pattern = LOSS_NONE;
 
-    conn->create_time = zeta_now_ms();
+    conn->create_time_us = now_us;
+    conn->last_active_us = now_us;
+    conn->create_time = now_us / 1000;
     conn->last_active = conn->create_time;
 
-    /* 初始化 ACK 控制参数 */
     conn->ack_rwnd_scale = 100;
     conn->ack_dup_thresh = 3;
 
-    /* 初始化虚拟窗口 */
+    zeta_ack_split_init(conn);
+
     conn->virtual_cwnd = 10;
     conn->target_rate = g_zeta->start_rate;
-
-    /* 初始化 RTT 特征 */
-    conn->features.rtt_min = 0;
-    conn->features.rtt_avg = 0;
+    conn->preferred_cpu = smp_processor_id();
 
     /* 加入哈希表 */
     hash = conn->hash_key;
@@ -156,28 +195,30 @@ void zeta_conn_gc(struct timer_list *t)
 
     spin_unlock_bh(&g_zeta->conn_lock);
 
-    if (cleaned > 0) {
-        ZETA_DBG("GC: cleaned %d stale connections\n", cleaned);
+    if (cleaned > 0 && g_zeta->verbose) {
+        ZETA_LOG("GC: cleaned %d stale connections\n", cleaned);
     }
 
-    /* 重新调度 GC */
     mod_timer(&g_zeta->gc_timer, jiffies + msecs_to_jiffies(ZETA_GC_INTERVAL_MS));
 }
 
-/* ========== 初始化连接管理 ========== */
+/* ========== 初始化 ========== */
 void zeta_conn_init(void)
 {
     if (!g_zeta)
         return;
 
-    /* 设置 GC 定时器 */
+    /* 初始化 SLAB 缓存 */
+    zeta_conn_cache_init();
+
     timer_setup(&g_zeta->gc_timer, zeta_conn_gc, 0);
     mod_timer(&g_zeta->gc_timer, jiffies + msecs_to_jiffies(ZETA_GC_INTERVAL_MS));
 
-    ZETA_LOG("Connection manager initialized\n");
+    ZETA_LOG("Connection manager initialized (hash=%d bits, max=%d)\n",
+             ZETA_HASH_BITS, ZETA_MAX_CONNECTIONS);
 }
 
-/* ========== 清理连接管理 ========== */
+/* ========== 清理 ========== */
 void zeta_conn_cleanup(void)
 {
     struct zeta_conn *conn;
@@ -187,17 +228,21 @@ void zeta_conn_cleanup(void)
     if (!g_zeta)
         return;
 
-    /* 停止 GC 定时器 */
     del_timer_sync(&g_zeta->gc_timer);
 
-    /* 清理所有连接 */
     spin_lock_bh(&g_zeta->conn_lock);
     hash_for_each_safe(g_zeta->conn_table, bkt, tmp, conn, hnode) {
         hash_del(&conn->hnode);
-        kfree(conn);
+        if (zeta_conn_cachep)
+            kmem_cache_free(zeta_conn_cachep, conn);
+        else
+            kfree(conn);
     }
     atomic_set(&g_zeta->conn_count, 0);
     spin_unlock_bh(&g_zeta->conn_lock);
+
+    /* 销毁 SLAB 缓存 */
+    zeta_conn_cache_destroy();
 
     ZETA_LOG("Connection manager cleaned up\n");
 }

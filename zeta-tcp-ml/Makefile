@@ -1,31 +1,35 @@
-# Zeta-TCP Learning-based Accelerator
-# NetFilter Hook Implementation
+# Zeta-TCP Makefile (High-Performance Version)
 
-obj-m := zeta_tcp.o
-zeta_tcp-objs := zeta_main.o zeta_hooks.o zeta_learning.o \
-                 zeta_ack_control.o zeta_conn.o zeta_proc.o
+obj-m += zeta_tcp.o
+zeta_tcp-objs := zeta_main.o zeta_conn.o zeta_learning.o zeta_ack_control.o \
+                 zeta_hooks.o zeta_proc.o zeta_percpu.o zeta_batch.o
 
-KVER := $(shell uname -r)
-KDIR := /lib/modules/$(KVER)/build
+KDIR:= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
 
-# 编译选项
-ccflags-y := -O2 -Wall -Wno-declaration-after-statement
-ccflags-y += -DZETA_VERSION=\"1.0.0\"
+# 优化选项
+ccflags-y := -O2 -DZETA_VERSION=\"2.0.0\"
 
 all:
-	make -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
-	make -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f *.o *.ko *.mod.c *.order *.symvers
 
-install: all
-	sudo insmod zeta_tcp.ko
-	@echo "Zeta-TCP loaded.  Check /proc/zeta_tcp for status."
+install:
+	sudo insmod zeta_tcp.ko verbose=1 ack_split=1
 
 uninstall:
-	sudo rmmod zeta_tcp || true
+	sudo rmmod zeta_tcp
 
 reload: uninstall install
 
-. PHONY: all clean install uninstall reload
+test:
+	@echo "=== Zeta-TCP Stats ==="
+	@cat /proc/zeta_tcp/stats
+	@echo ""
+	@echo "=== Per-CPU Stats ==="
+	@cat /proc/zeta_tcp/percpu
+
+.PHONY: all clean install uninstall reload test

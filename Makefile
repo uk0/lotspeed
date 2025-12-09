@@ -1,18 +1,16 @@
+VERSION		:= 3.3
 KERNEL_RELEASE  ?= $(shell uname -r)
 KERNEL_DIR      ?= /lib/modules/$(KERNEL_RELEASE)/build
-DKMS_TARBALL    ?= dkms.tar.gz
-TAR             ?= tar
 obj-m           += lotspeed.o
 
 ccflags-y := -std=gnu99
 
 .PHONY: all clean load unload
-.PHONY: .always-make
 
 all:
 	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
 
-clean: clean-dkms.conf clean-dkms-tarball
+clean:
 	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
 
 load:
@@ -21,24 +19,21 @@ load:
 unload:
 	sudo rmmod lotspeed
 
-.PHONY: dkms-tarball clean-dkms-tarball clean-dkms.conf
+.PHONY: dkms-prepare dkms-add dkms-build dkms-install dkms-remove dkms-clean
+dkms-prepare:
+	cp -r ./ /usr/src/lotspeed-${VERSION}
 
-.always.make:
+dkms-add:
+	dkms add -m lotspeed -v ${VERSION}
 
-dkms.conf: ./scripts/mkdkmsconf.sh .always-make
-	./scripts/mkdkmsconf.sh > dkms.conf
+dkms-build:
+	dkms build -m lotspeed -v ${VERSION}
 
-clean-dkms.conf:
-	$(RM) dkms.conf
+dkms-install:
+	dkms install -m lotspeed -v ${VERSION}
 
-$(DKMS_TARBALL): dkms.conf Makefile lotspeed.c
-	$(TAR) zcf $(DKMS_TARBALL) \
-		--transform 's,^,./dkms_source_tree/,' \
-		dkms.conf \
-		Makefile \
-		lotspeed.c
+dkms-remove:
+	dkms remove -m lotspeed -v $(VERSION) --all
 
-dkms-tarball: $(DKMS_TARBALL)
-
-clean-dkms-tarball:
-	$(RM) $(DKMS_TARBALL)
+dkms-clean: dkms-remove
+	rm -rf /usr/src/lotspeed-${VERSION}

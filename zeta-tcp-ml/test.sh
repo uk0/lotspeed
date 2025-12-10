@@ -4,7 +4,7 @@ dmesg -c
 make clean && make
 sudo rmmod zeta_tcp 2>/dev/null
 # 加载（启用 ACK Splitting）
-sudo insmod zeta_tcp.ko verbose=1 ack_split=1
+sudo insmod zeta_tcp.ko verbose=0 ack_split=1
 
 # 查看模块详细信息
 modinfo zeta_tcp.ko

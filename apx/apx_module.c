@@ -1,5 +1,5 @@
 /*
- * APX LotServer Core Implementation - Optimized Version 4.0
+ * ACC BoostTCP Core Implementation - Optimized Version 4.0
  * 整合RTT测量、BDP计算、SACK支持、优化乱序处理
  */
 
@@ -47,13 +47,13 @@ MODULE_PARM_DESC(aggressive_mode, "Aggressive acceleration mode (1=on, 0=off)");
 #define APX_LOG(level, fmt, ...) \
     do { \
         if (debug_level >= level) \
-            printk(KERN_INFO "[APX] " fmt "\n", ##__VA_ARGS__); \
+            printk(KERN_INFO "[ACC] " fmt "\n", ##__VA_ARGS__); \
     } while (0)
 
 #define LOG_BASIC(fmt, ...)   APX_LOG(1, fmt, ##__VA_ARGS__)
 #define LOG_VERBOSE(fmt, ...) APX_LOG(2, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...)   APX_LOG(3, fmt, ##__VA_ARGS__)
-#define LOG_ERROR(fmt, ...)   printk(KERN_ERR "[APX-ERR] " fmt "\n", ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...)   printk(KERN_ERR "[ACC-ERR] " fmt "\n", ##__VA_ARGS__)
 
 /* =========================================================================
  * 统计计数器 (增强版)
@@ -1410,7 +1410,7 @@ static struct nf_hook_ops apx_nf_ops[] = {
 
 static int apx_proc_stats_show(struct seq_file *m, void *v)
 {
-    seq_printf(m, "APX LotServer Core Statistics (v4.0 Optimized)\n");
+    seq_printf(m, "ACC BoostTCPCore Statistics (v4.0 Optimized)\n");
     seq_printf(m, "========================================\n");
     seq_printf(m, "Network Interface:        %s\n", net_interface);
     seq_printf(m, "Interface Status:       %s\n",
@@ -1471,7 +1471,7 @@ static const struct proc_ops apx_proc_stats_ops = {
 
 static void apx_show_stats(void)
 {
-    LOG_BASIC("========== APX Statistics ==========");
+    LOG_BASIC("========== ACC Statistics ==========");
     LOG_BASIC("Mode:                  %s", aggressive_mode ? "TURBO" : "NORMAL");
     LOG_BASIC("Flows created:         %d", atomic_read(&global_stats.flows_created));
     LOG_BASIC("Flows destroyed:       %d", atomic_read(&global_stats.flows_destroyed));
@@ -1503,7 +1503,7 @@ static int __init apx_init(void)
 
     printk(KERN_INFO "\n");
     LOG_BASIC("================================================");
-    LOG_BASIC("     APX LotServer Core v4.0 Optimized");
+    LOG_BASIC("     ACC BoostTCPCore v4.0 Optimized");
     LOG_BASIC("     Loading with Enhanced Features...");
     LOG_BASIC("================================================");
     LOG_BASIC("Debug level:  %d", debug_level);
@@ -1570,7 +1570,7 @@ err_hash:
 static void __exit apx_exit(void)
 {
     LOG_BASIC("================================================");
-    LOG_BASIC("     APX LotServer Core Unloading...");
+    LOG_BASIC("     ACC BoostTCPCore Unloading...");
     LOG_BASIC("================================================");
 
     apx_show_stats();
@@ -1594,6 +1594,6 @@ module_init(apx_init);
 module_exit(apx_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("APX Team");
-MODULE_DESCRIPTION("LotServer TCP Acceleration Core v4.0 - Optimized with RTT/SACK/BDP");
+MODULE_AUTHOR("ACC Team");
+MODULE_DESCRIPTION("BoostTCPTCP Acceleration Core v4.0 - Optimized with RTT/SACK/BDP");
 MODULE_VERSION("4.0");

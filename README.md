@@ -109,6 +109,27 @@ PAC (Proactive ACK Control) for TCP Incast Congestion
 * https://github.com/uk0/TCP-Incast/tree/zeta-tcp 
 
 
+---------------------------------------------
+
+### 最新版顶级思路[目前没有开源打算]
+
+* 基于时延和丢包的混合驱动拥塞控制
+* 学习型状态机
+* 概率性丢包检测
+* 反向控制
+* 跨流协同优化
+
+* 使用的服务器：
+  * cloudcone 
+  * Los Angeles, CA-DC1 
+  * [Ubuntu 24.04 - x86_64 — 74.48.174.xx]
+  * 北京500M联通，测试时间：2025-12-12 10:51:00
+
+
+![img_7.png](img/img_7.png)
+
+-----------------------------------
+
 
 [![Star History Chart](https://api.star-history.com/svg?repos=uk0/lotspeed&type=Date)](https://star-history.com/#uk0/lotspeed&Date)
 

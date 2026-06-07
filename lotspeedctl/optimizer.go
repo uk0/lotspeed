@@ -159,6 +159,7 @@ func (o *optimizer) apply(t *tunable) {
 func cmdOptimize(args []string) error {
 	interval := 5 * time.Second
 	iface := ""
+	target := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--interval":
@@ -173,10 +174,27 @@ func cmdOptimize(args []string) error {
 				iface = args[i+1]
 				i++
 			}
+		case "--target":
+			if i+1 < len(args) {
+				target = args[i+1]
+				i++
+			}
 		}
 	}
 	if iface == "" {
-		return fmt.Errorf("usage: optimize --iface <dev> [--interval N]")
+		return fmt.Errorf("usage: optimize --iface <dev> [--interval N] [--target IP]")
+	}
+	// If a target is given, probe once and persist (feature, params, score)
+	// to the on-disk model whenever bestScore improves — this is how the
+	// model accumulates knowledge over real runs.
+	var feat linkFeature
+	hasFeat := false
+	if target != "" {
+		if f, err := probeLink(target, 0); err == nil {
+			feat = f
+			hasFeat = true
+			fmt.Printf("baseline probe: rtt=%.0fms jitter=%.0fms loss=%.2f%%\n", f.rttMs, f.jitter, f.lossPct*100)
+		}
 	}
 	if err := os.WriteFile(ccPath, []byte("lotspeed"), 0o644); err != nil {
 		return fmt.Errorf("set CC=lotspeed (need root?): %w", err)
@@ -210,6 +228,15 @@ func cmdOptimize(args []string) error {
 		// OPTIMIZE: coordinate ascent with revert-on-regression.
 		if sc > o.bestScore {
 			o.bestScore = sc
+			// Best improved: snapshot current params + feature to the model.
+			if hasFeat && target != "" {
+				params := paramSet{}
+				for i := range o.tun {
+					params[o.tun[i].name] = o.tun[i].cur
+				}
+				feat.bwMbps = m.bwMbps // refresh bw with live measurement
+				_ = loadModel().record(feat, params, sc)
+			}
 		} else {
 			t := &o.tun[o.ti]
 			t.cur -= o.dir * t.step

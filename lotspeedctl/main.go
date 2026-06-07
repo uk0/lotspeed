@@ -85,6 +85,14 @@ func main() {
 		err = cmdPrio(os.Args[2:])
 	case "boost":
 		err = cmdBoost(os.Args[2:])
+	case "probe":
+		err = cmdProbe(os.Args[2:])
+	case "tune":
+		err = cmdTune(os.Args[2:])
+	case "hist-clear":
+		err = cmdHistClear(os.Args[2:])
+	case "model":
+		err = cmdModel(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -117,6 +125,10 @@ Usage:
   lotspeedctl prio [list|add P..|del P..|clear|auto]
                                      manage NeoQ priority ports (auto = detect game/web)
   lotspeedctl boost [N]              get/set NeoQ downstream rwnd boost (percent, 100=off)
+  lotspeedctl probe <ip> [port]      measure RTT/BW/loss (MAD-filtered, multi-sample)
+  lotspeedctl tune <ip> [port]       probe -> model.predict -> apply sysctls + hist_clear
+  lotspeedctl hist-clear             flush poisoned per-IP hist cache
+  lotspeedctl model [show|clear]     inspect KNN sample store (~/.lotspeedctl/model.json)
 `)
 }
 

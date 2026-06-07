@@ -80,6 +80,7 @@ struct lotspeed_params {
 	unsigned int hist_enable;
 	unsigned int hist_ttl_sec;      /* TTL */
 	unsigned int hist_max_entries;
+	unsigned int hist_min_cwnd_bound; /* lookup 兜底 cwnd (CLI 按 RTT/BDP 算入) */
 
 	/* ECN 参数 */
 	unsigned int ecn_enable;
@@ -171,6 +172,7 @@ static struct lotspeed_params ls_params = {
 	.hist_enable        = 1,
 	.hist_ttl_sec       = 1200,         /* 20分钟 */
 	.hist_max_entries   = 8192,
+	.hist_min_cwnd_bound = 64,           /* CLI 按 BDP_pkts/4 写入 */
 
 	.ecn_enable         = 1,
 	.ecn_factor         = 85,
@@ -237,6 +239,8 @@ static struct lotspeed_params ls_params = {
 /* ============== sysctl 表定义 ============== */
 
 static struct ctl_table_header *ls_sysctl_header;
+static int ls_hist_clear_handler(const struct ctl_table *table, int write,
+                                 void *buffer, size_t *lenp, loff_t *ppos);
 
 static struct ctl_table ls_sysctl_table[] = {
 	{
@@ -395,6 +399,20 @@ static struct ctl_table ls_sysctl_table[] = {
 		.maxlen         = sizeof(unsigned int),
 		.mode           = 0644,
 		.proc_handler   = proc_douintvec,
+	},
+	{
+		.procname       = "hist_min_cwnd_bound",
+		.data           = &ls_params.hist_min_cwnd_bound,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0644,
+		.proc_handler   = proc_douintvec,
+	},
+	{
+		.procname       = "hist_clear",
+		.data           = NULL,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0200,
+		.proc_handler   = ls_hist_clear_handler,
 	},
 	{
 		.procname       = "ecn_enable",
@@ -809,6 +827,33 @@ static DEFINE_HASHTABLE(ls_hist_table, LS_HIST_BITS);
 static DEFINE_SPINLOCK(ls_hist_lock);
 static struct kmem_cache *ls_hist_cache;
 static atomic_t ls_hist_count = ATOMIC_INIT(0);
+
+/* sysctl write-only trigger: `echo 1 > /proc/sys/net/ipv4/lotspeed/hist_clear`
+ * flushes the whole per-IP cache. Used by CLI to nuke poisoned entries from
+ * earlier broken runs. */
+static int ls_hist_clear_handler(const struct ctl_table *table, int write,
+                                 void *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ls_hist_entry *entry;
+	struct hlist_node *tmp;
+	int bkt, freed = 0;
+
+	if (!write) {
+		*lenp = 0;
+		return 0;
+	}
+	spin_lock_bh(&ls_hist_lock);
+	hash_for_each_safe(ls_hist_table, bkt, tmp, entry, node) {
+		hash_del(&entry->node);
+		kmem_cache_free(ls_hist_cache, entry);
+		freed++;
+	}
+	atomic_set(&ls_hist_count, 0);
+	spin_unlock_bh(&ls_hist_lock);
+	pr_info("lotspeed: hist_clear flushed %d entries\n", freed);
+	*ppos += *lenp;
+	return 0;
+}
 
 /* ============== 辅助函数 ============== */
 
@@ -1413,12 +1458,16 @@ static void ls_hist_lookup(struct sock *sk)
 				if (entry->bw_bytes_sec > 0 && tp->mss_cache > 0) {
 					u32 cwnd = SAFE_DIV(entry->bw_bytes_sec * entry->rtt_min_us,
 					                    (u64)tp->mss_cache * USEC_PER_SEC);
+					u32 floor = READ_ONCE(ls_params.hist_min_cwnd_bound);
+					/* hist-derived cwnd as a warm-start hint, floored against
+					 * a CLI-tunable lower bound (avoids 2Mbps lockup on RTT-mismatch).
+					 * Keep STARTUP mode so we still probe real bandwidth on the
+					 * new path — hist only seeds, never freezes. */
+					cwnd = max(cwnd, floor);
 					tcp_snd_cwnd_set(tp, clamp_t(u32, cwnd,
 						ls_get_min_cwnd(), ls_get_max_cwnd()));
-					ls->full_bw_reached = 1;
 					ls_update_high_delay_path(sk);
 					ls_update_rho(sk);
-					ls_enter_probe_bw(sk, LS_BW_CRUISE);
 				}
 			}
 			break;
@@ -1440,10 +1489,15 @@ static void ls_hist_update(struct sock *sk)
 	if (!READ_ONCE(ls_params.hist_enable) || !daddr || ls->min_rtt_us == 0)
 		return;
 
-	if (tcp_snd_cwnd(tp) > 0 && ls->min_rtt_us > 0 && tp->mss_cache > 0) {
+	/* Sanity: only persist entries from connections that actually probed.
+	 * Tiny cwnd from aborted/short connections poisons future lookups. */
+	if (tcp_snd_cwnd(tp) >= 32 && ls->min_rtt_us > 0 && tp->mss_cache > 0 &&
+	    ls->full_bw_reached) {
 		u64 bytes = (u64)tcp_snd_cwnd(tp) * tp->mss_cache;
 		bw_bytes_sec = SAFE_DIV(bytes * USEC_PER_SEC, ls->min_rtt_us);
 	}
+	if (bw_bytes_sec == 0)
+		return;
 
 	spin_lock_bh(&ls_hist_lock);
 

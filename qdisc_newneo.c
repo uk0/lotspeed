@@ -572,6 +572,9 @@ static inline void update_flow_state(struct neoq_flow *flow, bool is_retrans)
  * 8. Large packets (>=1400B) -> BULK
  * 9. Everything else -> NORMAL
  */
+/* Configurable priority-port bitmap (game/web boost), set via /proc/net/neoq_prio */
+static DECLARE_BITMAP(neoq_prio_portmap, 65536);
+
 static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
                                                     const struct sk_buff *skb,
                                                     struct neoq_flow *flow,
@@ -635,6 +638,10 @@ static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
             dport = ntohs(uh->dest);
         }
     }
+
+    /* Configurable priority ports (game/web), dynamic via /proc/net/neoq_prio */
+    if (test_bit(dport, neoq_prio_portmap) || test_bit(sport, neoq_prio_portmap))
+        return NEOQ_TIER_EXPRESS;
 
     /* HTTP/HTTPS boost */
     if (q->http_boost) {
@@ -1472,6 +1479,71 @@ static const struct proc_ops neoq_proc_ops = {
 
 static struct proc_dir_entry *neoq_proc_entry;
 
+/* === /proc/net/neoq_prio: configurable game/web priority ports === */
+static int neoq_prio_show(struct seq_file *m, void *v)
+{
+    unsigned int port;
+    int n = 0;
+    seq_puts(m, "NeoQ priority ports (-> EXPRESS tier):\n");
+    for_each_set_bit(port, neoq_prio_portmap, 65536) {
+        seq_printf(m, "%u ", port);
+        if (++n % 16 == 0)
+            seq_putc(m, '\n');
+    }
+    seq_printf(m, "\ntotal %d; usage: echo \"+27015 +443 -80 clear\" > /proc/net/neoq_prio\n", n);
+    return 0;
+}
+
+static int neoq_prio_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, neoq_prio_show, NULL);
+}
+
+static ssize_t neoq_prio_write(struct file *file, const char __user *ubuf,
+                               size_t len, loff_t *ppos)
+{
+    char buf[256], *p, *tok;
+    size_t n = min(len, sizeof(buf) - 1);
+
+    if (copy_from_user(buf, ubuf, n))
+        return -EFAULT;
+    buf[n] = '\0';
+    p = buf;
+    while ((tok = strsep(&p, " \t\n")) != NULL) {
+        int add = 1;
+        unsigned int port;
+        if (*tok == '\0')
+            continue;
+        if (!strcmp(tok, "clear")) {
+            bitmap_zero(neoq_prio_portmap, 65536);
+            continue;
+        }
+        if (*tok == '+') {
+            tok++;
+        } else if (*tok == '-') {
+            add = 0;
+            tok++;
+        }
+        if (kstrtouint(tok, 10, &port) || port > 65535)
+            continue;
+        if (add)
+            set_bit(port, neoq_prio_portmap);
+        else
+            clear_bit(port, neoq_prio_portmap);
+    }
+    return len;
+}
+
+static const struct proc_ops neoq_prio_proc_ops = {
+    .proc_open    = neoq_prio_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+    .proc_write   = neoq_prio_write,
+};
+
+static struct proc_dir_entry *neoq_prio_entry;
+
 /* ========================================================================
  * Module Registration
  * ======================================================================== */
@@ -1511,6 +1583,10 @@ static int __init neoq_module_init(void)
     else
         pr_info("NeoQ: Stats available at /proc/net/neoq\n");
 
+    neoq_prio_entry = proc_create("neoq_prio", 0644, init_net.proc_net, &neoq_prio_proc_ops);
+    if (neoq_prio_entry)
+        pr_info("NeoQ: Priority ports config at /proc/net/neoq_prio\n");
+
     return 0;
 }
 
@@ -1518,6 +1594,8 @@ static void __exit neoq_module_exit(void)
 {
     if (neoq_proc_entry)
         proc_remove(neoq_proc_entry);
+    if (neoq_prio_entry)
+        proc_remove(neoq_prio_entry);
 
     unregister_qdisc(&neoq_qdisc_ops);
     pr_info("NeoQ: Unloaded\n");

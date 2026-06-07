@@ -736,7 +736,7 @@ struct lotspeed {
 	/* === u8 字段区 (8 bytes) === */
 	u8      mode;                   /* ls_mode (0-3) */
 	u8      cycle_idx;              /* ls_bw_phase (0-3) */
-	u8      rho_scale;              /* 高延迟 rho (100=1.0x) */
+	u16     rho_scale;              /* 高延迟 rho (100=1.0x); u16 支持洲际 >2.55x 补偿 */
 	u8      init_cwnd;              /* 初始 cwnd */
 	u8      rounds_since_probe;     /* 距上次探测的轮次 */
 	u8      startup_rounds;         /* 启动轮次计数 */
@@ -906,9 +906,9 @@ static void ls_update_rho(struct sock *sk)
 	/* rho = rtt / rtt_ref (以百分比表示, 100 = 1.0) */
 	rho = (u64)ls->min_rtt_us * 100;
 	do_div(rho, ref_us);
-	rho = clamp_t(u64, rho, 100, min_t(u32, rho_max, 255));
+	rho = clamp_t(u64, rho, 100, rho_max);
 
-	ls->rho_scale = (u8)rho;
+	ls->rho_scale = (u16)rho;
 }
 
 /* 整数平方根近似 (用于 rho^0.5 计算) */
@@ -934,6 +934,7 @@ static u32 ls_hybla_cwnd_gain(struct sock *sk)
 {
 	struct lotspeed *ls = inet_csk_ca(sk);
 	u32 gain_exp = READ_ONCE(ls_params.hybla_gain_exp);
+	u32 rho_max = READ_ONCE(ls_params.hd_rho_max);
 	u64 gain;
 
 	if (!ls->high_delay_path || ls->rho_scale <= 100)
@@ -959,8 +960,8 @@ static u32 ls_hybla_cwnd_gain(struct sock *sk)
 		do_div(gain, 100);
 	}
 
-	/* 限制最大增益 */
-	return min_t(u32, gain, READ_ONCE(ls_params.hd_cwnd_gain) * 2);
+	/* 限制最大增益: 实测 rho^2(16x) 过冲增重传, 收敛到 rho_max(4x) */
+	return min_t(u32, gain, rho_max);
 }
 
 /* 计算 Hybla 增强的 pacing 增益 */

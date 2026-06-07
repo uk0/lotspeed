@@ -575,6 +575,47 @@ static inline void update_flow_state(struct neoq_flow *flow, bool is_retrans)
 /* Configurable priority-port bitmap (game/web boost), set via /proc/net/neoq_prio */
 static DECLARE_BITMAP(neoq_prio_portmap, 65536);
 
+/* Outbound-ACK rwnd boost = single-side downstream "window deception", percent (100=off).
+ * Pairs with lotspeed CC (upstream) to form one bidirectional accel system.
+ * Set via /proc/net/neoq_boost. */
+static u32 neoq_rwnd_boost = 100;
+
+/* Enlarge advertised receive window on outbound TCP ACKs so the peer sender
+ * (bounded by min(cwnd, rwnd)) ramps faster when it is rwnd-limited.
+ * Safe: skips zero-window (flow control), ensures skb writable, updates csum
+ * incrementally (same primitive as netfilter NAT). */
+static void neoq_boost_rwnd(struct sk_buff *skb)
+{
+    struct iphdr *iph;
+    struct tcphdr *th;
+    u32 boost = READ_ONCE(neoq_rwnd_boost);
+    unsigned int off;
+    u16 old_win, new_win;
+
+    if (boost <= 100 || skb->protocol != htons(ETH_P_IP))
+        return;
+    iph = ip_hdr(skb);
+    if (!iph || iph->protocol != IPPROTO_TCP)
+        return;
+    off = iph->ihl << 2;
+    if (!pskb_may_pull(skb, off + sizeof(struct tcphdr)))
+        return;
+    if (skb_ensure_writable(skb, off + sizeof(struct tcphdr)))
+        return;
+    iph = ip_hdr(skb);
+    th = (struct tcphdr *)((u8 *)iph + off);
+    if (!th->ack)
+        return;
+    old_win = ntohs(th->window);
+    if (old_win == 0)            /* zero-window = flow control, never touch */
+        return;
+    new_win = (u16)min_t(u32, (u32)old_win * boost / 100, 65535U);
+    if (new_win == old_win)
+        return;
+    inet_proto_csum_replace2(&th->check, skb, htons(old_win), htons(new_win), false);
+    th->window = htons(new_win);
+}
+
 static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
                                                     const struct sk_buff *skb,
                                                     struct neoq_flow *flow,
@@ -874,6 +915,9 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     bool is_retrans = false;
 
     len = qdisc_pkt_len(skb);
+
+    /* Downstream window deception: enlarge advertised rwnd on outbound ACKs */
+    neoq_boost_rwnd(skb);
 
     /* Limits check */
     if (unlikely(sch->q.qlen >= q->limit ||
@@ -1544,6 +1588,44 @@ static const struct proc_ops neoq_prio_proc_ops = {
 
 static struct proc_dir_entry *neoq_prio_entry;
 
+/* === /proc/net/neoq_boost: downstream rwnd boost factor (percent, 100=off) === */
+static int neoq_boost_show(struct seq_file *m, void *v)
+{
+    seq_printf(m, "%u\n", READ_ONCE(neoq_rwnd_boost));
+    return 0;
+}
+static int neoq_boost_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, neoq_boost_show, NULL);
+}
+static ssize_t neoq_boost_write(struct file *file, const char __user *ubuf,
+                                size_t len, loff_t *ppos)
+{
+    char buf[16];
+    u32 v;
+    size_t n = min(len, sizeof(buf) - 1);
+
+    if (copy_from_user(buf, ubuf, n))
+        return -EFAULT;
+    buf[n] = '\0';
+    if (kstrtouint(strim(buf), 10, &v) == 0) {
+        if (v < 100)
+            v = 100;
+        if (v > 1000)
+            v = 1000;
+        WRITE_ONCE(neoq_rwnd_boost, v);
+    }
+    return len;
+}
+static const struct proc_ops neoq_boost_proc_ops = {
+    .proc_open    = neoq_boost_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+    .proc_write   = neoq_boost_write,
+};
+static struct proc_dir_entry *neoq_boost_entry;
+
 /* ========================================================================
  * Module Registration
  * ======================================================================== */
@@ -1587,6 +1669,10 @@ static int __init neoq_module_init(void)
     if (neoq_prio_entry)
         pr_info("NeoQ: Priority ports config at /proc/net/neoq_prio\n");
 
+    neoq_boost_entry = proc_create("neoq_boost", 0644, init_net.proc_net, &neoq_boost_proc_ops);
+    if (neoq_boost_entry)
+        pr_info("NeoQ: Downstream rwnd boost at /proc/net/neoq_boost\n");
+
     return 0;
 }
 
@@ -1596,6 +1682,8 @@ static void __exit neoq_module_exit(void)
         proc_remove(neoq_proc_entry);
     if (neoq_prio_entry)
         proc_remove(neoq_prio_entry);
+    if (neoq_boost_entry)
+        proc_remove(neoq_boost_entry);
 
     unregister_qdisc(&neoq_qdisc_ops);
     pr_info("NeoQ: Unloaded\n");

@@ -10,6 +10,7 @@ import (
 )
 
 const neoqPrioProc = "/proc/net/neoq_prio"
+const neoqBoostProc = "/proc/net/neoq_boost"
 
 // Latency-sensitive web ports always prioritized.
 var webPorts = []int{80, 443, 8080, 8443}
@@ -115,5 +116,22 @@ func cmdPrio(args []string) error {
 	default:
 		return fmt.Errorf("usage: prio [list | add P... | del P... | clear | auto]")
 	}
+	return nil
+}
+
+// cmdBoost reads or sets the NeoQ downstream rwnd boost factor (percent, 100=off).
+func cmdBoost(args []string) error {
+	if len(args) == 0 {
+		b, err := os.ReadFile(neoqBoostProc)
+		if err != nil {
+			return fmt.Errorf("read %s (neoq loaded?): %w", neoqBoostProc, err)
+		}
+		fmt.Printf("neoq_boost = %s", b)
+		return nil
+	}
+	if err := os.WriteFile(neoqBoostProc, []byte(args[0]), 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("neoq_boost set to %s\n", args[0])
 	return nil
 }

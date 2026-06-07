@@ -16,8 +16,11 @@ type metrics struct {
 }
 
 // tunable parameter with a safe range.
+// path != "" => write that proc file directly (e.g. /proc/net/neoq_boost);
+// path == "" => lotspeed sysctl by name.
 type tunable struct {
 	name                string
+	path                string
 	min, max, step, cur int
 }
 
@@ -34,7 +37,7 @@ type optimizer struct {
 	bestScore   float64
 	phase       string
 	exploreT    int
-	prevTx      uint64
+	prevBytes   uint64
 	prevOut     uint64
 	prevRetr    uint64
 }
@@ -44,26 +47,37 @@ func newOptimizer(iface string, interval time.Duration) *optimizer {
 		iface: iface, interval: interval, alpha: 0.5, beta: 5.0,
 		dir: 1, phase: "EXPLORE", bestScore: -1e9,
 		tun: []tunable{
-			{"startup_gain", 200, 400, 20, 300},
-			{"fast_alpha", 4, 40, 4, 20},
-			{"loss_thresh", 2, 50, 4, 5},
-			{"hd_rho_max", 150, 400, 25, 400},
+			{"startup_gain", "", 200, 400, 20, 300},
+			{"fast_alpha", "", 4, 40, 4, 20},
+			{"loss_thresh", "", 2, 50, 4, 5},
+			{"hd_rho_max", "", 150, 400, 25, 400},
+			// downstream window deception strength (NeoQ), part of the same system
+			{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 100},
 		},
 	}
 	for i := range o.tun {
-		if v, err := readSysctl(o.tun[i].name); err == nil {
-			if n, err := strconv.Atoi(v); err == nil {
-				o.tun[i].cur = n
+		var s string
+		if o.tun[i].path != "" {
+			if b, err := os.ReadFile(o.tun[i].path); err == nil {
+				s = strings.TrimSpace(string(b))
 			}
+		} else if v, err := readSysctl(o.tun[i].name); err == nil {
+			s = v
+		}
+		if n, err := strconv.Atoi(s); err == nil {
+			o.tun[i].cur = n
 		}
 	}
 	return o
 }
 
-func ifaceTxBytes(iface string) uint64 {
-	b, _ := os.ReadFile("/sys/class/net/" + iface + "/statistics/tx_bytes")
-	v, _ := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
-	return v
+// ifaceBytes returns tx+rx so downstream gains (from neoq_boost) are rewarded.
+func ifaceBytes(iface string) uint64 {
+	tb, _ := os.ReadFile("/sys/class/net/" + iface + "/statistics/tx_bytes")
+	rb, _ := os.ReadFile("/sys/class/net/" + iface + "/statistics/rx_bytes")
+	tx, _ := strconv.ParseUint(strings.TrimSpace(string(tb)), 10, 64)
+	rx, _ := strconv.ParseUint(strings.TrimSpace(string(rb)), 10, 64)
+	return tx + rx
 }
 
 // avgSrttMs averages srtt across established sockets (ss -ti).
@@ -95,9 +109,9 @@ func avgSrttMs() float64 {
 }
 
 func (o *optimizer) measure() metrics {
-	tx := ifaceTxBytes(o.iface)
-	dtx := tx - o.prevTx
-	o.prevTx = tx
+	cur := ifaceBytes(o.iface)
+	dbytes := cur - o.prevBytes
+	o.prevBytes = cur
 	out, retr := readSnmpTcp()
 	dout, dretr := out-o.prevOut, retr-o.prevRetr
 	o.prevOut, o.prevRetr = out, retr
@@ -105,7 +119,7 @@ func (o *optimizer) measure() metrics {
 	if dout > 0 {
 		loss = float64(dretr) / float64(dout)
 	}
-	bw := float64(dtx) * 8 / o.interval.Seconds() / 1e6
+	bw := float64(dbytes) * 8 / o.interval.Seconds() / 1e6
 	return metrics{bwMbps: bw, rttMs: avgSrttMs(), lossPct: loss}
 }
 
@@ -130,9 +144,16 @@ func (o *optimizer) score(m metrics) float64 {
 	return s
 }
 
-func (o *optimizer) apply(t *tunable) { _ = writeSysctl(t.name, strconv.Itoa(t.cur)) }
+func (o *optimizer) apply(t *tunable) {
+	v := strconv.Itoa(t.cur)
+	if t.path != "" {
+		_ = os.WriteFile(t.path, []byte(v), 0o644)
+	} else {
+		_ = writeSysctl(t.name, v)
+	}
+}
 
-// cmdOptimize runs the adaptive parameter search.
+// cmdOptimize runs the adaptive parameter search (upstream CC + downstream NeoQ boost).
 //
 //	lotspeedctl optimize --iface eth0 [--interval N]
 func cmdOptimize(args []string) error {
@@ -162,11 +183,11 @@ func cmdOptimize(args []string) error {
 	}
 
 	o := newOptimizer(iface, interval)
-	// EXPLORE phase: aggressive grab to discover peak bandwidth.
+	// EXPLORE: aggressive grab to discover peak (up+down) throughput.
 	_ = writeSysctl("turbo_startup", "1")
 	_ = writeSysctl("startup_gain", "400")
-	fmt.Printf("optimize: iface=%s interval=%v phase=EXPLORE (aggressive grab)\n", iface, interval)
-	o.prevTx = ifaceTxBytes(iface)
+	fmt.Printf("optimize: iface=%s interval=%v phase=EXPLORE (aggressive grab, tx+rx)\n", iface, interval)
+	o.prevBytes = ifaceBytes(iface)
 	o.prevOut, o.prevRetr = readSnmpTcp()
 
 	for {
@@ -188,14 +209,14 @@ func cmdOptimize(args []string) error {
 
 		// OPTIMIZE: coordinate ascent with revert-on-regression.
 		if sc > o.bestScore {
-			o.bestScore = sc // last probe improved -> keep going same dir
+			o.bestScore = sc
 		} else {
-			t := &o.tun[o.ti] // revert last probe
+			t := &o.tun[o.ti]
 			t.cur -= o.dir * t.step
 			o.apply(t)
 			o.dir = -o.dir
 			if o.dir == 1 {
-				o.ti = (o.ti + 1) % len(o.tun) // both dirs tried -> next param
+				o.ti = (o.ti + 1) % len(o.tun)
 			}
 		}
 		t := &o.tun[o.ti]

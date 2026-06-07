@@ -83,6 +83,8 @@ func main() {
 		err = cmdOptimize(os.Args[2:])
 	case "prio":
 		err = cmdPrio(os.Args[2:])
+	case "boost":
+		err = cmdBoost(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -114,6 +116,7 @@ Usage:
                                      adaptive search: EXPLORE peak bw -> OPTIMIZE score
   lotspeedctl prio [list|add P..|del P..|clear|auto]
                                      manage NeoQ priority ports (auto = detect game/web)
+  lotspeedctl boost [N]              get/set NeoQ downstream rwnd boost (percent, 100=off)
 `)
 }
 

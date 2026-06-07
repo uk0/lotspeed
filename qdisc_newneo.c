@@ -580,6 +580,12 @@ static DECLARE_BITMAP(neoq_prio_portmap, 65536);
  * Set via /proc/net/neoq_boost. */
 static u32 neoq_rwnd_boost = 100;
 
+/* Global CoDel target/interval (ns), runtime-tunable via /proc/net/neoq_codel.
+ * Default 5ms/100ms suits LAN; raise target for high-RTT intercontinental links
+ * (else CoDel over-drops and starves the CC -> low goodput). */
+static u64 neoq_codel_target_ns = (u64)NEOQ_TARGET_US * 1000;
+static u64 neoq_codel_interval_ns = (u64)NEOQ_INTERVAL_US * 1000;
+
 /* Enlarge advertised receive window on outbound TCP ACKs so the peer sender
  * (bounded by min(cwnd, rwnd)) ramps faster when it is rwnd-limited.
  * Safe: skips zero-window (flow control), ensures skb writable, updates csum
@@ -593,6 +599,10 @@ static void neoq_boost_rwnd(struct sk_buff *skb)
     u16 old_win, new_win;
 
     if (boost <= 100 || skb->protocol != htons(ETH_P_IP))
+        return;
+    /* Skip GSO/TSO super-packets: writing into them breaks segmentation/csum.
+     * Outbound ACKs are tiny and never GSO'd, so we lose nothing in practice. */
+    if (skb_is_gso(skb))
         return;
     iph = ip_hdr(skb);
     if (!iph || iph->protocol != IPPROTO_TCP)
@@ -808,7 +818,7 @@ static bool codel_should_drop(struct neoq_flow *flow, struct neoq_tier *tier,
                               u64 now, struct sk_buff *skb)
 {
     u64 sojourn = now - get_neoq_cb(skb)->enqueue_time;
-    u64 effective_target = tier->codel_target;
+    u64 effective_target = READ_ONCE(neoq_codel_target_ns);
     bool over, due;
 
     flow->ecn_marked = 0;
@@ -852,7 +862,7 @@ static bool codel_should_drop(struct neoq_flow *flow, struct neoq_tier *tier,
     if (over) {
         if (!flow->dropping) {
             flow->dropping = 1;
-            flow->drop_next = codel_control_law(now, tier->codel_interval,
+            flow->drop_next = codel_control_law(now, READ_ONCE(neoq_codel_interval_ns),
                                                  flow->rec_inv_sqrt);
         }
         if (!flow->count)
@@ -874,7 +884,7 @@ static bool codel_should_drop(struct neoq_flow *flow, struct neoq_tier *tier,
             flow->count--;
         codel_cache_invsqrt(flow);
         flow->drop_next = codel_control_law(flow->drop_next,
-                                             tier->codel_interval,
+                                             READ_ONCE(neoq_codel_interval_ns),
                                              flow->rec_inv_sqrt);
         return true;
     }
@@ -883,7 +893,7 @@ static bool codel_should_drop(struct neoq_flow *flow, struct neoq_tier *tier,
         flow->count--;
         codel_cache_invsqrt(flow);
         flow->drop_next = codel_control_law(flow->drop_next,
-                                             tier->codel_interval,
+                                             READ_ONCE(neoq_codel_interval_ns),
                                              flow->rec_inv_sqrt);
         due = flow->count && (s64)(now - flow->drop_next) >= 0;
     }
@@ -1626,6 +1636,44 @@ static const struct proc_ops neoq_boost_proc_ops = {
 };
 static struct proc_dir_entry *neoq_boost_entry;
 
+/* === /proc/net/neoq_codel: CoDel target/interval in microseconds === */
+static int neoq_codel_show(struct seq_file *m, void *v)
+{
+    seq_printf(m, "target_us=%llu interval_us=%llu\nusage: echo \"<target_us> <interval_us>\" > /proc/net/neoq_codel\n",
+               READ_ONCE(neoq_codel_target_ns) / 1000, READ_ONCE(neoq_codel_interval_ns) / 1000);
+    return 0;
+}
+static int neoq_codel_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, neoq_codel_show, NULL);
+}
+static ssize_t neoq_codel_write(struct file *file, const char __user *ubuf,
+                                size_t len, loff_t *ppos)
+{
+    char buf[64];
+    unsigned int t = 0, iv = 0;
+    size_t n = min(len, sizeof(buf) - 1);
+
+    if (copy_from_user(buf, ubuf, n))
+        return -EFAULT;
+    buf[n] = '\0';
+    if (sscanf(buf, "%u %u", &t, &iv) >= 1) {
+        if (t)
+            WRITE_ONCE(neoq_codel_target_ns, (u64)t * 1000);
+        if (iv)
+            WRITE_ONCE(neoq_codel_interval_ns, (u64)iv * 1000);
+    }
+    return len;
+}
+static const struct proc_ops neoq_codel_proc_ops = {
+    .proc_open    = neoq_codel_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+    .proc_write   = neoq_codel_write,
+};
+static struct proc_dir_entry *neoq_codel_entry;
+
 /* ========================================================================
  * Module Registration
  * ======================================================================== */
@@ -1673,6 +1721,10 @@ static int __init neoq_module_init(void)
     if (neoq_boost_entry)
         pr_info("NeoQ: Downstream rwnd boost at /proc/net/neoq_boost\n");
 
+    neoq_codel_entry = proc_create("neoq_codel", 0644, init_net.proc_net, &neoq_codel_proc_ops);
+    if (neoq_codel_entry)
+        pr_info("NeoQ: CoDel target/interval at /proc/net/neoq_codel\n");
+
     return 0;
 }
 
@@ -1684,6 +1736,8 @@ static void __exit neoq_module_exit(void)
         proc_remove(neoq_prio_entry);
     if (neoq_boost_entry)
         proc_remove(neoq_boost_entry);
+    if (neoq_codel_entry)
+        proc_remove(neoq_codel_entry);
 
     unregister_qdisc(&neoq_qdisc_ops);
     pr_info("NeoQ: Unloaded\n");

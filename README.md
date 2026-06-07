@@ -291,6 +291,160 @@ PAC (Proactive ACK Control) for TCP Incast Congestion
 [QDISC_DOC](QDISC_DOC.md)
 
 
+-----------------------------------
+
+## lotspeedctl — Go 控制 CLI + 自适应参数寻优
+
+`lotspeedctl/` 下的 Go CLI 是**整套体系的大脑**:统一控制 lotspeed CC + NeoQ qdisc + 下行诱骗,自动测量真实链路、从历史 sample 学习、动态规划参数。三件套构成完整闭环:
+
+```
+┌─────────────────── lotspeedctl (Go) ────────────────────┐
+│  collect  →  measure (ss/snmp/ifstat)  →  EWMA / MAD    │
+│      ↓                                                   │
+│  model.json (KNN samples)  ← record (feature,params,score)│
+│      ↓                                                   │
+│  predict (k=5 inverse-distance + score weighted)         │
+│      ↓                                                   │
+│  apply  →  /proc/sys/net/ipv4/lotspeed/*                │
+│         →  /proc/net/neoq_{prio,boost,codel}             │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 编译
+
+`lotspeedctl` 是纯 Go,本地交叉编译即可:
+
+```bash
+cd lotspeedctl
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o lotspeedctl .
+scp lotspeedctl root@加速端:/usr/local/bin/
+```
+
+### 部署模型(单边加速)
+
+加速端(海外大带宽 VPS)装 lotspeed + sch_neoq + lotspeedctl,下游客户端(国内/弱网)**什么都不用装**,标准 bbr 即可。这就是单边加速的本质。
+
+```bash
+# 加速端
+modprobe lotspeed          # 或 insmod lotspeed.ko
+modprobe sch_neoq
+lotspeedctl enable eth0    # 切 CC=lotspeed + 给 eth0 挂 neoq
+```
+
+### 命令全集
+
+| 命令 | 说明 |
+|------|------|
+| `status` | 当前 CC + 可用 CC + lotspeed 关键参数 + NeoQ 统计 |
+| `enable <iface>` | 切 `CC=lotspeed` + 给 iface 挂 `neoq` qdisc |
+| `disable <iface>` | 还原 `CC=bbr` + 移除 iface 的 neoq |
+| `set <param> <val>` / `get [param]` | 读写 `/proc/sys/net/ipv4/lotspeed/<param>` |
+| `preset <name>` | `intercontinental` / `game` / `web` / `balanced` |
+| `monitor [sec]` | 实时刷新 CC + NeoQ 统计 |
+| `prio [list\|add P\|del P\|clear\|auto]` | NeoQ 优先端口(`auto` 自动识别游戏/网页) |
+| `boost [N]` | NeoQ 下行 rwnd 诱骗强度(percent,100=off) |
+| `hist-clear` | 强制清空 lotspeed 的 per-IP 历史缓存(诊断/重置用) |
+| `probe <ip> [port]` | 测量 RTT/BW/loss(MAD 异常值滤波) |
+| `tune <ip> [port]` | probe → model.predict → 写参数(一键调优) |
+| `daemon --iface X` | 抗丢包闭环 + 自动游戏/网页优先级 |
+| `optimize --iface X --target IP` | 自适应寻优:warm-start → EXPLORE → OPTIMIZE,持续 record sample 训练模型 |
+| `model [show\|clear]` | 查看/清空 KNN 样本库(`~/.lotspeedctl/model.json`) |
+
+### 动态调参的工作原理
+
+**1. 测量层(异常值抚平)**
+
+洲际链路抖动大,单次测量不可靠。`probe` 默认行为:
+
+- 20 次 ping,**Hampel filter (MAD>3)** 剔除离群值,取 P10/P50/P90
+- 3×5s iperf3,**trimmed mean** 去掉最高最低
+- ICMP 被 NAT 阻断时自动 fallback 到 TCP-connect 计时
+- 输出 `linkFeature` 向量:`{rtt_p50, rtt_p10, jitter, bw_mbps, loss}`
+
+**2. 模型层(KNN 样本库)**
+
+`~/.lotspeedctl/model.json` 是 JSON 持久化的 sample 列表,每条记录 `(feature, params, score)`。`predict()` 流程:
+
+- 对新链路特征 `f`,计算与每个历史 sample 的归一化 L2 距离(RTT/BW 用 log scale)
+- 取 K=5 最近邻
+- 按 `score / (距离 + 0.1)` 加权平均每个参数 → 推荐参数
+
+冷启动(无 sample)走 `heuristicPlan` BDP 公式作 fallback。
+
+**3. 数据收集(自动闭环)**
+
+`optimize --iface X --target IP` 是收集训练数据的入口:
+
+- **warm-start**:如果 model 已有 sample,先用 `predict` 作为初始参数(避免每次从默认值摸索)
+- **EXPLORE**:几个周期激进抢带宽,记录 `peakBw`/`minRtt`
+- **OPTIMIZE**:coordinate ascent 逐参数 `±step` 探索;score = `bw/peakBw − α·delay_inflation − β·loss`
+- **window-best record**:每 N 个 OPT 周期,把窗口内最高分的 `(feature, params, score)` 持久化到 `model.json`
+- 长跑越久,model 样本越多,后续 warm-start + tune 越准
+
+**4. 一键调优**
+
+```bash
+# 第一次:冷启动用 heuristic
+lotspeedctl tune <downstream_client_ip> <iperf3_port>
+
+# 后台跑寻优收集 sample
+lotspeedctl optimize --iface eth0 --target <client_ip>
+
+# 再次 tune:已用 model.predict 出推荐参数
+lotspeedctl tune <client_ip> <port>
+lotspeedctl model show          # 查看学到了什么
+```
+
+### systemd 常驻
+
+```ini
+# /etc/systemd/system/lotspeedctl.service
+[Unit]
+Description=LotSpeed adaptive accelerator
+After=network-online.target
+
+[Service]
+ExecStartPre=/usr/local/bin/lotspeedctl enable eth0
+ExecStart=/usr/local/bin/lotspeedctl optimize --iface eth0 --target <peer_ip> --interval 5
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl enable --now lotspeedctl
+```
+
+### NeoQ 配套接口(运行时可调)
+
+体系的另一半在 NeoQ qdisc 侧,都通过 `/proc/net/` 接口运行时可调,daemon/optimize 会自动用上:
+
+```bash
+# 游戏/网页优先级 (流量自动进 EXPRESS tier)
+echo "+27015 +443 +5201" > /proc/net/neoq_prio
+echo "clear" > /proc/net/neoq_prio
+cat /proc/net/neoq_prio
+
+# 下行 rwnd 诱骗 (单边双向加速;100=off,>=100 倍数放大出站 ACK 窗口)
+echo 250 > /proc/net/neoq_boost
+
+# CoDel target/interval (高 RTT 链路需要放大 target,默认 5ms 适合 LAN)
+echo "150000 300000" > /proc/net/neoq_codel    # 150ms target, 300ms interval
+```
+
+### lotspeed CC 注意事项
+
+- **`hist_enable`**:per-IP 历史缓存。开启后早期版本可能命中坏 entry 导致连接卡住。生产建议先 `echo 0 > /proc/sys/net/ipv4/lotspeed/hist_enable` 或者 `lotspeedctl hist-clear`,再开启;新版内核已加 `hist_min_cwnd_bound` 兜底与写入前 sanity check
+- **卸载顺序**:务必先 `sysctl -w net.ipv4.tcp_congestion_control=bbr` 再 `rmmod`,否则旧 socket 卡住模块卸不掉
+
+### 设计原则
+
+- **内核做机制,CLI 做策略**:`/proc` 接口暴露,CLI 周期性下发,符合 Unix 哲学
+- **数据驱动 > 启发式**:KNN 样本库可后续平滑替换为 Thompson sampling / Bayesian optimization / 小 MLP,而不动 record→predict 接口
+- **真实抚平 > 单次测量**:洲际抖动下,任何"测一次写一组参数"的方案都是噪声驱动;必须多次采样 + 异常值剔除
+- **单边部署**:加速端装,客户端不装,符合实际运维边界
 
 -----------------------------------
 

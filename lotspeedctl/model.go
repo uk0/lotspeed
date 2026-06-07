@@ -57,10 +57,10 @@ func (m *model) save() error {
 // RTT and BW use log scale so 10ms vs 100ms ≈ 100ms vs 1000ms,
 // preventing one dimension from dominating.
 func dist(a, b linkFeature) float64 {
-	logRtt := math.Log1p(a.rttMs) - math.Log1p(b.rttMs)
-	logBw := math.Log1p(a.bwMbps) - math.Log1p(b.bwMbps)
-	jit := (a.jitter - b.jitter) / 50 // 50ms = 1 unit
-	loss := (a.lossPct - b.lossPct) * 20
+	logRtt := math.Log1p(a.RttMs) - math.Log1p(b.RttMs)
+	logBw := math.Log1p(a.BwMbps) - math.Log1p(b.BwMbps)
+	jit := (a.Jitter - b.Jitter) / 50 // 50ms = 1 unit
+	loss := (a.LossPct - b.LossPct) * 20
 	return math.Sqrt(logRtt*logRtt + logBw*logBw + jit*jit + loss*loss)
 }
 
@@ -105,20 +105,20 @@ func (m *model) predict(f linkFeature) paramSet {
 // All formulas are BDP-driven, the only knob the user reasoned about above.
 func heuristicPlan(f linkFeature) paramSet {
 	bdpPkts := 0
-	if f.bwMbps > 0 && f.rttMs > 0 {
-		bdpPkts = int(f.bwMbps * 1e6 / 8 * f.rttMs / 1000 / 1460)
+	if f.BwMbps > 0 && f.RttMs > 0 {
+		bdpPkts = int(f.BwMbps * 1e6 / 8 * f.RttMs / 1000 / 1460)
 	}
 	if bdpPkts < 64 {
 		bdpPkts = 64
 	}
 	startupGain := 200
 	switch {
-	case f.rttMs >= 200:
+	case f.RttMs >= 200:
 		startupGain = 450
-	case f.rttMs >= 50:
+	case f.RttMs >= 50:
 		startupGain = 350
 	}
-	rhoMax := 100 + int(f.rttMs)
+	rhoMax := 100 + int(f.RttMs)
 	if rhoMax > 800 {
 		rhoMax = 800
 	}
@@ -154,7 +154,7 @@ func cmdModel(args []string) error {
 		fmt.Printf("model at %s\nsamples: %d\n", modelPath(), len(m.Samples))
 		for i, s := range m.Samples {
 			fmt.Printf("  [%d] rtt=%.0fms bw=%.0fM loss=%.1f%% jitter=%.0fms score=%.3f params=%v\n",
-				i, s.Feature.rttMs, s.Feature.bwMbps, s.Feature.lossPct*100, s.Feature.jitter, s.Score, s.Params)
+				i, s.Feature.RttMs, s.Feature.BwMbps, s.Feature.LossPct*100, s.Feature.Jitter, s.Score, s.Params)
 		}
 		return nil
 	}

@@ -184,17 +184,24 @@ func cmdOptimize(args []string) error {
 	if iface == "" {
 		return fmt.Errorf("usage: optimize --iface <dev> [--interval N] [--target IP]")
 	}
-	// If a target is given, probe once and persist (feature, params, score)
-	// to the on-disk model whenever bestScore improves — this is how the
-	// model accumulates knowledge over real runs.
+	// If a target is given, accumulate live measurements into an EWMA-smoothed
+	// feature and persist (feature, params, score) to the on-disk model whenever
+	// bestScore improves. No upfront probe needed — works even when the peer
+	// blocks ICMP/has no listening port (e.g. NAT'd downstream client).
 	var feat linkFeature
-	hasFeat := false
+	rttSamples := []float64{}
+	bwSamples := []float64{}
+	type windowBestT struct {
+		score  float64
+		params paramSet
+		loss   float64
+	}
+	windowBest := windowBestT{score: -1e9}
+	windowCycle := 0
+	const recordEveryN = 5
 	if target != "" {
-		if f, err := probeLink(target, 0); err == nil {
-			feat = f
-			hasFeat = true
-			fmt.Printf("baseline probe: rtt=%.0fms jitter=%.0fms loss=%.2f%%\n", f.rttMs, f.jitter, f.lossPct*100)
-		}
+		feat.Target = target
+		fmt.Printf("optimize will record samples for target %s to model %s\n", target, modelPath())
 	}
 	if err := os.WriteFile(ccPath, []byte("lotspeed"), 0o644); err != nil {
 		return fmt.Errorf("set CC=lotspeed (need root?): %w", err)
@@ -204,6 +211,34 @@ func cmdOptimize(args []string) error {
 	// EXPLORE: aggressive grab to discover peak (up+down) throughput.
 	_ = writeSysctl("turbo_startup", "1")
 	_ = writeSysctl("startup_gain", "400")
+	// Warm-start from the model if we have samples & a target. This is the
+	// "use what you've learned" half of the data loop — without it the model
+	// only grows but never repays the cost of growing it.
+	if target != "" {
+		mdl := loadModel()
+		if len(mdl.Samples) > 0 {
+			// Build a coarse feature from any prior sample with this target
+			// so KNN distance has a reasonable starting point; predict fills the rest.
+			var seed linkFeature
+			seed.Target = target
+			for _, s := range mdl.Samples {
+				if s.Feature.Target == target {
+					seed = s.Feature
+					break
+				}
+			}
+			pred := mdl.predict(seed)
+			applied := 0
+			for i := range o.tun {
+				if v, ok := pred[o.tun[i].name]; ok && v >= o.tun[i].min && v <= o.tun[i].max {
+					o.tun[i].cur = v
+					o.apply(&o.tun[i])
+					applied++
+				}
+			}
+			fmt.Printf("warm-start from model (k=%d samples): %d params applied\n", len(mdl.Samples), applied)
+		}
+	}
 	fmt.Printf("optimize: iface=%s interval=%v phase=EXPLORE (aggressive grab, tx+rx)\n", iface, interval)
 	o.prevBytes = ifaceBytes(iface)
 	o.prevOut, o.prevRetr = readSnmpTcp()
@@ -225,18 +260,54 @@ func cmdOptimize(args []string) error {
 			continue
 		}
 
+		// Live feature building: cap samples and use MAD-filtered medians so
+		// occasional outliers don't poison what we persist to the model.
+		if target != "" {
+			if m.rttMs > 0 {
+				rttSamples = append(rttSamples, m.rttMs)
+				if len(rttSamples) > 20 {
+					rttSamples = rttSamples[1:]
+				}
+			}
+			if m.bwMbps > 0 {
+				bwSamples = append(bwSamples, m.bwMbps)
+				if len(bwSamples) > 20 {
+					bwSamples = bwSamples[1:]
+				}
+			}
+		}
+		// Window-best sampling: every recordEveryN OPT cycles, persist the
+		// best-scoring (params, score) seen in that window. This guarantees
+		// the model keeps growing even when EXPLORE captured the global best
+		// and no later step exceeds it.
+		if target != "" {
+			if sc > windowBest.score {
+				windowBest.score = sc
+				windowBest.params = paramSet{}
+				for i := range o.tun {
+					windowBest.params[o.tun[i].name] = o.tun[i].cur
+				}
+				windowBest.loss = m.lossPct
+			}
+			windowCycle++
+			if windowCycle >= recordEveryN && len(rttSamples) >= 3 && len(bwSamples) >= 3 && windowBest.params != nil {
+				clean := madFilter(rttSamples, 3.0)
+				feat.RttMs = percentile(clean, 0.5)
+				feat.RttMin = percentile(clean, 0.1)
+				feat.Jitter = percentile(clean, 0.9) - feat.RttMin
+				feat.BwMbps = trimmedMean(bwSamples, 0.2)
+				feat.LossPct = windowBest.loss
+				if err := loadModel().record(feat, windowBest.params, windowBest.score); err == nil {
+					fmt.Printf("    -> sample recorded (model now has %d, window-best score=%.3f)\n",
+						len(loadModel().Samples), windowBest.score)
+				}
+				windowCycle = 0
+				windowBest = windowBestT{score: -1e9}
+			}
+		}
 		// OPTIMIZE: coordinate ascent with revert-on-regression.
 		if sc > o.bestScore {
 			o.bestScore = sc
-			// Best improved: snapshot current params + feature to the model.
-			if hasFeat && target != "" {
-				params := paramSet{}
-				for i := range o.tun {
-					params[o.tun[i].name] = o.tun[i].cur
-				}
-				feat.bwMbps = m.bwMbps // refresh bw with live measurement
-				_ = loadModel().record(feat, params, sc)
-			}
 		} else {
 			t := &o.tun[o.ti]
 			t.cur -= o.dir * t.step

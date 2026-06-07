@@ -26,7 +26,7 @@ func cmdTune(args []string) error {
 		return err
 	}
 	fmt.Printf("link: RTT=%.0fms (P10=%.0fms jit=%.0fms) loss=%.2f%% bw=%.0fM\n",
-		f.rttMs, f.rttMin, f.jitter, f.lossPct*100, f.bwMbps)
+		f.RttMs, f.RttMin, f.Jitter, f.LossPct*100, f.BwMbps)
 
 	m := loadModel()
 	src := "heuristic"

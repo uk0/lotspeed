@@ -11,13 +11,14 @@ import (
 
 // linkFeature is the smoothed measurement of a path used by both
 // the model (lookup key) and the planner (parameter formulas).
+// Fields are exported + JSON-tagged so the on-disk model preserves them.
 type linkFeature struct {
-	target  string  // peer IP (for logging only, not a model dimension)
-	rttMs   float64 // P50 RTT, MAD-filtered, multi-sample
-	rttMin  float64 // P10 RTT — proxy for unloaded floor
-	jitter  float64 // P90-P10, captures bufferbloat/variance
-	bwMbps  float64 // trimmed-mean throughput, multi-sample
-	lossPct float64 // ping loss fraction
+	Target  string  `json:"target"`            // peer IP, for logging
+	RttMs   float64 `json:"rtt_ms"`            // P50 RTT, MAD-filtered
+	RttMin  float64 `json:"rtt_min_ms"`        // P10 RTT — unloaded floor
+	Jitter  float64 `json:"jitter_ms"`         // P90-P10, bufferbloat
+	BwMbps  float64 `json:"bw_mbps"`           // trimmed-mean throughput
+	LossPct float64 `json:"loss_pct,omitempty"` // 0..1
 }
 
 var rttRe = regexp.MustCompile(`time=([0-9.]+) ms`)
@@ -87,16 +88,16 @@ func probeIperf(ip string, port, secs int) (float64, error) {
 // probeLink does full probing: 20-ping with MAD filtering + 3x5s iperf trimmed mean.
 // Returns a linkFeature with smoothed signal robust to a few outlier samples.
 func probeLink(ip string, port int) (linkFeature, error) {
-	f := linkFeature{target: ip}
+	f := linkFeature{Target: ip}
 	rtts, loss, err := probePing(ip, 20, port)
 	if err != nil {
 		return f, err
 	}
-	f.lossPct = loss
+	f.LossPct = loss
 	clean := madFilter(rtts, 3.0) // Hampel: drop >3*MAD outliers
-	f.rttMs = percentile(clean, 0.5)
-	f.rttMin = percentile(clean, 0.1)
-	f.jitter = percentile(clean, 0.9) - f.rttMin
+	f.RttMs = percentile(clean, 0.5)
+	f.RttMin = percentile(clean, 0.1)
+	f.Jitter = percentile(clean, 0.9) - f.RttMin
 	if port > 0 {
 		var bws []float64
 		for i := 0; i < 3; i++ {
@@ -105,7 +106,7 @@ func probeLink(ip string, port int) (linkFeature, error) {
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
-		f.bwMbps = trimmedMean(bws, 0.34) // drop the outlier of 3 samples
+		f.BwMbps = trimmedMean(bws, 0.34) // drop the outlier of 3 samples
 	}
 	return f, nil
 }
@@ -125,12 +126,12 @@ func cmdProbe(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("link to %s:\n", f.target)
-	fmt.Printf("  RTT  P50 = %6.1f ms  P10 = %6.1f ms  jitter = %5.1f ms\n", f.rttMs, f.rttMin, f.jitter)
-	fmt.Printf("  loss      = %.2f%%\n", f.lossPct*100)
+	fmt.Printf("link to %s:\n", f.Target)
+	fmt.Printf("  RTT  P50 = %6.1f ms  P10 = %6.1f ms  jitter = %5.1f ms\n", f.RttMs, f.RttMin, f.Jitter)
+	fmt.Printf("  loss      = %.2f%%\n", f.LossPct*100)
 	if port > 0 {
-		fmt.Printf("  BW (trimmed-mean, 3x5s) = %.1f Mbps\n", f.bwMbps)
-		bdp := f.bwMbps * 1e6 / 8 * f.rttMs / 1000 / 1460
+		fmt.Printf("  BW (trimmed-mean, 3x5s) = %.1f Mbps\n", f.BwMbps)
+		bdp := f.BwMbps * 1e6 / 8 * f.RttMs / 1000 / 1460
 		fmt.Printf("  BDP = %.0f packets\n", bdp)
 	}
 	return nil

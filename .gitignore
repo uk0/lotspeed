@@ -265,3 +265,7 @@ $RECYCLE.BIN/
 
 /dkms.conf
 /dkms.tar.gz
+
+# Go build output
+lotspeedctl/lotspeedctl-linux-amd64
+lotspeedctl/lotspeedctl

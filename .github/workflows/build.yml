@@ -1,0 +1,140 @@
+name: Build Kernel Module
+
+on:
+  push:
+    branches: [ main, merge_bl ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-bbrv3:
+    runs-on: ubuntu-latest
+    name: Build for BBRv3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc flex bison libelf-dev libssl-dev
+
+      - name: Cache BBRv3 kernel source
+        uses: actions/cache@v4
+        id: cache-kernel
+        with:
+          path: ~/kernel-bbrv3
+          key: kernel-bbrv3-v3-${{ hashFiles('.github/workflows/build.yml') }}
+
+      - name: Download and prepare BBRv3 kernel
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          # Clone Google's BBR repository (contains BBRv3 patches)
+          git clone --depth 1 https://github.com/google/bbr.git ~/bbr-repo
+          cd ~/bbr-repo
+
+          # Get the latest BBRv3 branch
+          git fetch --depth 1 origin v3
+          git checkout FETCH_HEAD
+
+          mv ~/bbr-repo ~/kernel-bbrv3
+
+          # Prepare kernel headers
+          cd ~/kernel-bbrv3
+          make defconfig
+          make modules_prepare
+          # Create empty Module.symvers to avoid modpost warnings
+          touch Module.symvers
+
+      - name: Build kernel module
+        run: |
+          KERNEL_DIR=~/kernel-bbrv3
+          KERNEL_VERSION=$(make -s -C $KERNEL_DIR kernelversion)
+
+          echo "Building for BBRv3 kernel $KERNEL_VERSION"
+          echo "Kernel directory: $KERNEL_DIR"
+
+          # Use KBUILD_MODPOST_WARN=1 to turn modpost errors into warnings for CI
+          make KERNEL_DIR=$KERNEL_DIR KERNEL_RELEASE=$KERNEL_VERSION KBUILD_MODPOST_WARN=1
+
+      - name: Verify build output
+        run: |
+          if [ -f lotspeed.ko ]; then
+            echo "Build successful!"
+            file lotspeed.ko
+            modinfo lotspeed.ko || true
+          else
+            echo "Build failed: lotspeed.ko not found"
+            exit 1
+          fi
+
+      - name: Upload kernel module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lotspeed-bbrv3
+          path: lotspeed.ko
+          retention-days: 7
+
+  build-xanmod:
+    runs-on: ubuntu-latest
+    name: Build for XanMod 6.18
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc flex bison libelf-dev libssl-dev
+
+      - name: Cache XanMod kernel source
+        uses: actions/cache@v4
+        id: cache-kernel-xanmod
+        with:
+          path: ~/kernel-xanmod
+          key: kernel-xanmod-6.18-${{ hashFiles('.github/workflows/build.yml') }}
+
+      - name: Download and prepare XanMod kernel
+        if: steps.cache-kernel-xanmod.outputs.cache-hit != 'true'
+        run: |
+          # Clone XanMod kernel repository
+          git clone --depth 1 --branch 6.18 https://gitlab.com/xanmod/linux.git ~/kernel-xanmod
+
+          # Prepare kernel headers
+          cd ~/kernel-xanmod
+          make defconfig
+          make modules_prepare
+          # Create empty Module.symvers to avoid modpost warnings
+          touch Module.symvers
+
+      - name: Build kernel module
+        run: |
+          KERNEL_DIR=~/kernel-xanmod
+          KERNEL_VERSION=$(make -s -C $KERNEL_DIR kernelversion)
+
+          echo "Building for XanMod kernel $KERNEL_VERSION"
+          echo "Kernel directory: $KERNEL_DIR"
+
+          # Use KBUILD_MODPOST_WARN=1 to turn modpost errors into warnings for CI
+          make KERNEL_DIR=$KERNEL_DIR KERNEL_RELEASE=$KERNEL_VERSION KBUILD_MODPOST_WARN=1
+
+      - name: Verify build output
+        run: |
+          if [ -f lotspeed.ko ]; then
+            echo "Build successful!"
+            file lotspeed.ko
+            modinfo lotspeed.ko || true
+          else
+            echo "Build failed: lotspeed.ko not found"
+            exit 1
+          fi
+
+      - name: Upload kernel module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lotspeed-xanmod
+          path: lotspeed.ko
+          retention-days: 7

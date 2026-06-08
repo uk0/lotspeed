@@ -4,22 +4,24 @@
 ### C ###
 # Prerequisites
 *.d
-.idea
-AppExKo
-dump_func
-exp
-kernel
+
 # Object files
 *.o
 *.ko
 *.obj
 *.elf
+apx
 
 # Linker output
 *.ilk
 *.map
 *.exp
-
+exp
+dump_func
+.idea
+AppExKo
+kernel
+tapv2
 # Precompiled Headers
 *.gch
 *.pch
@@ -263,3 +265,26 @@ $RECYCLE.BIN/
 
 /dkms.conf
 /dkms.tar.gz
+
+# Go build output
+lotspeedctl/lotspeedctl-linux-amd64
+lotspeedctl/lotspeedctl
+
+# --- Claude Code dev workspace (LOCAL ONLY — never push) ---
+docs/
+# Personal exports
+*.docx
+*.doc
+
+# --- 文章/工具 cruft (NEVER commit) ---
+node_modules/
+package.json
+package-lock.json
+generate-article.js
+generate-wechat-article.js
+note.md
+__pycache__/
+*.pyc
+mdp_data/
+source/
+img/img*.png

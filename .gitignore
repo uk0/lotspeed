@@ -269,3 +269,9 @@ $RECYCLE.BIN/
 # Go build output
 lotspeedctl/lotspeedctl-linux-amd64
 lotspeedctl/lotspeedctl
+
+# --- Claude Code dev workspace (LOCAL ONLY — never push) ---
+docs/
+# Personal exports
+*.docx
+*.doc

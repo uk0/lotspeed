@@ -46,18 +46,24 @@ type optimizer struct {
 
 func newOptimizer(iface string, interval time.Duration) *optimizer {
 	o := &optimizer{
-		// beta lowered 5.0->3.0: with K1 wiring loss_thresh in-kernel, the CC now
-		// tolerates non-congestive loss itself, so the score shouldn't also punish
-		// baseline intercontinental loss as hard (it was biasing toward throttling).
-		iface: iface, interval: interval, alpha: 0.5, beta: 3.0,
+		// beta=1.0 (goodput-accurate): the score measures wire throughput (iface
+		// tx+rx, which includes retransmits). beta*loss discounts that by the
+		// goodput actually lost to retransmission — no more. We do NOT punish
+		// retransmits beyond their goodput cost: on a lossy intercontinental link
+		// being aggressive (high retr) is the point, and the measured win is huge
+		// (+186% vs bbr; bbr collapses to 2M on loss spikes, aggressive holds 36-87M).
+		iface: iface, interval: interval, alpha: 0.5, beta: 1.0,
 		dir: 1, phase: "EXPLORE", bestScore: -1e9,
 		tun: []tunable{
-			{"startup_gain", "", 200, 400, 20, 300},
-			{"fast_alpha", "", 4, 40, 4, 20},
-			// loss_thresh range narrowed 2..50 -> 2..16: K1 test showed lt=2 beats
-			// lt=30 (over-tolerance causes self-inflicted congestion); optimum is low.
-			{"loss_thresh", "", 2, 16, 2, 4},
-			{"hd_rho_max", "", 150, 400, 25, 400},
+			{"startup_gain", "", 200, 400, 20, 400},
+			{"fast_alpha", "", 4, 40, 4, 30},
+			// loss_thresh 2..30 default 20: aggressive loss tolerance — don't back
+			// off on intercontinental loss. The goodput score (beta=1) lets the
+			// optimizer settle where throughput actually peaks per-link.
+			{"loss_thresh", "", 2, 30, 4, 20},
+			// hd_rho_max kept high (250..400): full Hybla high-delay rho keeps
+			// high-RTT cwnd ramping aggressively. (Was observed stuck at 0 = boost off.)
+			{"hd_rho_max", "", 250, 400, 25, 400},
 			// downstream window deception strength (NeoQ), part of the same system
 			{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 100},
 		},
@@ -71,20 +77,15 @@ func newOptimizer(iface string, interval time.Duration) *optimizer {
 		} else if v, err := readSysctl(o.tun[i].name); err == nil {
 			s = v
 		}
-		if n, err := strconv.Atoi(s); err == nil {
+		// Adopt the live sysctl value ONLY if it's in range — this preserves
+		// learned state across restarts. If it's out of range (garbage from a
+		// previous manual test, e.g. fast_alpha=1748 or hd_rho_max=0, or an old
+		// range), keep the tunable's aggressive default cur rather than clamping
+		// to the nearest bound (which would land on the timid end, e.g. 250 not 400).
+		if n, err := strconv.Atoi(s); err == nil && n >= o.tun[i].min && n <= o.tun[i].max {
 			o.tun[i].cur = n
 		}
-		// Clamp into the configured range: the live sysctl/proc value may hold an
-		// out-of-range number from a previous manual test or an older range. Without
-		// this, coordinate ascent (which only steps ±step from current) can never
-		// walk back when current is beyond max+step, and the param stays stuck.
-		if o.tun[i].cur < o.tun[i].min {
-			o.tun[i].cur = o.tun[i].min
-		}
-		if o.tun[i].cur > o.tun[i].max {
-			o.tun[i].cur = o.tun[i].max
-		}
-		o.apply(&o.tun[i]) // push the clamped value to the kernel immediately
+		o.apply(&o.tun[i]) // push the (sane) value to the kernel immediately
 	}
 	return o
 }
@@ -314,8 +315,17 @@ func cmdOptimize(args []string) error {
 		fmt.Printf("UCB initialized from %d prior samples\n", len(prior.Samples))
 	}
 	// EXPLORE: aggressive grab to discover peak (up+down) throughput.
+	// Aggressive intercontinental baseline (non-tunable knobs set once): remove the
+	// cwnd ceiling, max out high-delay Hybla compensation, shrink safety margins,
+	// extend STARTUP for high-RTT ramp. Verified +186% vs bbr on a lossy link.
 	_ = writeSysctl("turbo_startup", "1")
 	_ = writeSysctl("startup_gain", "400")
+	_ = writeSysctl("startup_min_rounds", "8") // more STARTUP rounds for high RTT
+	_ = writeSysctl("max_cwnd", "262144")      // K2: remove the 15000-pkt throughput ceiling
+	_ = writeSysctl("min_cwnd", "100")         // higher cwnd floor
+	_ = writeSysctl("hd_cwnd_gain", "200")     // high-delay cwnd 2x
+	_ = writeSysctl("hd_pacing_gain", "160")   // high-delay pacing 1.6x
+	_ = writeSysctl("inflight_headroom", "5")  // smaller safety margin = more aggressive
 	// Warm-start from the model if we have samples & a target. This is the
 	// "use what you've learned" half of the data loop — without it the model
 	// only grows but never repays the cost of growing it.

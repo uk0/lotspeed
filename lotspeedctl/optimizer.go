@@ -73,6 +73,17 @@ func newOptimizer(iface string, interval time.Duration) *optimizer {
 		if n, err := strconv.Atoi(s); err == nil {
 			o.tun[i].cur = n
 		}
+		// Clamp into the configured range: the live sysctl/proc value may hold an
+		// out-of-range number from a previous manual test or an older range. Without
+		// this, coordinate ascent (which only steps ±step from current) can never
+		// walk back when current is beyond max+step, and the param stays stuck.
+		if o.tun[i].cur < o.tun[i].min {
+			o.tun[i].cur = o.tun[i].min
+		}
+		if o.tun[i].cur > o.tun[i].max {
+			o.tun[i].cur = o.tun[i].max
+		}
+		o.apply(&o.tun[i]) // push the clamped value to the kernel immediately
 	}
 	return o
 }

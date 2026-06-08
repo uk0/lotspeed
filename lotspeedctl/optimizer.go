@@ -45,12 +45,17 @@ type optimizer struct {
 
 func newOptimizer(iface string, interval time.Duration) *optimizer {
 	o := &optimizer{
-		iface: iface, interval: interval, alpha: 0.5, beta: 5.0,
+		// beta lowered 5.0->3.0: with K1 wiring loss_thresh in-kernel, the CC now
+		// tolerates non-congestive loss itself, so the score shouldn't also punish
+		// baseline intercontinental loss as hard (it was biasing toward throttling).
+		iface: iface, interval: interval, alpha: 0.5, beta: 3.0,
 		dir: 1, phase: "EXPLORE", bestScore: -1e9,
 		tun: []tunable{
 			{"startup_gain", "", 200, 400, 20, 300},
 			{"fast_alpha", "", 4, 40, 4, 20},
-			{"loss_thresh", "", 2, 50, 4, 5},
+			// loss_thresh range narrowed 2..50 -> 2..16: K1 test showed lt=2 beats
+			// lt=30 (over-tolerance causes self-inflicted congestion); optimum is low.
+			{"loss_thresh", "", 2, 16, 2, 4},
 			{"hd_rho_max", "", 150, 400, 25, 400},
 			// downstream window deception strength (NeoQ), part of the same system
 			{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 100},
@@ -160,11 +165,18 @@ func (o *optimizer) measure() metrics {
 
 // score = bw/peakBw - alpha*max(0, rtt/minRtt-1) - beta*loss
 func (o *optimizer) score(m metrics) float64 {
+	// C3: decaying reference. peakBw ratchets up on a new peak but decays
+	// slowly otherwise, so a one-time lucky EXPLORE burst doesn't permanently
+	// deflate every later score and make recorded samples incomparable over time.
 	if m.bwMbps > o.peakBw {
 		o.peakBw = m.bwMbps
+	} else {
+		o.peakBw *= 0.995 // ~12 min half-life at 5s cycles
 	}
 	if m.rttMs > 0 && (o.minRtt == 0 || m.rttMs < o.minRtt) {
 		o.minRtt = m.rttMs
+	} else if o.minRtt > 0 {
+		o.minRtt *= 1.0005 // let the RTT floor drift up so the delay penalty isn't pinned on forever
 	}
 	if o.peakBw <= 0 {
 		return 0

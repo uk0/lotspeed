@@ -162,7 +162,7 @@ func cmdModel(args []string) error {
 			tuns := []tunable{
 				{"startup_gain", "", 200, 400, 20, 0},
 				{"fast_alpha", "", 4, 40, 4, 0},
-				{"loss_thresh", "", 2, 50, 4, 0},
+				{"loss_thresh", "", 2, 16, 2, 0},
 				{"hd_rho_max", "", 150, 400, 25, 0},
 				{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 0},
 			}

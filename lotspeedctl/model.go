@@ -156,6 +156,23 @@ func cmdModel(args []string) error {
 			fmt.Printf("  [%d] rtt=%.0fms bw=%.0fM loss=%.1f%% jitter=%.0fms score=%.3f params=%v\n",
 				i, s.Feature.RttMs, s.Feature.BwMbps, s.Feature.LossPct*100, s.Feature.Jitter, s.Score, s.Params)
 		}
+		// Also replay all samples through a fresh UCB bandit and show per-param
+		// best arm + sample count — this is what UCB learned across all sessions.
+		if len(m.Samples) > 0 {
+			tuns := []tunable{
+				{"startup_gain", "", 200, 400, 20, 0},
+				{"fast_alpha", "", 4, 40, 4, 0},
+				{"loss_thresh", "", 2, 50, 4, 0},
+				{"hd_rho_max", "", 150, 400, 25, 0},
+				{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 0},
+			}
+			ucb := newUCB(tuns, 0)
+			ucb.loadFromSamples(m.Samples)
+			fmt.Println("UCB best arm per parameter (replayed from all samples):")
+			for _, line := range ucb.debug() {
+				fmt.Printf("  %s\n", line)
+			}
+		}
 		return nil
 	}
 	if args[0] == "clear" {

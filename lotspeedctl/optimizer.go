@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"strconv"
@@ -160,6 +161,7 @@ func cmdOptimize(args []string) error {
 	interval := 5 * time.Second
 	iface := ""
 	target := ""
+	algo := "coord" // "coord" (coordinate ascent) | "ucb" (UCB1 bandit per param)
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--interval":
@@ -177,6 +179,11 @@ func cmdOptimize(args []string) error {
 		case "--target":
 			if i+1 < len(args) {
 				target = args[i+1]
+				i++
+			}
+		case "--algo":
+			if i+1 < len(args) {
+				algo = args[i+1]
 				i++
 			}
 		}
@@ -208,6 +215,15 @@ func cmdOptimize(args []string) error {
 	}
 
 	o := newOptimizer(iface, interval)
+	// UCB bandit: pre-load it with all prior samples so a fresh process
+	// inherits learning from previous runs (crucial for systemd auto-restart).
+	var ucb *ucbSelector
+	if algo == "ucb" {
+		ucb = newUCB(o.tun, math.Sqrt(2))
+		prior := loadModel()
+		ucb.loadFromSamples(prior.Samples)
+		fmt.Printf("UCB initialized from %d prior samples\n", len(prior.Samples))
+	}
 	// EXPLORE: aggressive grab to discover peak (up+down) throughput.
 	_ = writeSysctl("turbo_startup", "1")
 	_ = writeSysctl("startup_gain", "400")
@@ -297,13 +313,38 @@ func cmdOptimize(args []string) error {
 				feat.Jitter = percentile(clean, 0.9) - feat.RttMin
 				feat.BwMbps = trimmedMean(bwSamples, 0.2)
 				feat.LossPct = windowBest.loss
-				if err := loadModel().record(feat, windowBest.params, windowBest.score); err == nil {
+				// Sanity gate: don't pollute the model with samples taken when
+				// there was no real traffic (iperf died, network stalled, etc).
+				// score>=0 + bw>=5Mbps filters out the "everything is 0" garbage.
+				if feat.BwMbps < 5 || windowBest.score < 0 {
+					fmt.Printf("    -> sample SKIPPED (no real traffic: bw=%.0fM score=%.3f)\n",
+						feat.BwMbps, windowBest.score)
+				} else if err := loadModel().record(feat, windowBest.params, windowBest.score); err == nil {
 					fmt.Printf("    -> sample recorded (model now has %d, window-best score=%.3f)\n",
 						len(loadModel().Samples), windowBest.score)
 				}
 				windowCycle = 0
 				windowBest = windowBestT{score: -1e9}
 			}
+		}
+		// Feed the bandit too (regardless of which algo currently steers,
+		// so we can A/B compare later without losing data).
+		if ucb != nil {
+			for i := range o.tun {
+				ucb.update(o.tun[i].name, o.tun[i].cur, sc)
+			}
+		}
+		// UCB mode: each cycle pick a fresh value per parameter (rotate which
+		// param we update so coordinated effects stay observable).
+		if algo == "ucb" && ucb != nil {
+			t := &o.tun[o.ti]
+			next := ucb.suggest(t.name)
+			t.cur = next
+			o.apply(t)
+			o.ti = (o.ti + 1) % len(o.tun)
+			fmt.Printf("%s UCB bw=%.0f rtt=%.1f loss=%.2f%% score=%.3f | %s -> %d (suggest)\n",
+				ts, m.bwMbps, m.rttMs, m.lossPct*100, sc, t.name, next)
+			continue
 		}
 		// OPTIMIZE: coordinate ascent with revert-on-regression.
 		if sc > o.bestScore {

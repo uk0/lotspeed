@@ -42,6 +42,10 @@ type optimizer struct {
 	prevOut     uint64
 	prevRetr    uint64
 	codelRtt    float64 // EWMA RTT (ms) driving NeoQ CoDel target/interval
+	smScore     float64 // EWMA-smoothed score — stable steering signal (抚平)
+	bestKnown   float64 // best smoothed score seen — stability reference
+	bestParams  []int   // tunable values at bestKnown — snap-back target (纠正)
+	unstableN   int     // consecutive cycles below the stability floor
 }
 
 func newOptimizer(iface string, interval time.Duration) *optimizer {
@@ -232,6 +236,16 @@ func applyCodel(rttMs float64) {
 }
 
 func clampF(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func clampInt(v, lo, hi int) int {
 	if v < lo {
 		return lo
 	}
@@ -460,27 +474,82 @@ func cmdOptimize(args []string) error {
 			continue
 		}
 		// OPTIMIZE: coordinate ascent with revert-on-regression.
-		if sc > o.bestScore {
-			o.bestScore = sc
+		// No-traffic guard: with little/no real traffic the score is pure noise,
+		// so steering on it only thrashes params. Hold and wait for traffic.
+		if m.bwMbps < 5 {
+			fmt.Printf("%s OPT idle (bw=%.0fM<5, no signal) — holding params\n", ts, m.bwMbps)
+			continue
+		}
+		// SMOOTH (抚平): EWMA the control signal so one noisy cycle (RTT/bw blip
+		// on a jittery link) can't trigger a param change. Decisions use smScore.
+		if o.smScore == 0 {
+			o.smScore = sc
 		} else {
+			o.smScore = 0.6*o.smScore + 0.4*sc
+		}
+		// CORRECT (纠正, defensive): re-clamp every tunable into range each cycle so
+		// no drift/garbage value (observed loss_thresh=224, hd_rho_max=1550) can
+		// persist in memory or be re-applied to the kernel.
+		for i := range o.tun {
+			if c := clampInt(o.tun[i].cur, o.tun[i].min, o.tun[i].max); c != o.tun[i].cur {
+				o.tun[i].cur = c
+				o.apply(&o.tun[i])
+			}
+		}
+		// Snapshot the best-known stable config (all params at the highest smScore).
+		if o.bestParams == nil || o.smScore > o.bestKnown {
+			o.bestKnown = o.smScore
+			o.bestParams = make([]int, len(o.tun))
+			for i := range o.tun {
+				o.bestParams[i] = o.tun[i].cur
+			}
+		}
+		// CORRECT+SMOOTH (纠正抚平): if smScore collapses well below best-known for
+		// several consecutive cycles, the search wandered into an unstable region;
+		// snap the WHOLE config back to the best-known-stable point.
+		if o.bestKnown > 0 && o.smScore < 0.6*o.bestKnown {
+			o.unstableN++
+			if o.unstableN >= 3 {
+				for i := range o.tun {
+					o.tun[i].cur = o.bestParams[i]
+					o.apply(&o.tun[i])
+				}
+				fmt.Printf("%s STABILIZE: smScore %.3f << best %.3f, reverted to best-known config\n",
+					ts, o.smScore, o.bestKnown)
+				o.unstableN, o.dir = 0, 1
+				continue
+			}
+		} else {
+			o.unstableN = 0
+		}
+		// Decay both references so a one-time high peak can't latch forever: if the
+		// link's character permanently degrades, bestKnown drifts down to the new
+		// achievable level and STABILIZE stops firing, letting exploration resume.
+		o.bestScore *= 0.995
+		o.bestKnown *= 0.999
+		if o.smScore > o.bestScore {
+			o.bestScore = o.smScore
+		} else {
+			// Revert last probe, CLAMPED so cur can never leave [min,max].
 			t := &o.tun[o.ti]
-			t.cur -= o.dir * t.step
+			t.cur = clampInt(t.cur-o.dir*t.step, t.min, t.max)
 			o.apply(t)
 			o.dir = -o.dir
 			if o.dir == 1 {
 				o.ti = (o.ti + 1) % len(o.tun)
 			}
 		}
+		// Next probe, clamped. If the step would leave the range, flip & advance.
 		t := &o.tun[o.ti]
-		nv := t.cur + o.dir*t.step
-		if nv >= t.min && nv <= t.max {
+		nv := clampInt(t.cur+o.dir*t.step, t.min, t.max)
+		if nv != t.cur {
 			t.cur = nv
 			o.apply(t)
 		} else {
 			o.dir = -o.dir
 			o.ti = (o.ti + 1) % len(o.tun)
 		}
-		fmt.Printf("%s OPT bw=%.0f rtt=%.1f loss=%.2f%% score=%.3f best=%.3f | next %s=%d\n",
-			ts, m.bwMbps, m.rttMs, m.lossPct*100, sc, o.bestScore, o.tun[o.ti].name, o.tun[o.ti].cur)
+		fmt.Printf("%s OPT bw=%.0f rtt=%.1f loss=%.2f%% sm=%.3f best=%.3f | next %s=%d\n",
+			ts, m.bwMbps, m.rttMs, m.lossPct*100, o.smScore, o.bestScore, o.tun[o.ti].name, o.tun[o.ti].cur)
 	}
 }

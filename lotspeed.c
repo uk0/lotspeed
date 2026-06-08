@@ -783,7 +783,7 @@ struct lotspeed {
 
 	/* === 标志位 byte 3 (8 bits) === */
 	u8      ecn_in_cycle:1;         /* 周期内有 ECN */
-	u8      bw_probe_samples:1;     /* 正在收集带宽探测样本 */
+	u8      loss_too_high:1;        /* 本轮丢包率超 loss_thresh (K1 退避门控) */
 	u8      prev_probe_too_high:1;  /* 上次探测过高 */
 	u8      stopped_risky_probe:1;  /* 停止冒险探测 */
 	u8      try_fast_path:1;        /* 尝试快速路径 */
@@ -1295,6 +1295,7 @@ static void ls_enter_probe_bw(struct sock *sk, enum ls_bw_phase phase)
 
 	if (phase == LS_BW_CRUISE || phase == LS_BW_PROBE_DOWN) {
 		ls->loss_in_round = 0;
+		ls->loss_too_high = 0;
 		ls->ecn_in_round = 0;
 	}
 }
@@ -1806,7 +1807,7 @@ static void ls_adapt_lower_bounds(struct sock *sk)
 	if (ls->ecn_in_round)
 		ls_ecn_lower_bounds(sk);
 
-	if (ls->loss_in_round)
+	if (ls->loss_too_high)
 		ls_loss_lower_bounds(sk);
 }
 
@@ -2091,7 +2092,7 @@ static void ls_update_cycle_phase(struct sock *sk, const struct rate_sample *rs)
 		break;
 
 	case LS_BW_PROBE_UP:
-		if (ls->full_bw_reached || ls->loss_in_round || ls->ecn_in_round) {
+		if (ls->full_bw_reached || ls->loss_too_high || ls->ecn_in_round) {
 			if (ls->inflight_hi == ~0U || inflight > ls->inflight_hi)
 				ls->inflight_hi = inflight;
 			ls_enter_probe_bw(sk, LS_BW_PROBE_DOWN);
@@ -2179,6 +2180,15 @@ static void ls_main(struct sock *sk, const struct rate_sample *rs)
 	ls->loss_in_round |= (rs->losses > 0);
 	ls->ecn_in_round |= (ls->ecn_eligible && rs->delivered_ce > 0);
 
+	/* K1: 丢包率门控 — 仅当丢包率超过 loss_thresh 才视为拥塞性丢包并触发退避。
+	 * 低于阈值的非拥塞性随机丢包被容忍 (洲际链路常态),丢包但不降速。
+	 * 用 tx_in_flight (发送时刻在途包数) 作分母,与 BBR v3 一致。 */
+	if (rs->lost > 0 && rs->tx_in_flight > 0) {
+		u32 loss_thr = (u32)rs->tx_in_flight * READ_ONCE(ls_params.loss_thresh) / 100;
+		if ((u32)rs->lost > loss_thr)
+			ls->loss_too_high = 1;
+	}
+
 	/* RACK-TLP 快速丢包检测 (在传统丢包信号之后) */
 	ls_rack_tlp_main(sk, rs);
 
@@ -2222,6 +2232,7 @@ out:
 		ls->bw_latest = bw_sample;
 		ls->inflight_latest = rs->delivered;
 		ls->loss_in_round = 0;
+		ls->loss_too_high = 0;
 		ls->ecn_in_round = 0;
 	}
 }
@@ -2316,6 +2327,7 @@ static u32 ls_undo_cwnd(struct sock *sk)
 	struct lotspeed *ls = inet_csk_ca(sk);
 	ls_reset_full_bw(sk);
 	ls->loss_in_round = 0;
+	ls->loss_too_high = 0;
 	return ls->prior_cwnd;
 }
 

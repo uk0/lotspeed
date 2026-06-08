@@ -81,6 +81,40 @@ func ifaceBytes(iface string) uint64 {
 	return tx + rx
 }
 
+// autoDetectPeer picks the IP with the most ESTABLISHED connections right now.
+// Used in PASSIVE mode (no --target) so each sample is tagged with the actual
+// dominant peer. Falls back to "auto" if no connections.
+func autoDetectPeer() string {
+	out, err := exec.Command("ss", "-tn", "state", "established").Output()
+	if err != nil {
+		return "auto"
+	}
+	counts := map[string]int{}
+	for _, ln := range strings.Split(string(out), "\n") {
+		f := strings.Fields(ln)
+		if len(f) < 4 {
+			continue
+		}
+		peer := f[3]
+		if i := strings.LastIndex(peer, ":"); i > 0 {
+			peer = peer[:i]
+		}
+		peer = strings.TrimPrefix(peer, "[")
+		peer = strings.TrimSuffix(peer, "]")
+		if peer == "" || strings.HasPrefix(peer, "127.") || strings.HasPrefix(peer, "::1") {
+			continue
+		}
+		counts[peer]++
+	}
+	best, bestN := "auto", 0
+	for ip, n := range counts {
+		if n > bestN {
+			best, bestN = ip, n
+		}
+	}
+	return best
+}
+
 // avgSrttMs averages srtt across established sockets (ss -ti).
 func avgSrttMs() float64 {
 	out, err := exec.Command("ss", "-ti", "state", "established").Output()
@@ -189,12 +223,13 @@ func cmdOptimize(args []string) error {
 		}
 	}
 	if iface == "" {
-		return fmt.Errorf("usage: optimize --iface <dev> [--interval N] [--target IP]")
+		return fmt.Errorf("usage: optimize --iface <dev> [--interval N] [--target IP] [--algo coord|ucb]")
 	}
-	// If a target is given, accumulate live measurements into an EWMA-smoothed
-	// feature and persist (feature, params, score) to the on-disk model whenever
-	// bestScore improves. No upfront probe needed — works even when the peer
-	// blocks ICMP/has no listening port (e.g. NAT'd downstream client).
+	// Always record samples passively from whatever real traffic the kernel
+	// is moving. --target is now purely informational — if set, it's stamped
+	// onto sample.Feature.Target; if not, the dominant peer is detected from
+	// `ss -tn` each cycle. This means systemd just runs `optimize --iface eth0`
+	// with no human-supplied IP, and the model learns from production traffic.
 	var feat linkFeature
 	rttSamples := []float64{}
 	bwSamples := []float64{}
@@ -208,7 +243,9 @@ func cmdOptimize(args []string) error {
 	const recordEveryN = 5
 	if target != "" {
 		feat.Target = target
-		fmt.Printf("optimize will record samples for target %s to model %s\n", target, modelPath())
+		fmt.Printf("optimize: explicit target=%s, model=%s\n", target, modelPath())
+	} else {
+		fmt.Printf("optimize: PASSIVE mode (peer auto-detected per cycle), model=%s\n", modelPath())
 	}
 	if err := os.WriteFile(ccPath, []byte("lotspeed"), 0o644); err != nil {
 		return fmt.Errorf("set CC=lotspeed (need root?): %w", err)
@@ -278,18 +315,16 @@ func cmdOptimize(args []string) error {
 
 		// Live feature building: cap samples and use MAD-filtered medians so
 		// occasional outliers don't poison what we persist to the model.
-		if target != "" {
-			if m.rttMs > 0 {
-				rttSamples = append(rttSamples, m.rttMs)
-				if len(rttSamples) > 20 {
-					rttSamples = rttSamples[1:]
-				}
+		if m.rttMs > 0 {
+			rttSamples = append(rttSamples, m.rttMs)
+			if len(rttSamples) > 20 {
+				rttSamples = rttSamples[1:]
 			}
-			if m.bwMbps > 0 {
-				bwSamples = append(bwSamples, m.bwMbps)
-				if len(bwSamples) > 20 {
-					bwSamples = bwSamples[1:]
-				}
+		}
+		if m.bwMbps > 0 {
+			bwSamples = append(bwSamples, m.bwMbps)
+			if len(bwSamples) > 20 {
+				bwSamples = bwSamples[1:]
 			}
 		}
 		// Window-best sampling: every recordEveryN OPT cycles, persist the
@@ -313,6 +348,9 @@ func cmdOptimize(args []string) error {
 				feat.Jitter = percentile(clean, 0.9) - feat.RttMin
 				feat.BwMbps = trimmedMean(bwSamples, 0.2)
 				feat.LossPct = windowBest.loss
+				if target == "" {
+					feat.Target = autoDetectPeer() // who's the dominant peer right now?
+				}
 				// Sanity gate: only filter samples with no real traffic (bw<5M).
 				// Negative-score samples ARE valuable — they teach UCB which
 				// params to avoid on bad-link states (high loss / RTT spike).

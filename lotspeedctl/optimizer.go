@@ -41,6 +41,7 @@ type optimizer struct {
 	prevBytes   uint64
 	prevOut     uint64
 	prevRetr    uint64
+	codelRtt    float64 // EWMA RTT (ms) driving NeoQ CoDel target/interval
 }
 
 func newOptimizer(iface string, interval time.Duration) *optimizer {
@@ -211,6 +212,34 @@ func (o *optimizer) apply(t *tunable) {
 	}
 }
 
+// applyCodel maps the measured path RTT to NeoQ CoDel target/interval and pushes
+// them via /proc/net/neoq_codel. The egress qdisc can't measure RTT itself (it
+// never sees the returning ACKs), so the CLI — which knows RTT from ss — drives
+// RTT-adaptive AQM. Without this NeoQ runs a flat 5ms target/100ms interval that
+// over-drops on high-RTT links: interval < RTT means CoDel re-drops before a
+// drop's cwnd reduction has propagated back, collapsing throughput.
+// target = RTT/4 (standing queue tolerated), interval = 2*RTT (must exceed 1 RTT).
+func applyCodel(rttMs float64) {
+	if rttMs <= 0 {
+		return
+	}
+	rttUs := rttMs * 1000
+	target := clampF(rttUs/4, 5000, 60000)
+	interval := clampF(rttUs*2, 100000, 600000)
+	_ = os.WriteFile("/proc/net/neoq_codel",
+		[]byte(fmt.Sprintf("%d %d", int(target), int(interval))), 0o644)
+}
+
+func clampF(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
 // cmdOptimize runs the adaptive parameter search (upstream CC + downstream NeoQ boost).
 //
 //	lotspeedctl optimize --iface eth0 [--interval N]
@@ -324,6 +353,16 @@ func cmdOptimize(args []string) error {
 		m := o.measure()
 		sc := o.score(m)
 		ts := time.Now().Format("15:04:05")
+
+		// N3: drive RTT-adaptive CoDel for NeoQ from the measured RTT (smoothed).
+		if m.rttMs > 0 {
+			if o.codelRtt == 0 {
+				o.codelRtt = m.rttMs
+			} else {
+				o.codelRtt = 0.8*o.codelRtt + 0.2*m.rttMs
+			}
+			applyCodel(o.codelRtt)
+		}
 
 		if o.phase == "EXPLORE" {
 			o.exploreT++

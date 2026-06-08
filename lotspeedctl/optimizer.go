@@ -331,42 +331,42 @@ func cmdOptimize(args []string) error {
 		// best-scoring (params, score) seen in that window. This guarantees
 		// the model keeps growing even when EXPLORE captured the global best
 		// and no later step exceeds it.
-		if target != "" {
-			if sc > windowBest.score {
-				windowBest.score = sc
-				windowBest.params = paramSet{}
-				for i := range o.tun {
-					windowBest.params[o.tun[i].name] = o.tun[i].cur
-				}
-				windowBest.loss = m.lossPct
+		// Always record (both explicit-target and PASSIVE mode). In PASSIVE
+		// mode feat.Target is filled from the dominant peer at record time.
+		if sc > windowBest.score {
+			windowBest.score = sc
+			windowBest.params = paramSet{}
+			for i := range o.tun {
+				windowBest.params[o.tun[i].name] = o.tun[i].cur
 			}
-			windowCycle++
-			if windowCycle >= recordEveryN && len(rttSamples) >= 3 && len(bwSamples) >= 3 && windowBest.params != nil {
-				clean := madFilter(rttSamples, 3.0)
-				feat.RttMs = percentile(clean, 0.5)
-				feat.RttMin = percentile(clean, 0.1)
-				feat.Jitter = percentile(clean, 0.9) - feat.RttMin
-				feat.BwMbps = trimmedMean(bwSamples, 0.2)
-				feat.LossPct = windowBest.loss
-				if target == "" {
-					feat.Target = autoDetectPeer() // who's the dominant peer right now?
-				}
-				// Sanity gate: only filter samples with no real traffic (bw<5M).
-				// Negative-score samples ARE valuable — they teach UCB which
-				// params to avoid on bad-link states (high loss / RTT spike).
-				if feat.BwMbps < 5 {
-					fmt.Printf("    -> sample SKIPPED (no real traffic: bw=%.0fM)\n", feat.BwMbps)
-				} else if err := loadModel().record(feat, windowBest.params, windowBest.score); err == nil {
-					tag := "good"
-					if windowBest.score < 0 {
-						tag = "BAD-LINK"
-					}
-					fmt.Printf("    -> sample recorded [%s] (model now has %d, score=%.3f, bw=%.0fM loss=%.1f%%)\n",
-						tag, len(loadModel().Samples), windowBest.score, feat.BwMbps, feat.LossPct*100)
-				}
-				windowCycle = 0
-				windowBest = windowBestT{score: -1e9}
+			windowBest.loss = m.lossPct
+		}
+		windowCycle++
+		if windowCycle >= recordEveryN && len(rttSamples) >= 3 && len(bwSamples) >= 3 && windowBest.params != nil {
+			clean := madFilter(rttSamples, 3.0)
+			feat.RttMs = percentile(clean, 0.5)
+			feat.RttMin = percentile(clean, 0.1)
+			feat.Jitter = percentile(clean, 0.9) - feat.RttMin
+			feat.BwMbps = trimmedMean(bwSamples, 0.2)
+			feat.LossPct = windowBest.loss
+			if target == "" {
+				feat.Target = autoDetectPeer() // who's the dominant peer right now?
 			}
+			// Sanity gate: only filter samples with no real traffic (bw<5M).
+			// Negative-score samples ARE valuable — they teach UCB which
+			// params to avoid on bad-link states (high loss / RTT spike).
+			if feat.BwMbps < 5 {
+				fmt.Printf("    -> sample SKIPPED (no real traffic: bw=%.0fM)\n", feat.BwMbps)
+			} else if err := loadModel().record(feat, windowBest.params, windowBest.score); err == nil {
+				tag := "good"
+				if windowBest.score < 0 {
+					tag = "BAD-LINK"
+				}
+				fmt.Printf("    -> sample recorded [%s] (model now has %d, score=%.3f, bw=%.0fM loss=%.1f%%)\n",
+					tag, len(loadModel().Samples), windowBest.score, feat.BwMbps, feat.LossPct*100)
+			}
+			windowCycle = 0
+			windowBest = windowBestT{score: -1e9}
 		}
 		// Feed the bandit too (regardless of which algo currently steers,
 		// so we can A/B compare later without losing data).

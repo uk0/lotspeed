@@ -313,15 +313,18 @@ func cmdOptimize(args []string) error {
 				feat.Jitter = percentile(clean, 0.9) - feat.RttMin
 				feat.BwMbps = trimmedMean(bwSamples, 0.2)
 				feat.LossPct = windowBest.loss
-				// Sanity gate: don't pollute the model with samples taken when
-				// there was no real traffic (iperf died, network stalled, etc).
-				// score>=0 + bw>=5Mbps filters out the "everything is 0" garbage.
-				if feat.BwMbps < 5 || windowBest.score < 0 {
-					fmt.Printf("    -> sample SKIPPED (no real traffic: bw=%.0fM score=%.3f)\n",
-						feat.BwMbps, windowBest.score)
+				// Sanity gate: only filter samples with no real traffic (bw<5M).
+				// Negative-score samples ARE valuable — they teach UCB which
+				// params to avoid on bad-link states (high loss / RTT spike).
+				if feat.BwMbps < 5 {
+					fmt.Printf("    -> sample SKIPPED (no real traffic: bw=%.0fM)\n", feat.BwMbps)
 				} else if err := loadModel().record(feat, windowBest.params, windowBest.score); err == nil {
-					fmt.Printf("    -> sample recorded (model now has %d, window-best score=%.3f)\n",
-						len(loadModel().Samples), windowBest.score)
+					tag := "good"
+					if windowBest.score < 0 {
+						tag = "BAD-LINK"
+					}
+					fmt.Printf("    -> sample recorded [%s] (model now has %d, score=%.3f, bw=%.0fM loss=%.1f%%)\n",
+						tag, len(loadModel().Samples), windowBest.score, feat.BwMbps, feat.LossPct*100)
 				}
 				windowCycle = 0
 				windowBest = windowBestT{score: -1e9}

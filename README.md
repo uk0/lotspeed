@@ -99,6 +99,11 @@ Files:
 
 * `merge_bl`: lotspeed merge_bl 基于学习历史记录的模式进行加速，并且洲际场景抖动不会降速避让,并且整合了BBRv3的优点。
 
+* `learn_speed_v1`: 在 merge_bl 之上的行为化调度 + 学习闭环分支:
+  - **CC**: min_rtt 双窗口修复(过期窗/PROBE_RTT 重新生效, BBRv3 式浅排空), CRUISE headroom 按 loss 压力门控, loss_thresh 丢包率门控(实测最优 lt=2)
+  - **NeoQ**: CAKE 式 sparse/bulk 行为分类(临界点按流速率自适应, 不依赖端口), 全局 5-tuple flow 表, 跨档 WRR 8:4:2:1 防饿死, 满队列从最低档驱逐, **重传包 CoDel 免疫**(丢恢复包在 250ms 链路 = 恢复时间翻倍), `/proc/net/neoq_ml` 机器可读统计
+  - **lotspeedctl**: 每参数 Δ 信用分配(因果归因, 不再拟合链路噪声), 体验感知 score(`--gamma`, Express 排队延迟惩罚), bad-link 周期跳过, apply 后 settle, KNN 同 regime 邻居门控
+
 
 * auto install
 
@@ -277,6 +282,66 @@ iperf3 -c green1 -p 35201 -R -t 30
 
 ![f7525becdae16659ddfd54d99efe0f66.png](img/f7525becdae16659ddfd54d99efe0f66.png)
 
+
+### 真实洲际链路测试报告 — lotspeed vs BBR v3 (learn_speed_v1, 2026-06)
+
+#### 测试环境
+
+| 项 | 值 |
+|---|---|
+| 加速端 | 美东 colo VPS (198.23.x.x), kernel `6.18.2-bbrv3`, 仅加速端部署 lotspeed + sch_neoq + lotspeedctl |
+| 接收端 | 国内测试机 (NAT 出口), 标准 bbr 客户端, **什么都不装** (单边加速) |
+| 链路 | RTT 13↔264ms 跨时段漂移, 丢包 0.8%↔10%, 国际链路常态抖动 |
+| 方向 | `iperf3 -R` 接收端拉加速端 (下载方向), 30s/轮, 交替轮换抵消链路漂移 |
+| 对照 | 同内核系统自带 `bbr` (即 BBR v3), 切 `sysctl` 即换, 其余全同 |
+
+#### 单流 (P1) — 干净时段打平, 丢包高峰拉开
+
+| 场景 | lotspeed | BBR v3 | Δ |
+|---|---|---|---|
+| 干净时段 (重传 <150/30s), 4 轮均值 | 111M | 112M | ≈0 |
+| 跨时段 6 轮均值 (历史) | 93M | 87M | **+7%** |
+| 丢包高峰 (loss_thresh=2) | **67M** | 35M | **+91%** |
+| 丢包高峰崩溃轮 | 稳定 45-78M | **崩至 7-9M** | — |
+
+> 单流结论: 干净链路两者贴着 per-flow 上限走, 差异在噪声内; **差距全部来自丢包时段** — BBR v3 把随机丢包当拥塞退避, lotspeed 按实测丢包率门控 (`loss_thresh`) 顶住不退。
+
+#### 多流 (P8) — 持续优势 + 稳定性差异
+
+| 轮 | lotspeed | BBR v3 |
+|---|---|---|
+| R1 | 380M (rt 86k) | 276M (rt 18) |
+| R2 | 352M (rt 29k) | **104M** (rt 12) |
+| 均值 | **366M** | 190M (**+93%**) |
+
+> BBR v3 两轮波动 2.6× (撞上丢包期即崩), lotspeed 两轮稳定。lotspeed 的高重传是激进策略的成本 (~7% 发送量), 换取链路被持续打满。
+
+#### 并发扩展性 (lt=2)
+
+| 并发 | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| 吞吐 | 118M | 194M | 361M | 380M | **442M** |
+
+> P4 前接近线性 → 单流 ~118M 是 ISP per-flow 限制而非链路容量 (≥442M); 多连接是免费杠杆。`loss_thresh=2` 在 P1 与 P8 同为最优 (P8 下 lt6=359M / lt12=352M 反而更低)。
+
+#### 混合负载 — NeoQ 的"临界点" (bulk 满速 + 交互不卡)
+
+P8 bulk 满载同时以 0.2s 间隔 ping ×248 模拟交互小包 (<128B → Express 档):
+
+| | NeoQ | fq_codel |
+|---|---|---|
+| bulk 吞吐 | **356M** | 340M |
+| ping p50 / p99 / max | 244 / **257** / 263 ms | 244 / 262 / 271 ms |
+| Express 档内排队 | avg **1us** / peak 514us, 0 drop | — |
+
+行为分类实证 (两轮 iperf 期间的 tier 分布): 880MB bulk 数据全部自动降入 Bulk 档; Express 档仅 2009 包 (均 92B = ACK/控制/重传), 排队延迟微秒级 — **同一条连接的数据包满速、控制包零排队**, 临界点按流速率自适应, 不依赖端口 (隧道内混合流量同样生效)。
+
+#### 结论
+
+1. **单流**: 与 BBR v3 的差距 = 丢包时段的差距 (+91%); 干净时段打平 (per-flow 限制)
+2. **多流**: +93%, 且方差远小于 BBR v3 (不随丢包期崩溃)
+3. **体验**: bulk 满载下交互小包 Express 旁路, 本地排队微秒级; 重传包免疫 CoDel 丢弃, 高丢包链路恢复不被本地拖累
+4. 全部参数可由 `lotspeedctl optimize` 在线学习 (每参数 Δ 信用 + Express 延迟惩罚进 score)
 
 PAC (Proactive ACK Control) for TCP Incast Congestion
 ==========================================

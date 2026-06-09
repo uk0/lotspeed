@@ -902,7 +902,15 @@ static void ls_advance_bw_filter(struct sock *sk)
 	/* BBR v3 风格: 每个周期轮转窗口, 保持 1-2 个周期的最大值 */
 	if (!ls->bw_hi[1])
 		return;  /* 本窗口无样本，保留旧值 */
-	ls->bw_hi[0] = ls->bw_hi[1];
+	/* 衰减+迟滞: 闭合窗口样本若跌破上一估计的一半,视为 RTT 尖峰污染,
+	 * 估计每周期衰减 25% 而非直接采纳塌陷样本 —— 真实降级在 ~3-4 周期内收敛,
+	 * 一次性尖峰仅损失 25% 而非 50%+ */
+	if (ls->bw_hi[1] >= (ls->bw_hi[0] >> 1)) {
+		ls->bw_hi[0] = ls->bw_hi[1];  /* 正常推进 */
+	} else if (ls->bw_hi[0]) {
+		ls->bw_hi[0] -= (ls->bw_hi[0] >> 2);  /* 尖峰窗: 衰减 25% */
+		ls->bw_hi[0] = max(ls->bw_hi[0], ls->bw_hi[1]);
+	}
 	ls->bw_hi[1] = 0;
 }
 
@@ -1203,7 +1211,8 @@ static void ls_reset_full_bw(struct sock *sk)
 	ls->full_bw_cnt = 0;
 }
 
-static void ls_check_full_bw_reached(struct sock *sk, u32 bw_sample)
+static void ls_check_full_bw_reached(struct sock *sk, const struct rate_sample *rs,
+                                     u32 bw_sample)
 {
 	struct lotspeed *ls = inet_csk_ca(sk);
 	u32 bw_thresh;
@@ -1213,6 +1222,13 @@ static void ls_check_full_bw_reached(struct sock *sk, u32 bw_sample)
 
 	if (ls->round_start && ls->mode == LS_STARTUP)
 		ls->startup_rounds++;
+
+	/* RTT 尖峰守卫: RTT >1.25x min_rtt 的轮次会膨胀 interval_us、压低 bw_sample,
+	 * 视为无信息轮 —— 既不递增也不复位平台计数,避免尖峰把 STARTUP 提前判定为平台。
+	 * min_rtt 未设 (~0U) 时跳过守卫。 */
+	if (ls->min_rtt_us != ~0U && rs->rtt_us > 0 &&
+	    rs->rtt_us > ls->min_rtt_us + (ls->min_rtt_us >> 2))
+		return;
 
 	bw_thresh = (u64)ls->full_bw * LS_UNIT * 5 / 4 >> LS_SCALE;
 	if (bw_sample >= bw_thresh) {
@@ -1653,8 +1669,22 @@ static void ls_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 		switch (ls->cycle_idx) {
 		case LS_BW_PROBE_UP:
 			cwnd = max(cwnd, target_cwnd);
-			if (ls->full_bw_reached && cwnd < target_cwnd)
-				cwnd += acked;
+			/* 注: 原条件 cwnd < target_cwnd 在上行 max() 之后恒为假,
+			 * 每 ACK 增长从未执行过(死代码) —— PROBE_UP 此前只靠
+			 * pacing gain 推进。改以 inflight_hi 为探测上界:
+			 * 无损时 ~0U 等效无界(apply_cap 钳 max_cwnd),
+			 * 损后收缩则成为探测顶,符合 BBRv3 probe_up 语义。 */
+			if (ls->full_bw_reached && cwnd < ls->inflight_hi) {
+				u32 up_boost = acked;
+				/* 高延迟路径: 用 Hybla 增益放大每 ACK 增长,
+				 * 使 PROBE_UP 重发现 BDP 的速度随 rho 放大,
+				 * 264ms 链路退避后能在更少周期内回到 BDP */
+				if (ls->high_delay_path) {
+					u32 hybla_gain = ls_hybla_cwnd_gain(sk);
+					up_boost = acked * hybla_gain / 100;
+				}
+				cwnd += up_boost;
+			}
 			break;
 		case LS_BW_PROBE_DOWN:
 			cwnd = min(cwnd, target_cwnd);
@@ -1872,65 +1902,6 @@ static void ls_rack_update(struct sock *sk, const struct rate_sample *rs)
 		ls->rack_end_seq = tp->snd_una;
 }
 
-/* 计算 RACK 乱序窗口 */
-static u32 ls_rack_reord_window(struct sock *sk)
-{
-	struct lotspeed *ls = inet_csk_ca(sk);
-	u32 reord_thresh = READ_ONCE(ls_params.rack_reord_thresh);
-	u32 min_rtt_div = READ_ONCE(ls_params.rack_min_rtt_div);
-	u32 reord_window;
-
-	if (ls->rack_rtt_us == 0)
-		return 1000;  /* 默认 1ms */
-
-	/* reord_window = RTT / reord_thresh */
-	reord_window = ls->rack_rtt_us / reord_thresh;
-
-	/* 至少是 min_rtt / min_rtt_div */
-	if (ls->min_rtt_us != ~0U && min_rtt_div > 0) {
-		u32 min_window = ls->min_rtt_us / min_rtt_div;
-		reord_window = max(reord_window, min_window);
-	}
-
-	/* 最小 1ms，最大 200ms */
-	return clamp_t(u32, reord_window, 1000, 200000);
-}
-
-/* RACK 检测丢包 */
-static bool ls_rack_detect_loss(struct sock *sk, const struct rate_sample *rs)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct lotspeed *ls = inet_csk_ca(sk);
-	u32 reord_window;
-	bool loss_detected = false;
-
-	if (!READ_ONCE(ls_params.rack_enable) || ls->rack_rtt_us == 0)
-		return false;
-
-	reord_window = ls_rack_reord_window(sk);
-
-	/*
-	 * 检测条件: 如果有未确认的数据，且距离最后一次 ACK 已经
-	 * 超过 RTT + reord_window，则可能有丢包
-	 */
-	if (tp->packets_out > 0 && rs->interval_us > 0) {
-		/* 检查是否超过乱序窗口 */
-		if (rs->interval_us > ls->rack_rtt_us + reord_window) {
-			loss_detected = true;
-			ls->rack_detect_loss = 1;
-		}
-	}
-
-	/* 观察到乱序时，增大乱序窗口容忍度 */
-	if (rs->prior_delivered > 0 && tp->delivered > 0) {
-		if (!ls->rack_reord_seen && rs->interval_us > ls->rack_rtt_us) {
-			ls->rack_reord_seen = 1;
-		}
-	}
-
-	return loss_detected;
-}
-
 /*
  * TLP (Tail Loss Probe) 尾部丢包探测
  *
@@ -2013,14 +1984,13 @@ static void ls_rack_tlp_main(struct sock *sk, const struct rate_sample *rs)
 {
 	struct lotspeed *ls = inet_csk_ca(sk);
 
-	/* 更新 RACK 状态 */
+	/* 更新 RACK 状态 (RTT EWMA + 最高确认序号) */
 	ls_rack_update(sk, rs);
 
-	/* RACK 丢包检测 */
-	if (ls_rack_detect_loss(sk, rs)) {
-		/* 检测到丢包，标记以便快速响应 */
-		ls->loss_in_round = 1;
-	}
+	/* 注: 原基于 rs->interval_us 的伪丢包检测已删除 —— interval_us 是交付率
+	 * 采样区间而非包龄,在 ACK 聚合的高 RTT 路径上常态超阈,会每轮误置
+	 * loss_in_round 污染快速路径门控。真实丢包由内核 RACK 经 rs->lost 上报,
+	 * 在 ls_main 中正确消费。 */
 
 	/* TLP ACK 处理 */
 	if (rs->acked_sacked > 0 && ls->tlp_in_progress) {
@@ -2226,7 +2196,7 @@ static void ls_main(struct sock *sk, const struct rate_sample *rs)
 		ls_update_brave_mode(sk, rs->rtt_us);
 
 	if (!ls->full_bw_reached)
-		ls_check_full_bw_reached(sk, bw_sample);
+		ls_check_full_bw_reached(sk, rs, bw_sample);
 
 	ls_check_drain(sk, rs);
 	ls_update_cycle_phase(sk, rs);

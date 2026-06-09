@@ -80,10 +80,12 @@ func newOptimizer(iface string, interval time.Duration) *optimizer {
 		tun: []tunable{
 			{"startup_gain", "", 200, 400, 20, 400},
 			{"fast_alpha", "", 4, 40, 4, 30},
-			// loss_thresh 2..16 default 4 (B4): bench sweet spot is ~2-16; lt=30
-			// caused retrans storms and the old default 20 sat in the bad zone.
+			// loss_thresh 2..24 default 4: on a ~10%-ambient-loss link the per-link
+			// optimum sits ~12-16 and was pressing the old max=16 ceiling, so the
+			// range is widened to 24 (lt=30 still caused retrans storms; 24 gives
+			// headroom above the 10%-ambient optimum without reaching that zone).
 			// Start tight (4) — the per-link optimum is found by stepping up.
-			{"loss_thresh", "", 2, 16, 2, 4},
+			{"loss_thresh", "", 2, 24, 2, 4},
 			// hd_rho_max kept high (250..400): full Hybla high-delay rho keeps
 			// high-RTT cwnd ramping aggressively. (Was observed stuck at 0 = boost off.)
 			{"hd_rho_max", "", 250, 400, 25, 400},

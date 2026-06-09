@@ -74,7 +74,8 @@ func dist(a, b linkFeature) float64 {
 }
 
 // predict returns score-weighted nearest-neighbor params for the given feature.
-// Falls back to a heuristic plan if the model has no samples yet (cold start).
+// Falls back to a heuristic plan if the model has no samples yet (cold start) or
+// if too few in-regime neighbors survive the gate below.
 func (m *model) predict(f linkFeature) paramSet {
 	if len(m.Samples) == 0 {
 		return heuristicPlan(f)
@@ -83,16 +84,38 @@ func (m *model) predict(f linkFeature) paramSet {
 		s sample
 		d float64
 	}
-	rs := make([]ranked, len(m.Samples))
-	for i, s := range m.Samples {
-		rs[i] = ranked{s, dist(f, s.Feature)}
+	// Regime gate: multi-route links carry physically different paths (e.g. a
+	// 13ms LAN regime vs a 264ms intercontinental regime). KNN across both
+	// interpolates a config optimal for neither, so only samples whose RttMs is
+	// within a factor of 2 of the query's (q/2 <= s <= q*2) participate. Within
+	// the regime, only Score>0 samples contribute params — negative/bad-link
+	// samples (RTT spikes, high loss) would otherwise drag the average toward
+	// configs we know perform badly. Those samples remain in the model file for
+	// UCB history; they're excluded from the planner average only.
+	rs := make([]ranked, 0, len(m.Samples))
+	for _, s := range m.Samples {
+		if s.Score <= 0 {
+			continue
+		}
+		if f.RttMs > 0 {
+			if s.Feature.RttMs < f.RttMs/2 || s.Feature.RttMs > f.RttMs*2 {
+				continue
+			}
+		}
+		rs = append(rs, ranked{s, dist(f, s.Feature)})
+	}
+	// Too few in-regime neighbors to trust the average: fall back to the
+	// heuristic plan (the caller — cmdTune / warm-start — gets a usable config).
+	if len(rs) < 2 {
+		return heuristicPlan(f)
 	}
 	sort.Slice(rs, func(i, j int) bool { return rs[i].d < rs[j].d })
 	k := 5
 	if k > len(rs) {
 		k = len(rs)
 	}
-	// score- and inverse-distance-weighted average per param.
+	// score- and inverse-distance-weighted average per param. All survivors have
+	// Score>0 (gated above), so the floor is unnecessary but kept harmless.
 	out := paramSet{}
 	wsum := map[string]float64{}
 	for _, r := range rs[:k] {
@@ -133,14 +156,14 @@ func heuristicPlan(f linkFeature) paramSet {
 	}
 	// B6: cold-start loss_thresh. This is the single most impactful knob and was
 	// previously never set on cold start (the optimizer tunes it but heuristicPlan
-	// didn't emit it). Bench sweet spot is ~2-16; default 4 (clean/low-RTT links
-	// want a tight retrans threshold). On high-RTT intercontinental paths a single
-	// loss is more likely transient reordering than congestion, so we tolerate a
-	// bit more (8) before backing off — without going near the lt=30 retrans-storm
-	// zone the old preset used.
-	lossThresh := 4
+	// didn't emit it). Loss-aware seed: ambient loss below loss_thresh must not
+	// trigger backoff or the CC degenerates to bbr behavior; +4 margin covers
+	// measurement noise. f.LossPct is a fraction (0..1), so *100 -> percent.
+	lossThresh := clampInt(int(math.Round(f.LossPct*100))+4, 4, 20)
+	// Keep the high-RTT floor of 8 (single losses on >150ms paths are more often
+	// transient reordering than congestion): take the max of the two heuristics.
 	if f.RttMs > 150 {
-		lossThresh = 8
+		lossThresh = maxInt(lossThresh, 8)
 	}
 	// TODO(param-table): unify this output set with the optimizer's tun list
 	// (optimizer.go newOptimizer) and cmdTune's writer — heuristicPlan still emits
@@ -201,13 +224,13 @@ func cmdModel(args []string) error {
 		// best arm + sample count — this is what UCB learned across all sessions.
 		if len(m.Samples) > 0 {
 			// Inspection replay. loss_thresh uses the CURRENT optimizer range
-			// {2,16,2} so new samples bucket onto real arms. neoq_boost is kept
+			// {2,24,2} so new samples bucket onto real arms. neoq_boost is kept
 			// here (not in the optimizer's tun list anymore) only so legacy
 			// samples that still carry it remain visible in `model show`.
 			tuns := []tunable{
 				{"startup_gain", "", 200, 400, 20, 0},
 				{"fast_alpha", "", 4, 40, 4, 0},
-				{"loss_thresh", "", 2, 16, 2, 0},
+				{"loss_thresh", "", 2, 24, 2, 0},
 				{"hd_rho_max", "", 250, 400, 25, 0},
 				{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 0},
 			}

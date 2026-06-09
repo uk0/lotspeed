@@ -1327,20 +1327,26 @@ static void ls_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	bool probe_rtt_expired, min_rtt_expired;
 	u32 expire;
 
-	/* 使用 min_rtt_stamp 追踪探测期 (简化) */
-	expire = ls->min_rtt_stamp + msecs_to_jiffies(LS_PROBE_RTT_WIN_MS);
+	/* 短窗 (probe_rtt_min): 独立时间戳 probe_rtt_min_stamp,窗口 LS_PROBE_RTT_WIN_MS。
+	 * 跟踪近期路径 RTT;每次刷新都重置自己的时间戳,所以窗口能真正到期。 */
+	expire = ls->probe_rtt_min_stamp + msecs_to_jiffies(LS_PROBE_RTT_WIN_MS);
 	probe_rtt_expired = after(tcp_jiffies32, expire);
 
 	if (rs->rtt_us >= 0 &&
-	    (rs->rtt_us < ls->probe_rtt_min_us || probe_rtt_expired)) {
+	    ((u32)rs->rtt_us < ls->probe_rtt_min_us || probe_rtt_expired)) {
 		ls->probe_rtt_min_us = rs->rtt_us;
+		ls->probe_rtt_min_stamp = tcp_jiffies32;
 	}
 
-	/* 更新全局 min_rtt */
+	/* 全局窗 (min_rtt): 时间戳 min_rtt_stamp,窗口 LS_MIN_RTT_WIN_SEC。
+	 * 仅在短窗值严格更低、或全局窗到期时采纳并重新打戳;相等不重置,
+	 * 否则 min_rtt_stamp 每个 ACK 都刷新导致两个窗口永不到期 (旧 bug)。
+	 * 到期时采纳短窗当前值 (近期路径 RTT),从而让 min_rtt 能向上跟随 RTT 抬升。 */
 	expire = ls->min_rtt_stamp + LS_MIN_RTT_WIN_SEC * HZ;
 	min_rtt_expired = after(tcp_jiffies32, expire);
 
-	if (ls->probe_rtt_min_us <= ls->min_rtt_us || min_rtt_expired) {
+	if (ls->probe_rtt_min_us < ls->min_rtt_us ||
+	    (min_rtt_expired && ls->probe_rtt_min_us != ~0U)) {
 		ls->min_rtt_us = ls->probe_rtt_min_us;
 		ls->min_rtt_stamp = tcp_jiffies32;
 		ls_update_rho(sk);
@@ -1354,7 +1360,10 @@ static void ls_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 
 	/* PROBE_RTT 状态处理 */
 	if (ls->mode == LS_PROBE_RTT) {
-		u32 probe_cwnd = ls_get_min_cwnd();
+		/* BBRv3 浅探测: 排空到 ~50% BDP 即可暴露空队列 RTT,
+		 * 不像 BBRv1 砸到 min_cwnd —— 后者在 264ms 高延迟链路上会造成周期性吞吐塌陷。 */
+		u32 probe_cwnd = max(ls_get_min_cwnd(),
+				     ls_bdp(sk, ls_bw(sk), LS_UNIT / 2));
 		u32 elapsed;
 
 		/* 优化: 保留部分 cwnd */
@@ -1379,7 +1388,9 @@ static void ls_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 				ls->probe_rtt_round_done = 1;
 			if (ls->probe_rtt_round_done &&
 			    elapsed >= msecs_to_jiffies(READ_ONCE(ls_params.probe_rtt_duration))) {
-				ls->min_rtt_stamp = tcp_jiffies32;
+				/* 重置短窗戳: PROBE_RTT 由 probe_rtt_expired 触发,
+				 * 退出时必须刷新该戳,否则下个 ACK 立即重入 PROBE_RTT。 */
+				ls->probe_rtt_min_stamp = tcp_jiffies32;
 				ls_restore_cwnd(sk);
 				if (ls->full_bw_reached) {
 					ls_enter_probe_bw(sk, LS_BW_CRUISE);
@@ -1658,12 +1669,12 @@ static void ls_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 		break;
 
 	case LS_PROBE_RTT:
+		/* BBRv3 浅探测下限: ~50% BDP,与 ls_update_min_rtt 的排空目标一致 */
+		cwnd = max(ls_get_min_cwnd(), ls_bdp(sk, ls_bw(sk), LS_UNIT / 2));
 		if (READ_ONCE(ls_params.probe_rtt_cwnd_pct) > 0 && ls->prior_cwnd > 0) {
 			u32 probe_cwnd = ls->prior_cwnd *
 				READ_ONCE(ls_params.probe_rtt_cwnd_pct) / 100;
-			cwnd = max_t(u32, probe_cwnd, ls_get_min_cwnd());
-		} else {
-			cwnd = ls_get_min_cwnd();
+			cwnd = max_t(u32, cwnd, probe_cwnd);
 		}
 		break;
 	}
@@ -1683,7 +1694,11 @@ static void ls_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 apply_cap:
 	cwnd = clamp_t(u32, cwnd, ls_get_min_cwnd(), ls_get_max_cwnd());
 
-	if (ls->mode == LS_PROBE_BW && ls->cycle_idx == LS_BW_CRUISE) {
+	/* CRUISE headroom 仅在本周期实际承受过丢包/ECN 退避压力时才施加:
+	 * inflight_lo != ~0U 表示已被 loss/ECN 下界压制 (每周期 CRUISE→REFILL 时复位为 ~0U)。
+	 * 干净单流无丢包时跳过,避免恒定 -6.25% cwnd 浪费。 */
+	if (ls->mode == LS_PROBE_BW && ls->cycle_idx == LS_BW_CRUISE &&
+	    ls->inflight_lo != ~0U) {
 		cwnd = min(cwnd, ls_inflight_with_headroom(sk));
 	}
 

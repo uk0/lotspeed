@@ -46,6 +46,24 @@ type optimizer struct {
 	bestKnown   float64 // best smoothed score seen — stability reference
 	bestParams  []int   // tunable values at bestKnown — snap-back target (纠正)
 	unstableN   int     // consecutive cycles below the stability floor
+
+	// B1 delta-credit: the index/value/score of the coordinate probed LAST cycle,
+	// so this cycle's score can be differenced against it and credited to that one
+	// arm only. probedTi<0 means "no probe outstanding" (first OPT cycle).
+	probedTi  int
+	probedVal int
+	prevScore float64 // score under the config BEFORE the outstanding probe
+	havePrev  bool
+
+	// B2 sequential decision smoothing: a coordinate step is only accepted/reverted
+	// once two consecutive cycles agree on its sign, to keep one noisy cycle from
+	// committing a move. pendingSign is the sign seen last cycle for the probed param.
+	pendingSign int
+
+	// B4 effect-size freeze: params whose best/worst arm means barely differ are
+	// frozen (skipped when advancing o.ti). Unfrozen on a minRtt regime shift.
+	frozen       map[string]bool
+	freezeMinRtt float64 // minRtt at the time the last freeze was decided
 }
 
 func newOptimizer(iface string, interval time.Duration) *optimizer {
@@ -58,18 +76,23 @@ func newOptimizer(iface string, interval time.Duration) *optimizer {
 		// (+186% vs bbr; bbr collapses to 2M on loss spikes, aggressive holds 36-87M).
 		iface: iface, interval: interval, alpha: 0.5, beta: 1.0,
 		dir: 1, phase: "EXPLORE", bestScore: -1e9,
+		probedTi: -1, frozen: map[string]bool{},
 		tun: []tunable{
 			{"startup_gain", "", 200, 400, 20, 400},
 			{"fast_alpha", "", 4, 40, 4, 30},
-			// loss_thresh 2..30 default 20: aggressive loss tolerance — don't back
-			// off on intercontinental loss. The goodput score (beta=1) lets the
-			// optimizer settle where throughput actually peaks per-link.
-			{"loss_thresh", "", 2, 30, 4, 20},
+			// loss_thresh 2..16 default 4 (B4): bench sweet spot is ~2-16; lt=30
+			// caused retrans storms and the old default 20 sat in the bad zone.
+			// Start tight (4) — the per-link optimum is found by stepping up.
+			{"loss_thresh", "", 2, 16, 2, 4},
 			// hd_rho_max kept high (250..400): full Hybla high-delay rho keeps
 			// high-RTT cwnd ramping aggressively. (Was observed stuck at 0 = boost off.)
 			{"hd_rho_max", "", 250, 400, 25, 400},
-			// downstream window deception strength (NeoQ), part of the same system
-			{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 100},
+			// NOTE: neoq_boost was REMOVED from the tun list (B4) — it is a no-op on
+			// single-flow traffic (it only reshapes the downstream rwnd across
+			// concurrent flows) so probing it (~28% of the old exploration budget)
+			// just added noise. The sysctl/proc writer (cmdBoost in prio.go,
+			// neoqBoostProc) is kept; reintroduce this arm here if/when a
+			// multi-flow optimization mode is added.
 		},
 	}
 	// Start every tunable at its AGGRESSIVE default and push it to the kernel.
@@ -246,6 +269,34 @@ func clampInt(v, lo, hi int) int {
 	return v
 }
 
+// settle waits out the transient after a config change, then re-baselines the
+// byte/segment counters so the NEXT measure() window covers only steady state
+// (B5). Without this the window straddles the old config's tail and the new
+// config's ramp-up, so the score is a blend of two configs and can't be
+// attributed to the change. settle = clamp(8*RTT, 2s, 5s): 8 RTTs is enough for
+// a cwnd/pacing change to propagate and re-stabilize, floored at 2s (so it's
+// never shorter than a couple of measurement granularities) and capped at 5s (so
+// a very high-RTT link doesn't stall the loop). rttMs<=0 falls back to the floor.
+func (o *optimizer) settle(rttMs float64) {
+	d := 2 * time.Second
+	if rttMs > 0 {
+		d = clampDur(time.Duration(8*rttMs)*time.Millisecond, 2*time.Second, 5*time.Second)
+	}
+	time.Sleep(d)
+	o.prevBytes = ifaceBytes(o.iface)
+	o.prevOut, o.prevRetr = readSnmpTcp()
+}
+
+func clampDur(v, lo, hi time.Duration) time.Duration {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
 // cmdOptimize runs the adaptive parameter search (upstream CC + downstream NeoQ boost).
 //
 //	lotspeedctl optimize --iface eth0 [--interval N]
@@ -292,9 +343,12 @@ func cmdOptimize(args []string) error {
 	rttSamples := []float64{}
 	bwSamples := []float64{}
 	type windowBestT struct {
-		score  float64
-		params paramSet
-		loss   float64
+		score        float64
+		params       paramSet
+		loss         float64
+		changedParam string  // B1: the coordinate whose move reached this best score
+		delta        float64 // B1: that move's score change (raw, pre-conditioning)
+		badLink      bool    // B2: was this window-best captured during link weather?
 	}
 	windowBest := windowBestT{score: -1e9}
 	windowCycle := 0
@@ -312,13 +366,13 @@ func cmdOptimize(args []string) error {
 	o := newOptimizer(iface, interval)
 	// UCB bandit: pre-load it with all prior samples so a fresh process
 	// inherits learning from previous runs (crucial for systemd auto-restart).
-	var ucb *ucbSelector
-	if algo == "ucb" {
-		ucb = newUCB(o.tun, math.Sqrt(2))
-		prior := loadModel()
-		ucb.loadFromSamples(prior.Samples)
-		fmt.Printf("UCB initialized from %d prior samples\n", len(prior.Samples))
-	}
+	// Instantiated in BOTH modes: in coord mode it backs delta-credit (B1) and the
+	// effect-size freeze (B4); in ucb mode it also steers. The exploration constant
+	// is unused in coord mode (we only read arm means/effect-size, never suggest()).
+	ucb := newUCB(o.tun, math.Sqrt(2))
+	prior := loadModel()
+	ucb.loadFromSamples(prior.Samples)
+	fmt.Printf("UCB initialized from %d prior samples\n", len(prior.Samples))
 	// EXPLORE: aggressive grab to discover peak (up+down) throughput.
 	// Aggressive intercontinental baseline (non-tunable knobs set once): remove the
 	// cwnd ceiling, max out high-delay Hybla compensation, shrink safety margins,
@@ -390,6 +444,15 @@ func cmdOptimize(args []string) error {
 			continue
 		}
 
+		// B2 link-weather gate: an RTT spike >3x the unloaded floor is the path
+		// misbehaving, not our params. score() already turns that into a deeply
+		// negative number; attributing it to whatever coordinate we happen to be
+		// probing teaches the optimizer the wrong lesson (this is exactly how a
+		// real -0.909 sample came purely from an RTT spike). On such cycles we
+		// still RECORD the sample (tagged BAD-LINK — bad-link data is useful to
+		// the KNN), but we skip UCB credit and skip the accept/revert decision.
+		badLink := o.minRtt > 0 && m.rttMs > 0 && (m.rttMs/o.minRtt-1) > 2.0
+
 		// Live feature building: cap samples and use MAD-filtered medians so
 		// occasional outliers don't poison what we persist to the model.
 		if m.rttMs > 0 {
@@ -417,6 +480,17 @@ func cmdOptimize(args []string) error {
 				windowBest.params[o.tun[i].name] = o.tun[i].cur
 			}
 			windowBest.loss = m.lossPct
+			// B1: tag this best with the coordinate that moved to reach it, so the
+			// persisted sample can carry single-param credit (changedParam/delta).
+			// havePrev means a probe is outstanding (probedTi/probedVal/prevScore set).
+			if o.havePrev {
+				windowBest.changedParam = o.tun[o.probedTi].name
+				windowBest.delta = sc - o.prevScore
+			} else {
+				windowBest.changedParam = ""
+				windowBest.delta = 0
+			}
+			windowBest.badLink = badLink
 		}
 		windowCycle++
 		if windowCycle >= recordEveryN && len(rttSamples) >= 3 && len(bwSamples) >= 3 && windowBest.params != nil {
@@ -434,37 +508,38 @@ func cmdOptimize(args []string) error {
 			// params to avoid on bad-link states (high loss / RTT spike).
 			if feat.BwMbps < 5 {
 				fmt.Printf("    -> sample SKIPPED (no real traffic: bw=%.0fM)\n", feat.BwMbps)
-			} else if err := loadModel().record(feat, windowBest.params, windowBest.score); err == nil {
+			} else if err := loadModel().record(feat, windowBest.params, windowBest.score, windowBest.changedParam, windowBest.delta); err == nil {
 				tag := "good"
-				if windowBest.score < 0 {
+				if windowBest.badLink || windowBest.score < 0 {
 					tag = "BAD-LINK"
 				}
-				fmt.Printf("    -> sample recorded [%s] (model now has %d, score=%.3f, bw=%.0fM loss=%.1f%%)\n",
-					tag, len(loadModel().Samples), windowBest.score, feat.BwMbps, feat.LossPct*100)
+				fmt.Printf("    -> sample recorded [%s] (model now has %d, score=%.3f, bw=%.0fM loss=%.1f%% changed=%s d=%.3f)\n",
+					tag, len(loadModel().Samples), windowBest.score, feat.BwMbps, feat.LossPct*100, windowBest.changedParam, windowBest.delta)
 			}
 			windowCycle = 0
 			windowBest = windowBestT{score: -1e9}
 		}
-		// Feed the bandit too (regardless of which algo currently steers,
-		// so we can A/B compare later without losing data).
-		if ucb != nil {
-			for i := range o.tun {
-				ucb.update(o.tun[i].name, o.tun[i].cur, sc)
-			}
-		}
 		// UCB mode: each cycle pick a fresh value per parameter (rotate which
-		// param we update so coordinated effects stay observable).
-		if algo == "ucb" && ucb != nil {
+		// param we update so coordinated effects stay observable). Credit the
+		// arm we last steered with the delta vs the prior config (B1+B3), and
+		// skip credit entirely on a bad-link cycle (B2).
+		if algo == "ucb" {
+			if o.havePrev && !badLink {
+				ucb.update(o.tun[o.probedTi].name, o.probedVal, sc-o.prevScore)
+			}
+			o.prevScore = sc
 			t := &o.tun[o.ti]
 			next := ucb.suggest(t.name)
 			t.cur = next
 			o.apply(t)
-			o.ti = (o.ti + 1) % len(o.tun)
+			o.probedTi, o.probedVal, o.havePrev = o.ti, next, true
+			o.ti = o.nextTi(o.ti)
 			fmt.Printf("%s UCB bw=%.0f rtt=%.1f loss=%.2f%% score=%.3f | %s -> %d (suggest)\n",
 				ts, m.bwMbps, m.rttMs, m.lossPct*100, sc, t.name, next)
+			o.settle(m.rttMs) // B5: let the new config reach steady state before the next window
 			continue
 		}
-		// OPTIMIZE: coordinate ascent with revert-on-regression.
+		// OPTIMIZE: coordinate ascent with delta-credited revert-on-regression.
 		// No-traffic guard: with little/no real traffic the score is pure noise,
 		// so steering on it only thrashes params. Hold and wait for traffic.
 		if m.bwMbps < 5 {
@@ -487,6 +562,50 @@ func cmdOptimize(args []string) error {
 				o.apply(&o.tun[i])
 			}
 		}
+		// B2 bad-link cycle: skip BOTH the UCB credit and the accept/revert
+		// decision. Leave the current probe in place and drop the outstanding
+		// probe bookkeeping so the next clean cycle re-baselines prevScore — we
+		// don't want a weather-inflated delta to drive the next decision.
+		if badLink {
+			o.havePrev = false
+			o.pendingSign = 0
+			fmt.Printf("%s OPT BAD-LINK (rtt=%.1f/%.1fx min) — skip credit+decision, hold %s=%d\n",
+				ts, m.rttMs, m.rttMs/o.minRtt, o.tun[o.ti].name, o.tun[o.ti].cur)
+			continue
+		}
+		// B1 delta-credit: the score change since the prior config is attributable
+		// to the SINGLE coordinate we moved last cycle. Credit only that arm (the
+		// conditioning into [0,1] happens inside ucb.update). This replaces the old
+		// loop that smeared one scalar score onto all 5 params.
+		var delta float64
+		haveDelta := o.havePrev
+		if haveDelta {
+			delta = o.smScore - o.prevScore
+			ucb.update(o.tun[o.probedTi].name, o.probedVal, delta)
+		}
+		// B4 effect-size freeze: once the just-credited param has ≥5 pulls, if its
+		// best and worst arm means differ by <0.05 (conditioned-reward units) it has
+		// no measurable effect on this link — freeze it (stop probing it). This is
+		// the generic catch for inert params (what neoq_boost was on single flow).
+		if haveDelta {
+			name := o.tun[o.probedTi].name
+			if spread, pulls := ucb.effectSize(name); pulls >= 5 && spread < 0.05 && !o.frozen[name] {
+				o.frozen[name] = true
+				o.freezeMinRtt = o.minRtt
+				fmt.Printf("%s FREEZE %s (effect=%.3f over %d pulls < 0.05) — no measurable effect, parking it\n",
+					ts, name, spread, pulls)
+			}
+		}
+		// B4 unfreeze on regime change: if the unloaded RTT floor has shifted by ≥2x
+		// since we froze (a different path/route — a param inert on one link may
+		// matter on another), thaw everything and re-explore.
+		if len(o.frozen) > 0 && o.freezeMinRtt > 0 && o.minRtt > 0 {
+			if r := o.minRtt / o.freezeMinRtt; r >= 2 || r <= 0.5 {
+				o.frozen = map[string]bool{}
+				fmt.Printf("%s UNFREEZE all (minRtt regime %.1f->%.1fms) — re-exploring\n",
+					ts, o.freezeMinRtt, o.minRtt)
+			}
+		}
 		// Snapshot the best-known stable config (all params at the highest smScore).
 		if o.bestParams == nil || o.smScore > o.bestKnown {
 			o.bestKnown = o.smScore
@@ -507,7 +626,8 @@ func cmdOptimize(args []string) error {
 				}
 				fmt.Printf("%s STABILIZE: smScore %.3f << best %.3f, reverted to best-known config\n",
 					ts, o.smScore, o.bestKnown)
-				o.unstableN, o.dir = 0, 1
+				o.unstableN, o.dir, o.havePrev, o.pendingSign = 0, 1, false, 0
+				o.settle(m.rttMs)
 				continue
 			}
 		} else {
@@ -520,27 +640,96 @@ func cmdOptimize(args []string) error {
 		o.bestKnown *= 0.999
 		if o.smScore > o.bestScore {
 			o.bestScore = o.smScore
-		} else {
-			// Revert last probe, CLAMPED so cur can never leave [min,max].
-			t := &o.tun[o.ti]
-			t.cur = clampInt(t.cur-o.dir*t.step, t.min, t.max)
-			o.apply(t)
-			o.dir = -o.dir
-			if o.dir == 1 {
-				o.ti = (o.ti + 1) % len(o.tun)
+		}
+		// B2 decision smoothing (sequential variant) + coordinate advance, unified.
+		//
+		// We require TWO measurements of the SAME probed config to agree on the sign
+		// of its delta-vs-baseline before committing accept/revert — the cheaper
+		// sequential alternative to median-of-3 (the tradeoff: a clear verdict costs
+		// one extra cycle, in exchange a single noisy cycle can never flip the search).
+		// Vote 1 is this cycle's delta after the step; if it's non-zero we HOLD the
+		// identical config one more cycle (no new step, no advance) for vote 2, keeping
+		// the same baseline (o.prevScore) so the second delta is comparable. Only after
+		// the verdict do we advance to the next coordinate.
+		//
+		// hold=true => re-measure the same config next cycle (confirmation pending);
+		// hold=false => verdict reached (or nothing to judge) → step the next coord.
+		hold := false
+		if haveDelta {
+			const eps = 0.01 // dead-band: |delta|<eps is "no measurable change"
+			sign := 0
+			if delta > eps {
+				sign = 1
+			} else if delta < -eps {
+				sign = -1
+			}
+			t := &o.tun[o.probedTi]
+			switch {
+			case sign == 0:
+				// Flat (incl. a clamped no-op at a range edge): no signal, move on.
+				o.pendingSign = 0
+			case o.pendingSign == 0:
+				// Vote 1 → hold the same config one cycle to confirm the sign.
+				o.pendingSign = sign
+				hold = true
+			case sign == o.pendingSign:
+				// Vote 2 agrees → act on the probed coordinate.
+				if sign < 0 {
+					// Hurt twice: back the step out and flip this param's direction.
+					t.cur = clampInt(t.cur-o.dir*t.step, t.min, t.max)
+					o.apply(t)
+					o.dir = -o.dir
+				}
+				// sign>0 (helped twice): accept — leave cur, keep o.dir for momentum.
+				o.pendingSign = 0
+			default:
+				// Two cycles disagree (noise) → don't commit, move on.
+				o.pendingSign = 0
 			}
 		}
-		// Next probe, clamped. If the step would leave the range, flip & advance.
+		if hold {
+			// Re-measure the identical config: do NOT step or advance, and keep
+			// o.prevScore as the shared baseline. havePrev stays true so vote 2 is
+			// credited/judged against probedTi next cycle.
+			fmt.Printf("%s OPT bw=%.0f rtt=%.1f loss=%.2f%% sm=%.3f best=%.3f | confirm %s=%d (hold)\n",
+				ts, m.bwMbps, m.rttMs, m.lossPct*100, o.smScore, o.bestScore, o.tun[o.probedTi].name, o.probedVal)
+			o.settle(m.rttMs)
+			continue
+		}
+		// Verdict reached (or nothing to judge): advance to the next non-frozen
+		// coordinate and step it. If the step would leave the range, flip this
+		// param's direction and retry so we always apply a real change to credit.
+		o.ti = o.nextTi(o.ti)
 		t := &o.tun[o.ti]
 		nv := clampInt(t.cur+o.dir*t.step, t.min, t.max)
-		if nv != t.cur {
-			t.cur = nv
-			o.apply(t)
-		} else {
+		if nv == t.cur {
 			o.dir = -o.dir
-			o.ti = (o.ti + 1) % len(o.tun)
+			nv = clampInt(t.cur+o.dir*t.step, t.min, t.max)
 		}
-		fmt.Printf("%s OPT bw=%.0f rtt=%.1f loss=%.2f%% sm=%.3f best=%.3f | next %s=%d\n",
-			ts, m.bwMbps, m.rttMs, m.lossPct*100, o.smScore, o.bestScore, o.tun[o.ti].name, o.tun[o.ti].cur)
+		prev := t.cur
+		t.cur = nv
+		o.apply(t)
+		// Record the outstanding probe for next cycle's delta-credit, then SETTLE
+		// (B5) so the next measure() window covers only the new config's steady
+		// state — not the old config's tail plus this one's ramp-up.
+		o.probedTi, o.probedVal, o.prevScore, o.havePrev = o.ti, nv, o.smScore, (nv != prev)
+		fmt.Printf("%s OPT bw=%.0f rtt=%.1f loss=%.2f%% sm=%.3f best=%.3f | next %s=%d (settle)\n",
+			ts, m.bwMbps, m.rttMs, m.lossPct*100, o.smScore, o.bestScore, t.name, nv)
+		o.settle(m.rttMs)
 	}
+}
+
+// nextTi returns the index of the next non-frozen tunable after i, wrapping
+// around. If every tunable is frozen it returns the next index anyway (so the
+// loop still advances and the cycle still measures/records — freeze only steers
+// which param we PROBE, it must never deadlock the loop).
+func (o *optimizer) nextTi(i int) int {
+	n := len(o.tun)
+	for k := 1; k <= n; k++ {
+		j := (i + k) % n
+		if !o.frozen[o.tun[j].name] {
+			return j
+		}
+	}
+	return (i + 1) % n
 }

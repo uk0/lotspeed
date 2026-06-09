@@ -15,11 +15,20 @@ import (
 type paramSet map[string]int
 
 // sample is one (link, params, score) record.
+//
+// ChangedParam/Delta (B1 delta-credit): the optimizer probes ONE coordinate per
+// cycle, so the score change is attributable to that single param, not the whole
+// set. ChangedParam names it; Delta is sc-prevScore for it. Params is still the
+// FULL config (the KNN planner needs the whole point), but UCB credit replays
+// only ChangedParam. Legacy samples lack these fields (ChangedParam==""); UCB
+// falls back to crediting the full set for those (see loadFromSamples).
 type sample struct {
-	Feature linkFeature `json:"feature"`
-	Params  paramSet    `json:"params"`
-	Score   float64     `json:"score"`
-	TS      int64       `json:"ts"`
+	Feature      linkFeature `json:"feature"`
+	Params       paramSet    `json:"params"`
+	Score        float64     `json:"score"`
+	TS           int64       `json:"ts"`
+	ChangedParam string      `json:"changed_param,omitempty"`
+	Delta        float64     `json:"delta,omitempty"`
 }
 
 type model struct {
@@ -122,22 +131,54 @@ func heuristicPlan(f linkFeature) paramSet {
 	if rhoMax > 800 {
 		rhoMax = 800
 	}
+	// B6: cold-start loss_thresh. This is the single most impactful knob and was
+	// previously never set on cold start (the optimizer tunes it but heuristicPlan
+	// didn't emit it). Bench sweet spot is ~2-16; default 4 (clean/low-RTT links
+	// want a tight retrans threshold). On high-RTT intercontinental paths a single
+	// loss is more likely transient reordering than congestion, so we tolerate a
+	// bit more (8) before backing off — without going near the lt=30 retrans-storm
+	// zone the old preset used.
+	lossThresh := 4
+	if f.RttMs > 150 {
+		lossThresh = 8
+	}
+	// TODO(param-table): unify this output set with the optimizer's tun list
+	// (optimizer.go newOptimizer) and cmdTune's writer — heuristicPlan still emits
+	// min_cwnd/max_cwnd/hist_min_cwnd_bound that the optimizer doesn't tune, while
+	// the optimizer tunes fast_alpha that heuristicPlan doesn't emit. One shared
+	// param table would remove this skew. Out of scope for the delta-credit fix.
 	return paramSet{
 		"min_cwnd":            maxInt(64, bdpPkts/10),
 		"max_cwnd":            minInt(15000, bdpPkts*2),
 		"startup_gain":        startupGain,
 		"hd_rho_max":          rhoMax,
 		"hist_min_cwnd_bound": maxInt(64, bdpPkts/4),
+		"loss_thresh":         lossThresh,
 	}
 }
 
-func minInt(a, b int) int { if a < b { return a }; return b }
-func maxInt(a, b int) int { if a > b { return a }; return b }
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 // record appends a new (feature, params, score) sample and persists.
-// Called by optimize after convergence.
-func (m *model) record(f linkFeature, p paramSet, score float64) error {
-	m.Samples = append(m.Samples, sample{Feature: f, Params: p, Score: score, TS: time.Now().Unix()})
+// Called by optimize after convergence. changedParam/delta carry the B1
+// single-coordinate credit (empty/zero is fine — UCB then falls back to
+// full-set crediting for this sample).
+func (m *model) record(f linkFeature, p paramSet, score float64, changedParam string, delta float64) error {
+	m.Samples = append(m.Samples, sample{
+		Feature: f, Params: p, Score: score, TS: time.Now().Unix(),
+		ChangedParam: changedParam, Delta: delta,
+	})
 	// cap at 500 samples (FIFO) — keep model lightweight.
 	if len(m.Samples) > 500 {
 		m.Samples = m.Samples[len(m.Samples)-500:]
@@ -159,10 +200,14 @@ func cmdModel(args []string) error {
 		// Also replay all samples through a fresh UCB bandit and show per-param
 		// best arm + sample count — this is what UCB learned across all sessions.
 		if len(m.Samples) > 0 {
+			// Inspection replay. loss_thresh uses the CURRENT optimizer range
+			// {2,16,2} so new samples bucket onto real arms. neoq_boost is kept
+			// here (not in the optimizer's tun list anymore) only so legacy
+			// samples that still carry it remain visible in `model show`.
 			tuns := []tunable{
 				{"startup_gain", "", 200, 400, 20, 0},
 				{"fast_alpha", "", 4, 40, 4, 0},
-				{"loss_thresh", "", 2, 30, 4, 0},
+				{"loss_thresh", "", 2, 16, 2, 0},
 				{"hd_rho_max", "", 250, 400, 25, 0},
 				{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 0},
 			}

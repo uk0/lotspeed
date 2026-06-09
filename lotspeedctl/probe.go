@@ -13,11 +13,11 @@ import (
 // the model (lookup key) and the planner (parameter formulas).
 // Fields are exported + JSON-tagged so the on-disk model preserves them.
 type linkFeature struct {
-	Target  string  `json:"target"`            // peer IP, for logging
-	RttMs   float64 `json:"rtt_ms"`            // P50 RTT, MAD-filtered
-	RttMin  float64 `json:"rtt_min_ms"`        // P10 RTT — unloaded floor
-	Jitter  float64 `json:"jitter_ms"`         // P90-P10, bufferbloat
-	BwMbps  float64 `json:"bw_mbps"`           // trimmed-mean throughput
+	Target  string  `json:"target"`             // peer IP, for logging
+	RttMs   float64 `json:"rtt_ms"`             // P50 RTT, MAD-filtered
+	RttMin  float64 `json:"rtt_min_ms"`         // P10 RTT — unloaded floor
+	Jitter  float64 `json:"jitter_ms"`          // P90-P10, bufferbloat
+	BwMbps  float64 `json:"bw_mbps"`            // trimmed-mean throughput
 	LossPct float64 `json:"loss_pct,omitempty"` // 0..1
 }
 

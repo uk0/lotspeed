@@ -72,24 +72,15 @@ func newOptimizer(iface string, interval time.Duration) *optimizer {
 			{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 100},
 		},
 	}
+	// Start every tunable at its AGGRESSIVE default and push it to the kernel.
+	// We deliberately do NOT adopt the live sysctl value: a fresh module load has
+	// conservative kernel defaults (e.g. loss_thresh=2) and adopting those would
+	// make the optimizer start timid. Starting at the aggressive default also
+	// overwrites any stale/garbage value from a prior run. Per-link learned optima
+	// are recovered via the model warm-start (explicit-target mode) and the
+	// model.json the optimizer keeps growing.
 	for i := range o.tun {
-		var s string
-		if o.tun[i].path != "" {
-			if b, err := os.ReadFile(o.tun[i].path); err == nil {
-				s = strings.TrimSpace(string(b))
-			}
-		} else if v, err := readSysctl(o.tun[i].name); err == nil {
-			s = v
-		}
-		// Adopt the live sysctl value ONLY if it's in range — this preserves
-		// learned state across restarts. If it's out of range (garbage from a
-		// previous manual test, e.g. fast_alpha=1748 or hd_rho_max=0, or an old
-		// range), keep the tunable's aggressive default cur rather than clamping
-		// to the nearest bound (which would land on the timid end, e.g. 250 not 400).
-		if n, err := strconv.Atoi(s); err == nil && n >= o.tun[i].min && n <= o.tun[i].max {
-			o.tun[i].cur = n
-		}
-		o.apply(&o.tun[i]) // push the (sane) value to the kernel immediately
+		o.apply(&o.tun[i])
 	}
 	return o
 }
@@ -335,7 +326,7 @@ func cmdOptimize(args []string) error {
 	_ = writeSysctl("turbo_startup", "1")
 	_ = writeSysctl("startup_gain", "400")
 	_ = writeSysctl("startup_min_rounds", "8") // more STARTUP rounds for high RTT
-	_ = writeSysctl("max_cwnd", "262144")      // K2: remove the 15000-pkt throughput ceiling
+	_ = writeSysctl("max_cwnd", "524288")      // K2: remove ceiling; 524288 pkts ≈ 760MB inflight, ample for 1.5Gbps even at very high RTT
 	_ = writeSysctl("min_cwnd", "100")         // higher cwnd floor
 	_ = writeSysctl("hd_cwnd_gain", "200")     // high-delay cwnd 2x
 	_ = writeSysctl("hd_pacing_gain", "160")   // high-delay pacing 1.6x

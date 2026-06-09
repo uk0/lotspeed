@@ -256,6 +256,17 @@ struct neoq_flow {
     u32                 bytes_window;       /* 当前窗口内累计字节 */
     u64                 window_start;       /* 当前窗口起点 (ns) */
     u8                  is_bulk_behave:1;   /* 1=已判定为批量(降级), 0=稀疏 */
+
+    /* === NEW (FIX1): 近窗 retrans 占比 (Express 防滥用) ===
+     * retrans_count/total_packets 是累积量, 无法反映"近期"丢包压力。这里搭车
+     * sparse 门控的 100ms 窗口: window_pkts/window_retrans 随该窗口一起重置,
+     * 窗口滚动时用刚结束窗口算出占比存入 prev_retrans_share (u8 百分比 0-100)。
+     * 分类时读 prev_retrans_share (上一完整窗口), 仅当它 > 旋钮阈值且 flow 已被判为
+     * 批量行为时, 才停止把该流的重传提到 Express (重传仍保留 CoDel 免疫, 只是不插队)。
+     * 全部塞进结构尾部既有 padding (offset 121-125), 不增大 struct, 不跨 cacheline。 */
+    u16                 window_pkts;        /* 当前窗口内包数 (含重传) */
+    u16                 window_retrans;     /* 当前窗口内重传包数 */
+    u8                  prev_retrans_share; /* 上一完整窗口的重传占比, 0-100% */
 } ____cacheline_aligned_in_smp;
 
 enum {
@@ -263,6 +274,40 @@ enum {
     FLOW_NEW,
     FLOW_SPARSE,
     FLOW_BULK,
+};
+
+/* ========================================================================
+ * NEW (FIX2): 分类计算结果 (compute-then-commit)
+ *
+ * 旧实现里 classify_packet_enhanced 直接改写 flow 检测状态 (highest_seq 前移、
+ * retrans_count++、sparse 窗口累加/滚动、is_bulk_behave 翻转), 但限额丢弃判定在
+ * 其后: 一旦本包被丢, flow 状态已被一个从未入队的包推进 -> 该段后续真正发送会被误
+ * 判为重传, 且被丢字节抬高 sparse 速率导致错误降级。
+ *
+ * 修复: classify 只"计算"(读 flow, 不写), 把所有待写状态收进本结构; 仅当包被接受
+ * 入队后, 由 neoq_commit_classify() 一次性提交。保持单次分类 (不重复解析头部)。
+ * 注: 窗口滚动 (window_start/bytes_window 重置 + prev_retrans_share 计算) 也只在
+ * 接受时提交; 一个 100% 被丢的区间只是延长当前窗口, 这是可接受且更简单的语义。 */
+struct neoq_classify_result {
+    /* tier 决策仍由 classify_packet_enhanced 的返回值带出, 不入本结构。 */
+    bool    is_retrans;         /* retrans 判定 (供 cb 标记 / Express 提权) */
+    bool    retrans_demoted_hint; /* FIX1: 本重传被防滥用门控拒绝 Express, 调用方计数 */
+
+    /* --- seq 跟踪待写 (源自只读 tcp_retransmit_compute) --- */
+    bool    seq_update;         /* 是否需要把 highest_seq 写成 new_highest_seq */
+    u32     new_highest_seq;    /* seq_update 时的目标值 */
+    bool    count_retrans;      /* 是否需要 retrans_count++ (=is_retrans 的 TCP 真值) */
+
+    /* --- sparse 窗口待写 (源自只读 flow_sparse_compute) ---
+     * compute 已算出本包提交后窗口各字段的"终值", commit 仅照抄, 无需再判分支。 */
+    bool    win_touched;        /* 本包是否参与了窗口逻辑 (>=128B 且 flow 非空且 thresh!=0) */
+    u64     win_start_set;      /* 提交后 window_start 的终值 (ns) */
+    u32     win_bytes_set;      /* 提交后 bytes_window 的终值 */
+    u16     win_pkts_set;       /* 提交后 window_pkts 的终值 */
+    u16     win_retrans_set;    /* 提交后 window_retrans 的终值 */
+    bool    win_prev_share_upd; /* 是否需要写 prev_retrans_share (仅窗口滚动时) */
+    u8      win_prev_share_set; /* win_prev_share_upd 时写入的 prev_retrans_share */
+    bool    win_bulk_set;       /* 提交后 is_bulk_behave 的终值 */
 };
 
 /* ========================================================================
@@ -350,6 +395,10 @@ struct neoq_sched_data {
      *   的 retrans 包数 -> 即本特性的有效性计数。 */
     u64                 retrans_seen;
     u64                 retrans_protected;
+    /* === NEW (FIX1): 被 Express 防滥用门控拒绝提权的重传包数 ===
+     * 即"本应进 Express、但因所在批量流近窗重传占比过高而被留在原档位"的重传计数。
+     * 供 /proc/net/neoq_ml 观察门控的触发量。 */
+    u64                 retrans_demoted;
 
     struct qdisc_watchdog watchdog;
 };
@@ -417,14 +466,18 @@ static inline struct sk_buff *flow_dequeue(struct neoq_flow *flow)
 }
 
 /* ========================================================================
- * NEW: Retransmit Packet Detection
+ * NEW: Retransmit Packet Detection (FIX2: 只读计算版)
  *
  * Detect retransmit by checking if TCP seq < highest_seq seen.
  * Retransmit packets get Express priority for faster loss recovery.
- * ======================================================================== */
-
-static __always_inline bool is_tcp_retransmit(const struct sk_buff *skb,
-                                               struct neoq_flow *flow)
+ *
+ * 本函数为只读: 仅读取 flow->highest_seq, 把待写状态填入 res (seq_update/
+ * new_highest_seq/count_retrans), 绝不改 flow。原地写回由 neoq_commit_classify()
+ * 在包被接受后完成。判定逻辑与原 is_tcp_retransmit 逐分支等价。
+ * 返回值 = 本包是否为重传 (= res->count_retrans)。 */
+static __always_inline bool tcp_retransmit_compute(const struct sk_buff *skb,
+                                                    const struct neoq_flow *flow,
+                                                    struct neoq_classify_result *res)
 {
     const struct iphdr *iph;
     const struct tcphdr *th;
@@ -446,27 +499,32 @@ static __always_inline bool is_tcp_retransmit(const struct sk_buff *skb,
     seq = ntohl(th->seq);
     end_seq = seq + (ntohs(iph->tot_len) - offset - (th->doff << 2));
 
-    /* First packet for this flow - initialize */
+    /* First packet for this flow - initialize (待写: highest_seq = end_seq) */
     if (flow->highest_seq == 0 && !th->syn) {
-        flow->highest_seq = end_seq;
+        res->seq_update = true;
+        res->new_highest_seq = end_seq;
         return false;
     }
 
-    /* SYN packet - reset tracking */
+    /* SYN packet - reset tracking (待写: highest_seq = end_seq) */
     if (th->syn) {
-        flow->highest_seq = end_seq;
+        res->seq_update = true;
+        res->new_highest_seq = end_seq;
         return false;
     }
 
-    /* Retransmit detection: seq < highest_seq means retransmit */
+    /* Retransmit detection: seq < highest_seq means retransmit
+     * (待写: retrans_count++, 由 count_retrans 表达; 不前移 highest_seq) */
     if (before(seq, flow->highest_seq)) {
-        flow->retrans_count++;
+        res->count_retrans = true;
         return true;
     }
 
-    /* Update highest seq for new data */
-    if (after(end_seq, flow->highest_seq))
-        flow->highest_seq = end_seq;
+    /* Update highest seq for new data (待写: highest_seq = end_seq) */
+    if (after(end_seq, flow->highest_seq)) {
+        res->seq_update = true;
+        res->new_highest_seq = end_seq;
+    }
 
     return false;
 }
@@ -625,6 +683,15 @@ static u32 neoq_rwnd_boost = 100;
 static u64 neoq_sparse_window_ns = 100ULL * NSEC_PER_MSEC;
 static u32 neoq_sparse_thresh_bytes = 2 * NEOQ_QUANTUM;
 
+/* === NEW (FIX1): Express 防滥用阈值 (runtime-tunable via /proc/net/neoq_retrans) ===
+ * 一条批量流在 10% 丢包链路上会重传约 10% 的海量包; 若每个重传都进 Express, 这些重传
+ * 会排在真正的交互包前面 (丢包下的优先级反转)。当某流上一完整窗口的重传占比超过本阈值
+ * 且该流已被判为批量行为(is_bulk_behave)时, 其重传不再提到 Express, 而是留在按行为决定
+ * 的档位(批量流即 Normal/Bulk)。重传仍保留 CoDel 免疫(永不被 CoDel 丢), 只是不再插队。
+ * 稀疏/交互流的重传(量本来就小)不受影响, 继续进 Express。
+ * 默认 15(%)。0 = 关闭本门控 = 旧行为(所有重传一律进 Express)。 */
+static u32 neoq_retrans_share_max = 15;
+
 /* Global CoDel target/interval (ns), runtime-tunable via /proc/net/neoq_codel.
  * Default 5ms/100ms suits LAN; raise target for high-RTT intercontinental links
  * (else CoDel over-drops and starves the CC -> low goodput). */
@@ -671,45 +738,87 @@ static void neoq_boost_rwnd(struct sk_buff *skb)
     th->window = htons(new_win);
 }
 
-/* === NEW: CAKE 风格每流稀疏门控 ===
+/* === NEW: CAKE 风格每流稀疏门控 (FIX2: 只读计算版) ===
  * 在 ~window_ns 滑动窗口内累计 flow 字节; 窗口到期则衰减(重置)累加器, 并依据刚结束
  * 窗口的字节量更新 is_bulk_behave; 窗口内一旦累计超过阈值立即钉为批量。
  * 返回 true 表示该 flow 当前为"稀疏", 可保留 Express/High; false 表示已被降级。
+ *
+ * 本函数只读 flow, 把本包提交后窗口各字段的终值算进 res (win_*); commit 仅照抄。
+ * 因丢弃判定在 classify 之后, 必须保证被丢的包不污染窗口 (见 neoq_classify_result)。
+ * FIX1: 同步维护 window_pkts/window_retrans; 窗口滚动时由刚结束窗口算出重传占比,
+ *       存入 prev_retrans_share, 供 Express 防滥用门控读取上一完整窗口的占比。
+ * is_retrans: 本包是否为重传 (须由调用方先经 tcp_retransmit_compute 算出再传入),
+ *             用于把本包计入终态 window_retrans。
  * 注: 必须在 enqueue 持 root lock 路径内调用 (无额外加锁), 由调用方保证。 */
-static __always_inline bool flow_is_sparse(struct neoq_flow *flow, u32 pkt_len, u64 now)
+static __always_inline bool flow_sparse_compute(const struct neoq_flow *flow,
+                                                u32 pkt_len, u64 now,
+                                                bool is_retrans,
+                                                struct neoq_classify_result *res)
 {
     u32 thresh = READ_ONCE(neoq_sparse_thresh_bytes);
     u64 window = READ_ONCE(neoq_sparse_window_ns);
+    u64 wstart;
+    u32 bytes;
+    u16 pkts, rxmt;
+    bool bulk;
 
-    if (thresh == 0)            /* 阈值=0: 禁用降级, 永远稀疏 */
+    if (thresh == 0)            /* 阈值=0: 禁用降级, 永远稀疏 (不触碰窗口字段) */
         return true;
 
-    if (flow->window_start == 0)
-        flow->window_start = now;
+    res->win_touched = true;
 
-    if (now - flow->window_start >= window) {
+    /* 取当前窗口状态的本地副本 (绝不写 flow) */
+    wstart = flow->window_start ? flow->window_start : now;   /* window_start==0 -> 起点=now */
+    bytes  = flow->bytes_window;
+    pkts   = flow->window_pkts;
+    rxmt   = flow->window_retrans;
+    bulk   = flow->is_bulk_behave;
+
+    if (now - wstart >= window) {
         /* 窗口滚动: 用刚结束窗口的字节量决定稀疏/批量, 然后重置累加器。
-         * 空闲期(几乎无字节)会把 flow 重新判回稀疏 -> 网页突发后快速恢复。 */
-        flow->is_bulk_behave = (flow->bytes_window >= thresh) ? 1 : 0;
-        flow->bytes_window = 0;
-        flow->window_start = now;
+         * 空闲期(几乎无字节)会把 flow 重新判回稀疏 -> 网页突发后快速恢复。
+         * FIX1: 同步用刚结束窗口的 (window_retrans/window_pkts) 算百分比存入 prev share。 */
+        bulk = (bytes >= thresh) ? 1 : 0;
+        res->win_prev_share_upd = true;
+        res->win_prev_share_set = pkts ? (u8)((u32)rxmt * 100 / pkts) : 0;
+        bytes = 0;
+        pkts  = 0;
+        rxmt  = 0;
+        wstart = now;
     }
 
-    flow->bytes_window += pkt_len;
-    if (flow->bytes_window >= thresh)   /* 窗口内即时触发降级 */
-        flow->is_bulk_behave = 1;
+    /* 累加本包 (终值) */
+    bytes += pkt_len;
+    if (pkts < U16_MAX)
+        pkts++;
+    if (is_retrans && rxmt < U16_MAX)
+        rxmt++;
+    if (bytes >= thresh)        /* 窗口内即时触发降级 */
+        bulk = 1;
 
-    return !flow->is_bulk_behave;
+    res->win_start_set  = wstart;
+    res->win_bytes_set  = bytes;
+    res->win_pkts_set   = pkts;
+    res->win_retrans_set = rxmt;
+    res->win_bulk_set   = bulk;
+
+    return !bulk;
 }
 
-/* 单次分类: 头部解析一次, flow 已在手(含 retrans 分支)。
+/* 单次分类 (FIX2: 只读计算, 不改 flow; 待写状态全收进 res 由 commit 提交):
+ * 头部解析一次, flow 已在手(含 retrans 分支)。
  * 行为分类核心 (修复 P1): hint 端口只提权小包; 持续高速率的 flow 即便命中 hint
- * 端口或 <256B 规则也被降级到按大小决定的档位。 */
+ * 端口或 <256B 规则也被降级到按大小决定的档位。
+ *
+ * FIX1: 重传不再无条件进 Express。当某流上一完整窗口重传占比 > neoq_retrans_share_max
+ * 且该流为批量行为时, 其重传留在按行为决定的档位(批量流即 Normal/Bulk), 仅保留 CoDel
+ * 免疫(仍置 is_retrans), 不再插队 Express; 计 res->retrans_demoted_hint 供调用方计数。
+ * 稀疏/交互流的重传不受影响, 继续进 Express。 */
 static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
                                                     const struct sk_buff *skb,
                                                     struct neoq_flow *flow,
                                                     u64 now,
-                                                    bool *is_retrans_out)
+                                                    struct neoq_classify_result *res)
 {
     const struct iphdr *iph;
     const struct tcphdr *th;
@@ -722,17 +831,23 @@ static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
     bool sparse = true;
     bool port_hint = false;
 
-    *is_retrans_out = false;
     pkt_len = qdisc_pkt_len(skb);
 
     /* === 硬规则: 任何流量都无条件保持 Express === */
-    /* 小包(ACK/控制) */
+    /* 小包(ACK/控制); 与原实现一致: 不在此计算 retrans/窗口, is_retrans 保持 false。 */
     if (pkt_len < 128)
         return NEOQ_TIER_EXPRESS;
 
+    /* FIX2 顺序调整: 先只读计算 retrans 判定 (供 sparse 窗口统计 window_retrans),
+     * 再算 sparse。两者读写 flow 字段互不相交, 不改变各自结论。
+     * tcp_retransmit_compute 内部自带 IP/TCP/越界检查, 非 TCP 返回 false。 */
+    if (flow)
+        is_retrans = tcp_retransmit_compute(skb, flow, res);
+    res->is_retrans = is_retrans;
+
     /* 每流行为门控(对 >=128B 的包才有意义); flow 为空时(legacy 路径)按稀疏处理 */
     if (flow)
-        sparse = flow_is_sparse(flow, pkt_len, now);
+        sparse = flow_sparse_compute(flow, pkt_len, now, is_retrans, res);
 
     if (skb->protocol != htons(ETH_P_IP)) {
         /* P6: v6 不解析端口/retrans, 仅按大小分档, 不会误进 Express(除<128已返回) */
@@ -756,12 +871,20 @@ static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
             sport = ntohs(th->source);
             dport = ntohs(th->dest);
 
-            /* === KEY: Retransmit detection (现可靠, 全局流表) -> Express === */
-            if (flow) {
-                is_retrans = is_tcp_retransmit(skb, flow);
-                *is_retrans_out = is_retrans;
-                if (is_retrans)
+            /* === KEY: Retransmit -> Express, 但受 FIX1 防滥用门控约束 ===
+             * gate 条件: 旋钮启用(>0) 且 上一完整窗口重传占比 > 阈值 且 本流为批量行为。
+             * 命中 gate -> 不提 Express, 落入下方大小/行为分档(批量流=Normal/Bulk);
+             * is_retrans 仍为真 -> cb 免疫标记照置, 重传永不被 CoDel 丢, 只是不插队。 */
+            if (is_retrans) {
+                u32 share_max = READ_ONCE(neoq_retrans_share_max);
+                bool gate = share_max && !sparse &&
+                            flow && flow->prev_retrans_share > share_max;
+
+                if (gate)
+                    res->retrans_demoted_hint = true;   /* 由调用方累计 retrans_demoted */
+                else
                     return NEOQ_TIER_EXPRESS;
+                /* gate 命中: 继续向下, 按行为/大小分档 */
             }
 
             /* 纯 ACK -> Express (硬规则) */
@@ -818,6 +941,33 @@ static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
     }
 
     return NEOQ_TIER_NORMAL;
+}
+
+/* === NEW (FIX2): 提交分类计算结果到 flow ===
+ * 仅在包被接受入队后调用 (溢出/限额丢弃路径不调用), 把 classify 阶段算出的待写状态
+ * 一次性落到 flow。这样被丢的包不会推进 highest_seq / retrans_count / sparse 窗口,
+ * 避免: (a) 同一段后续真发被误判重传; (b) 被丢字节抬高 sparse 速率致错误降级。
+ * 注: 必须与 classify 在同一持锁路径、针对同一 flow, 其间无其它写者, 故 compute 时读到
+ *     的 flow 状态与此处一致, 直接照抄 res 的终值即可。 */
+static __always_inline void neoq_commit_classify(struct neoq_flow *flow,
+                                                 const struct neoq_classify_result *res)
+{
+    /* seq 跟踪 */
+    if (res->seq_update)
+        flow->highest_seq = res->new_highest_seq;
+    if (res->count_retrans)
+        flow->retrans_count++;
+
+    /* sparse 窗口 (含 FIX1 的 window_pkts/window_retrans/prev_retrans_share) */
+    if (res->win_touched) {
+        flow->window_start  = res->win_start_set;
+        flow->bytes_window  = res->win_bytes_set;
+        flow->window_pkts   = res->win_pkts_set;
+        flow->window_retrans = res->win_retrans_set;
+        flow->is_bulk_behave = res->win_bulk_set;
+        if (res->win_prev_share_upd)
+            flow->prev_retrans_share = res->win_prev_share_set;
+    }
 }
 
 /* ========================================================================
@@ -1148,6 +1298,7 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     struct neoq_sched_data *q = qdisc_priv(sch);
     struct neoq_tier *tier;
     struct neoq_flow *flow;
+    struct neoq_classify_result res = {0};   /* FIX2: classify 把待写状态收进此处 */
     u32 idx, len, gso;
     u8 tier_idx;
     bool is_retrans = false;
@@ -1184,9 +1335,14 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
         flow->bytes_window = 0;
         flow->window_start = 0;
         flow->is_bulk_behave = 0;
+        flow->window_pkts = 0;          /* FIX1: 近窗占比统计字段随新流清零 */
+        flow->window_retrans = 0;
+        flow->prev_retrans_share = 0;
     }
 
-    tier_idx = classify_packet_enhanced(q, skb, flow, now, &is_retrans);
+    /* FIX2: classify 只读计算 (不改 flow), 结果存 res; 接受入队后才 commit。 */
+    tier_idx = classify_packet_enhanced(q, skb, flow, now, &res);
+    is_retrans = res.is_retrans;
     tier = &q->tiers[tier_idx];
 
     /* === 限额检查 (P3/P7: 以段计数; 溢出时对 Express/High 驱逐低优先级队列) === */
@@ -1225,7 +1381,11 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
         }
     }
 
-    /* === 确认纳入: 此后才推进 flow 生命周期状态 (只统计真正入队的包) === */
+    /* === 确认纳入: 此后才提交分类待写状态并推进 flow 生命周期 (只统计真入队的包) ===
+     * FIX2: commit 必须早于 update_flow_state —— 后者读 retrans_count/total_packets 算
+     * loss_rate, 而旧实现里 retrans_count++ 发生在 classify(即 update_flow_state 之前),
+     * 故此处先 commit (落 retrans_count 等) 再 update_flow_state, 保持原顺序语义不变。 */
+    neoq_commit_classify(flow, &res);
     update_flow_state(flow, is_retrans);
 
     /* retrans 免疫标记随 skb 旅行到 dequeue (CoDel 丢弃判定处)。
@@ -1233,6 +1393,9 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     get_neoq_cb(skb)->is_retrans = is_retrans ? 1 : 0;
     if (is_retrans)
         q->retrans_seen++;
+    /* FIX1: 本重传因防滥用门控被拒 Express (留在按行为决定的档位) -> 计数。 */
+    if (res.retrans_demoted_hint)
+        q->retrans_demoted++;
 
     /* === Flow 链表管理必须在字节记账之前 ===
      * 迁移会把 flow->backlog (本包之前的旧 backlog) 在档位间整体搬移; 若先把本包的 len
@@ -1629,6 +1792,7 @@ static void neoq_reset(struct Qdisc *sch)
     q->flows_cnt = 0;
     q->retrans_seen = 0;        /* retrans 免疫计数随复位归零 */
     q->retrans_protected = 0;
+    q->retrans_demoted = 0;     /* FIX1: Express 防滥用计数随复位归零 */
 }
 
 static void neoq_destroy(struct Qdisc *sch)
@@ -2077,6 +2241,43 @@ static const struct proc_ops neoq_sparse_proc_ops = {
 };
 static struct proc_dir_entry *neoq_sparse_entry;
 
+/* === /proc/net/neoq_retrans: FIX1 Express 防滥用阈值 (重传占比百分比, 0=关闭) === */
+static int neoq_retrans_show(struct seq_file *m, void *v)
+{
+    seq_printf(m, "share_max=%u\nusage: echo \"<percent>\" > /proc/net/neoq_retrans  (0 disables gate, default 15)\n",
+               READ_ONCE(neoq_retrans_share_max));
+    return 0;
+}
+static int neoq_retrans_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, neoq_retrans_show, NULL);
+}
+static ssize_t neoq_retrans_write(struct file *file, const char __user *ubuf,
+                                  size_t len, loff_t *ppos)
+{
+    char buf[16];
+    u32 v;
+    size_t n = min(len, sizeof(buf) - 1);
+
+    if (copy_from_user(buf, ubuf, n))
+        return -EFAULT;
+    buf[n] = '\0';
+    if (kstrtouint(strim(buf), 10, &v) == 0) {
+        if (v > 100)                    /* 占比上限 100%; 0 合法 = 关闭门控 */
+            v = 100;
+        WRITE_ONCE(neoq_retrans_share_max, v);
+    }
+    return len;
+}
+static const struct proc_ops neoq_retrans_proc_ops = {
+    .proc_open    = neoq_retrans_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+    .proc_write   = neoq_retrans_write,
+};
+static struct proc_dir_entry *neoq_retrans_entry;
+
 /* === /proc/net/neoq_ml: 机器可读单行 key=value, 供 Go tuner 每隔数秒解析 ===
  * 与 neoq_stats_show 共用 neoq_lock。键名短且稳定 (即 CLI 的 API), 切勿随意改名。
  * peak_delay_us 为"上次读取以来"的峰值 -> 本处 read-on-reset 清零 (human-readable 的
@@ -2099,7 +2300,7 @@ static int neoq_ml_show(struct seq_file *m, void *v)
             "t1_pkts=0 t1_bytes=0 t1_drops=0 t1_marks=0 t1_avg_delay_us=0 t1_peak_delay_us=0 "
             "t2_pkts=0 t2_bytes=0 t2_drops=0 t2_marks=0 t2_avg_delay_us=0 t2_peak_delay_us=0 "
             "t3_pkts=0 t3_bytes=0 t3_drops=0 t3_marks=0 t3_avg_delay_us=0 t3_peak_delay_us=0 "
-            "retrans_seen=0 retrans_protected=0\n");
+            "retrans_seen=0 retrans_protected=0 retrans_demoted=0\n");
         return 0;
     }
 
@@ -2127,8 +2328,8 @@ static int neoq_ml_show(struct seq_file *m, void *v)
         tier->peak_delay_ml = 0;        /* read-on-reset: 清掉已上报的近期峰值 */
     }
 
-    seq_printf(m, " retrans_seen=%llu retrans_protected=%llu\n",
-               q->retrans_seen, q->retrans_protected);
+    seq_printf(m, " retrans_seen=%llu retrans_protected=%llu retrans_demoted=%llu\n",
+               q->retrans_seen, q->retrans_protected, q->retrans_demoted);
 
     spin_unlock_bh(&neoq_lock);
     return 0;
@@ -2202,6 +2403,10 @@ static int __init neoq_module_init(void)
     if (neoq_sparse_entry)
         pr_info("NeoQ: Sparse gate window/thresh at /proc/net/neoq_sparse\n");
 
+    neoq_retrans_entry = proc_create("neoq_retrans", 0644, init_net.proc_net, &neoq_retrans_proc_ops);
+    if (neoq_retrans_entry)
+        pr_info("NeoQ: Express retrans-abuse gate at /proc/net/neoq_retrans\n");
+
     neoq_ml_entry = proc_create("neoq_ml", 0444, init_net.proc_net, &neoq_ml_proc_ops);
     if (neoq_ml_entry)
         pr_info("NeoQ: Machine-readable stats at /proc/net/neoq_ml\n");
@@ -2221,6 +2426,8 @@ static void __exit neoq_module_exit(void)
         proc_remove(neoq_codel_entry);
     if (neoq_sparse_entry)
         proc_remove(neoq_sparse_entry);
+    if (neoq_retrans_entry)
+        proc_remove(neoq_retrans_entry);
     if (neoq_ml_entry)
         proc_remove(neoq_ml_entry);
 

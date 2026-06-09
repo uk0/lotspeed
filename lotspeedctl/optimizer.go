@@ -56,10 +56,17 @@ type optimizer struct {
 	prevT3Bytes uint64  // NeoQ: cumulative Bulk bytes at last measure() (for delta)
 	nqPrimed    bool    // NeoQ: prev*T0/T3 counters baselined (skip first-cycle bogus delta)
 	codelRtt    float64 // EWMA RTT (ms) driving NeoQ CoDel target/interval
-	smScore     float64 // EWMA-smoothed score — stable steering signal (抚平)
-	bestKnown   float64 // best smoothed score seen — stability reference
-	bestParams  []int   // tunable values at bestKnown — snap-back target (纠正)
-	unstableN   int     // consecutive cycles below the stability floor
+
+	// rttRing holds the last jitterRingLen per-cycle RTT samples (ms). Its MAD is
+	// the jitter signal in score(). Only CLEAN cycles push here — bad-link cycles
+	// (RTT spikes flagged by the link-weather gate) are skipped so a weather blip
+	// can't poison the variance estimate (see the measure-site push in the loop).
+	rttRing []float64
+
+	smScore    float64 // EWMA-smoothed score — stable steering signal (抚平)
+	bestKnown  float64 // best smoothed score seen — stability reference
+	bestParams []int   // tunable values at bestKnown — snap-back target (纠正)
+	unstableN  int     // consecutive cycles below the stability floor
 
 	// B1 delta-credit: the index/value/score of the coordinate probed LAST cycle,
 	// so this cycle's score can be differenced against it and credited to that one
@@ -107,6 +114,22 @@ const (
 	expressActivityFloorPkts = 50
 	// defaultGamma weights the Express-delay penalty in score(). 0 disables the term.
 	defaultGamma = 0.3
+	// jitterRingLen is how many recent per-cycle RTTs the optimizer keeps to
+	// estimate jitter (MAD of the ring). 8 cycles is enough for a stable MAD
+	// without lagging a genuine regime change too long.
+	jitterRingLen = 8
+	// jitterMinSamples is the minimum ring occupancy before the jitter penalty is
+	// applied; below it the MAD is too noisy to trust and score() stays the
+	// throughput+delay+loss formula (so an empty/short ring is a no-op).
+	jitterMinSamples = 4
+	// jitterDelta weights the jitter penalty in score(). The term subtracts
+	// jitterDelta*clamp(jitterMs/rttMs, 0, 1): on a 250ms intercontinental path a
+	// jitter/rtt ratio above ~0.1 already degrades interactive feel, so penalizing
+	// RTT variance steers the search away from parameter sets that win mean
+	// throughput by causing RTT oscillation (e.g. overly aggressive probing).
+	// Hardcoded (no flag) to stay surgical; the gamma flag precedent exists if a
+	// knob is wanted later.
+	jitterDelta = 0.2
 )
 
 func newOptimizer(iface string, interval time.Duration, gamma float64) *optimizer {
@@ -133,14 +156,24 @@ func newOptimizer(iface string, interval time.Duration, gamma float64) *optimize
 			// high-RTT cwnd ramping aggressively. (Was observed stuck at 0 = boost off.)
 			{"hd_rho_max", "", 250, 400, 25, 400},
 			// neoq_sparse_thresh: CAKE-style sparse-gate byte threshold per 100ms
-			// window (1..8 MTUs); the window stays fixed at 100000us. A flow under
-			// this many bytes/window stays "sparse" (Express-eligible); above it it's
-			// demoted to bulk. Written as "100000 <bytes>" (see apply()). Default
-			// 3028 = 2*MTU = the kernel default. ANTI-NOISE: this arm is only SELECTED
-			// for probing when the cycle shows a genuinely mixed workload (see nextTi
-			// + mixedWorkload) — on single-flow/idle traffic it's a no-op and would
+			// window; the window stays fixed at 100000us. A flow under this many
+			// bytes/window stays "sparse" (Express-eligible); above it it's demoted to
+			// bulk. Written as "100000 <bytes>" (see apply()). bytes/100ms map to a
+			// rate as bytes*8/0.1/1e6 Mbps = bytes*80/1e6, so the 6 stepped arms
+			// {3028,27112,51196,75280,99364,123448} cover {0.24, 2.2, 4.1, 6.0, 7.9,
+			// 9.9} Mbps. RANGE RATIONALE: the real sparse/bulk boundary is between a
+			// "web page burst" (a 2MB page loading at 5-20 Mbps for 1-2s — must stay
+			// Express/fast) and a "sustained download" (50+ Mbps for minutes — must
+			// demote to Bulk), which sits in the 1-10 Mbps band. The old max of
+			// 12112B/100ms (~0.97 Mbps) topped out an order of magnitude below that
+			// boundary, so the optimizer could never explore where the answer lives.
+			// (max-min) is an exact multiple of step (120420/24084=5) so the top arm
+			// lands exactly at 123448. cur=3028 = 2*MTU = the kernel default
+			// (conservative start). ANTI-NOISE: this arm is only SELECTED for probing
+			// when the cycle shows a genuinely mixed workload (see nextTi +
+			// mixedWorkload) — on single-flow/idle traffic it's a no-op and would
 			// otherwise absorb exploration credit (the neoq_boost lesson).
-			{"neoq_sparse_thresh", neoqSparseProc, 1514, 12112, 1514, 3028},
+			{"neoq_sparse_thresh", neoqSparseProc, 3028, 123448, 24084, 3028},
 			// NOTE: neoq_boost was REMOVED from the tun list (B4) — it is a no-op on
 			// single-flow traffic (it only reshapes the downstream rwnd across
 			// concurrent flows) so probing it (~28% of the old exploration budget)
@@ -303,6 +336,16 @@ func (o *optimizer) score(m metrics) float64 {
 	if o.gamma > 0 && m.nqOK && m.t0DeltaPkts > expressActivityFloorPkts {
 		s -= o.gamma * clampF(m.t0PeakDelayUs/expressDelayBudgetUs, 0, 2.0)
 	}
+	// Jitter term: penalize RTT variance (network quality = throughput + delay +
+	// variance). jitter = MAD of the recent-RTT ring; the penalty is
+	// jitterDelta*clamp(jitter/rtt, 0, 1). Gated on a sufficiently full ring (so a
+	// short/empty ring is a no-op and score() stays the legacy formula) and rtt>0.
+	// The ring is fed only on clean cycles (bad-link cycles are skipped at the push
+	// site), so a weather spike can't inflate the MAD.
+	if len(o.rttRing) >= jitterMinSamples && m.rttMs > 0 {
+		jitterMs := medianAbsDev(o.rttRing)
+		s -= jitterDelta * clampF(jitterMs/m.rttMs, 0, 1)
+	}
 	return s
 }
 
@@ -456,6 +499,7 @@ func cmdOptimize(args []string) error {
 		badLink       bool    // B2: was this window-best captured during link weather?
 		expressPeakUs float64 // NeoQ: Express recent-peak delay at the best cycle
 		t3Goodput     uint64  // NeoQ: bulk bytes moved in the best cycle's window
+		jitterMs      float64 // RTT-ring MAD (variance signal) at the best cycle
 	}
 	windowBest := windowBestT{score: -1e9}
 	windowCycle := 0
@@ -573,6 +617,17 @@ func cmdOptimize(args []string) error {
 		// the KNN), but we skip UCB credit and skip the accept/revert decision.
 		badLink := o.minRtt > 0 && m.rttMs > 0 && (m.rttMs/o.minRtt-1) > 2.0
 
+		// Jitter ring: push this cycle's RTT only on a CLEAN cycle (rtt>0, not
+		// bad-link). A bad-link cycle's RTT is a weather spike, not steady-state
+		// jitter — including it would poison the MAD that score() penalizes on. The
+		// ring holds the last jitterRingLen clean RTTs; score() reads it next cycle.
+		if !badLink && m.rttMs > 0 {
+			o.rttRing = append(o.rttRing, m.rttMs)
+			if len(o.rttRing) > jitterRingLen {
+				o.rttRing = o.rttRing[1:]
+			}
+		}
+
 		// Live feature building: cap samples and use MAD-filtered medians so
 		// occasional outliers don't poison what we persist to the model.
 		if m.rttMs > 0 {
@@ -613,6 +668,13 @@ func cmdOptimize(args []string) error {
 			windowBest.badLink = badLink
 			windowBest.expressPeakUs = m.t0PeakDelayUs
 			windowBest.t3Goodput = m.t3GoodputDelta
+			// Jitter at the best cycle: MAD of the ring, matching what score() saw
+			// (0 when the ring is too short for the jitter term to apply).
+			if len(o.rttRing) >= jitterMinSamples {
+				windowBest.jitterMs = medianAbsDev(o.rttRing)
+			} else {
+				windowBest.jitterMs = 0
+			}
 		}
 		windowCycle++
 		if windowCycle >= recordEveryN && len(rttSamples) >= 3 && len(bwSamples) >= 3 && windowBest.params != nil {
@@ -630,7 +692,7 @@ func cmdOptimize(args []string) error {
 			// params to avoid on bad-link states (high loss / RTT spike).
 			if feat.BwMbps < 5 {
 				fmt.Printf("    -> sample SKIPPED (no real traffic: bw=%.0fM)\n", feat.BwMbps)
-			} else if err := loadModel().record(feat, windowBest.params, windowBest.score, windowBest.changedParam, windowBest.delta, windowBest.expressPeakUs, windowBest.t3Goodput); err == nil {
+			} else if err := loadModel().record(feat, windowBest.params, windowBest.score, windowBest.changedParam, windowBest.delta, windowBest.expressPeakUs, windowBest.t3Goodput, windowBest.jitterMs); err == nil {
 				tag := "good"
 				if windowBest.badLink || windowBest.score < 0 {
 					tag = "BAD-LINK"

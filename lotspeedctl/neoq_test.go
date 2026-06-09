@@ -165,3 +165,67 @@ func newOptimizerForTest(gamma float64) *optimizer {
 	o.minRtt = 250 // m.rttMs==250 -> delay penalty 0
 	return o
 }
+
+// Change 2: with a SHORT RTT ring (< jitterMinSamples) the jitter term must NOT
+// fire — score() stays the throughput+delay+loss formula. This is the no-op
+// guarantee for the warm-up cycles before the ring fills.
+func TestScoreJitterShortRingNoOp(t *testing.T) {
+	base := metrics{bwMbps: 100, rttMs: 250, lossPct: 0.02}
+	legacy := newOptimizerForTest(0).score(base)
+
+	o := newOptimizerForTest(0)
+	o.rttRing = []float64{250, 260, 250} // len 3 < jitterMinSamples(4) -> no penalty
+	got := o.score(base)
+	if !almost(got, legacy) {
+		t.Errorf("short ring leaked a jitter penalty: %.6f vs legacy %.6f", got, legacy)
+	}
+}
+
+// Change 2: with a FULL ring the jitter penalty must equal exactly
+// jitterDelta*clamp(MAD(ring)/rtt, 0, 1). Verify both the linear band and the
+// clamp ceiling, and that a bad-link-style spike that was NEVER pushed (the ring
+// holds only clean RTTs) is therefore absent from the MAD.
+func TestScoreJitterPenaltyAndClamp(t *testing.T) {
+	base := metrics{bwMbps: 100, rttMs: 250, lossPct: 0.02}
+
+	// Linear band: clean ring, MAD=3 over rtt=250 -> ratio 0.012, penalty 0.2*0.012.
+	clean := []float64{200, 210, 205, 215, 208, 212, 203, 209}
+	legacyA := newOptimizerForTest(0).score(base)
+	oa := newOptimizerForTest(0)
+	oa.rttRing = append([]float64(nil), clean...)
+	wantA := legacyA - jitterDelta*clampF(medianAbsDev(clean)/base.rttMs, 0, 1)
+	if got := oa.score(base); !almost(got, wantA) {
+		t.Errorf("linear jitter penalty: score=%.6f want %.6f (MAD=%.0f)", got, wantA, medianAbsDev(clean))
+	}
+
+	// Clamp ceiling: wide ring, MAD=300 >= rtt=250 -> ratio clamps to 1, penalty
+	// exactly jitterDelta (0.2), no more.
+	ceil := []float64{0, 100, 200, 300, 700, 800, 900, 1000}
+	legacyB := newOptimizerForTest(0).score(base)
+	ob := newOptimizerForTest(0)
+	ob.rttRing = append([]float64(nil), ceil...)
+	wantB := legacyB - jitterDelta*1.0
+	if got := ob.score(base); !almost(got, wantB) {
+		t.Errorf("clamped jitter penalty: score=%.6f want %.6f (MAD=%.0f, must cap at delta)", got, wantB, medianAbsDev(ceil))
+	}
+}
+
+// Change 2 (ring hygiene): the bad-link skip is the caller's responsibility —
+// score() only consumes whatever is in the ring, so the loop must keep weather
+// spikes OUT of it. This test documents the contract: a ring of CLEAN samples has
+// a small MAD; the same ring with a run of bad-link weather spikes (distinct large
+// RTTs, as real weather produces) has a strictly larger MAD and thus a heavier
+// jitter penalty. Skipping the push on bad-link cycles is therefore load-bearing —
+// without it, link weather (which the bad-link gate already excludes from credit
+// and decisions) would also inflate the variance penalty.
+func TestJitterRingSkipBadLinkContract(t *testing.T) {
+	clean := []float64{248, 250, 252, 249, 251, 250, 253, 247}
+	cleanMAD := medianAbsDev(clean)
+	// What the ring would hold if a sustained-weather run had been pushed instead
+	// of skipped: four clean cycles displaced by four distinct bad-link RTTs.
+	poisoned := []float64{248, 250, 252, 249, 800, 950, 1100, 1300}
+	poisonedMAD := medianAbsDev(poisoned)
+	if !(poisonedMAD > cleanMAD) {
+		t.Fatalf("weather-poisoned ring MAD=%v not greater than clean MAD=%v — skip guard would be a no-op", poisonedMAD, cleanMAD)
+	}
+}

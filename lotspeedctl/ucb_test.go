@@ -29,6 +29,31 @@ func TestConditionReward(t *testing.T) {
 	}
 }
 
+// Change 1: the widened neoq_sparse_thresh range {3028..123448 step 24084} must
+// enumerate to EXACTLY 6 UCB arms with the top arm landing exactly at max (the
+// arm-budget constraint). newUCB builds arms by stepping min..max by step, so
+// (max-min) being an exact multiple of step is what makes the top land cleanly.
+func TestArmsForSparseThreshRange(t *testing.T) {
+	const min, max, step = 3028, 123448, 24084
+	if (max-min)%step != 0 {
+		t.Fatalf("(max-min)=%d not an exact multiple of step=%d — top arm would not land", max-min, step)
+	}
+	u := newUCB([]tunable{{"neoq_sparse_thresh", neoqSparseProc, min, max, step, min}}, 0)
+	arms := u.arms["neoq_sparse_thresh"]
+	want := []int{3028, 27112, 51196, 75280, 99364, 123448}
+	if len(arms) != len(want) {
+		t.Fatalf("got %d arms, want %d (%v)", len(arms), len(want), want)
+	}
+	for i, a := range arms {
+		if a.value != want[i] {
+			t.Errorf("arm[%d]=%d want %d", i, a.value, want[i])
+		}
+	}
+	if arms[len(arms)-1].value != max {
+		t.Errorf("top arm=%d want exactly max=%d", arms[len(arms)-1].value, max)
+	}
+}
+
 // B1: a new-style sample (ChangedParam set) must credit ONLY that arm; the other
 // params in the same set must stay untouched.
 func TestLoadFromSamplesDeltaCreditOnlyChangedParam(t *testing.T) {

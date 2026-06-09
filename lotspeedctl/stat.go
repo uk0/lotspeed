@@ -37,6 +37,25 @@ func percentile(xs []float64, p float64) float64 {
 	return s[idx]
 }
 
+// medianAbsDev returns the median absolute deviation from the median (MAD) — the
+// same robust spread madFilter computes internally, but returned as a value rather
+// than used as a filter cutoff. Used as the jitter estimate over the RTT ring.
+func medianAbsDev(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	med := percentile(xs, 0.5)
+	devs := make([]float64, len(xs))
+	for i, v := range xs {
+		d := v - med
+		if d < 0 {
+			d = -d
+		}
+		devs[i] = d
+	}
+	return percentile(devs, 0.5)
+}
+
 // madFilter keeps samples within k*MAD of the median (default k=3 — Hampel filter).
 // MAD = median absolute deviation. Tolerates up to 50% outliers, unlike stddev.
 func madFilter(xs []float64, k float64) []float64 {

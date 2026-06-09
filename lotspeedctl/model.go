@@ -35,6 +35,10 @@ type sample struct {
 	// window-best cycle; T3GoodputDelta is bulk bytes moved that window.
 	ExpressPeakUs  float64 `json:"express_peak_us,omitempty"`
 	T3GoodputDelta uint64  `json:"t3_goodput_delta,omitempty"`
+	// JitterMs is the RTT jitter (MAD of the optimizer's recent-RTT ring, ms) at the
+	// window-best cycle — the variance signal score() penalizes. omitempty so legacy
+	// model.json still loads; zero is the natural "no jitter data" value.
+	JitterMs float64 `json:"jitter_ms,omitempty"`
 }
 
 type model struct {
@@ -203,12 +207,14 @@ func maxInt(a, b int) int {
 // Called by optimize after convergence. changedParam/delta carry the B1
 // single-coordinate credit (empty/zero is fine — UCB then falls back to
 // full-set crediting for this sample). expressPeakUs/t3Goodput carry the NeoQ
-// experience signals for the window-best cycle (zero when stats were unavailable).
-func (m *model) record(f linkFeature, p paramSet, score float64, changedParam string, delta float64, expressPeakUs float64, t3Goodput uint64) error {
+// experience signals for the window-best cycle (zero when stats were unavailable);
+// jitterMs is the RTT-ring MAD (variance signal) at that cycle.
+func (m *model) record(f linkFeature, p paramSet, score float64, changedParam string, delta float64, expressPeakUs float64, t3Goodput uint64, jitterMs float64) error {
 	m.Samples = append(m.Samples, sample{
 		Feature: f, Params: p, Score: score, TS: time.Now().Unix(),
 		ChangedParam: changedParam, Delta: delta,
 		ExpressPeakUs: expressPeakUs, T3GoodputDelta: t3Goodput,
+		JitterMs: jitterMs,
 	})
 	// cap at 500 samples (FIFO) — keep model lightweight.
 	if len(m.Samples) > 500 {
@@ -244,7 +250,7 @@ func cmdModel(args []string) error {
 				{"fast_alpha", "", 4, 40, 4, 0},
 				{"loss_thresh", "", 2, 24, 2, 0},
 				{"hd_rho_max", "", 250, 400, 25, 0},
-				{"neoq_sparse_thresh", neoqSparseProc, 1514, 12112, 1514, 0},
+				{"neoq_sparse_thresh", neoqSparseProc, 3028, 123448, 24084, 0},
 				{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 0},
 			}
 			ucb := newUCB(tuns, 0)

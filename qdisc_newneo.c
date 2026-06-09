@@ -242,6 +242,14 @@ struct neoq_flow {
     u32                 srtt_us;            /* Smoothed RTT in microseconds */
     u32                 rtt_min_us;         /* Minimum RTT observed */
     u64                 last_rtt_update;    /* Last RTT update timestamp */
+
+    /* === NEW: CAKE 风格稀疏/批量行为门控 ===
+     * 在一个滑动窗口内累计 flow 的字节数，窗口到期后衰减/重置。
+     * 若窗口内速率低于稀疏阈值, flow 仍可享受 Express/High; 持续高于阈值则被
+     * 降级到按包大小决定的档位 (Normal/Bulk), 即便命中 hint 端口。 */
+    u32                 bytes_window;       /* 当前窗口内累计字节 */
+    u64                 window_start;       /* 当前窗口起点 (ns) */
+    u8                  is_bulk_behave:1;   /* 1=已判定为批量(降级), 0=稀疏 */
 } ____cacheline_aligned_in_smp;
 
 enum {
@@ -256,12 +264,13 @@ enum {
  * ======================================================================== */
 
 struct neoq_tier {
-    struct neoq_flow    *flows;         /* Dynamically allocated */
-    u32                 *backlogs;
-    u32                 *tags;
-
+    /* 注: flows/backlogs/tags 已上移为全局表 (见 neoq_sched_data),
+     * 一个 5-tuple 只对应一个 neoq_flow; 每个 tier 仍各自持有 DRR 链表。 */
     struct list_head    new_flows;
     struct list_head    old_flows;
+
+    /* === NEW: 跨档位防饿死 WRR 的每档字节赤字 === */
+    s64                 tier_deficit;       /* 按权重补充, 工作保持 */
 
     u32                 sparse_cnt;
     u32                 bulk_cnt;
@@ -283,9 +292,6 @@ struct neoq_tier {
     u64                 codel_target;
 
     u32                 quantum;
-    u32                 way_indirect;
-    u32                 way_miss;
-    u32                 way_collide;
 } ____cacheline_aligned_in_smp;
 
 /* ========================================================================
@@ -294,6 +300,17 @@ struct neoq_tier {
 
 struct neoq_sched_data {
     struct neoq_tier    *tiers;
+
+    /* === NEW: 全局 5-tuple 流表 (替代每档独立表), 一份实例, 保持原集合相联方案 ===
+     * 一条 TCP 连接的状态 (highest_seq/srtt/retrans/CoDel) 不再被切碎到 4 个档位。 */
+    struct neoq_flow    *flows;         /* NEOQ_QUEUES 项 */
+    u32                 *backlogs;       /* 每槽 backlog 镜像 (与 flow->backlog 同步) */
+    u32                 *tags;           /* 集合相联 tag 表 */
+
+    /* 全局哈希表统计 (原为每档, 因表已全局而上移) */
+    u32                 way_indirect;
+    u32                 way_miss;
+    u32                 way_collide;
 
     /* Config */
     u32                 limit;
@@ -562,23 +579,34 @@ static inline void update_flow_state(struct neoq_flow *flow, bool is_retrans)
 
 /*
  * Classification priority (highest to lowest):
- * 1. Retransmit packets -> EXPRESS (fastest loss recovery)
- * 2. Pure ACKs -> EXPRESS
- * 3. Small packets (<128B) -> EXPRESS
- * 4. HTTP/HTTPS/DNS/SSH -> EXPRESS (if http_boost enabled)
- * 5. SYN/FIN packets -> HIGH (connection setup/teardown)
- * 6. Small interactive (<256B) -> HIGH
- * 7. Gaming/VoIP UDP -> HIGH
- * 8. Large packets (>=1400B) -> BULK
- * 9. Everything else -> NORMAL
+ * 行为分类 (CAKE 风格稀疏流), 由高到低:
+ * 1. Retransmit 包 -> EXPRESS (最快丢包恢复, 现因全局流表而可靠)
+ * 2. 纯 ACK / pkt_len<128 / SYN|FIN|RST -> EXPRESS (无条件)
+ * 3. hint 端口 (http_boost + 配置位图) 仅对 *小包* (<256B) 提权到 EXPRESS/HIGH;
+ *    大包 (>=1400B) 永远不会因端口 hint 进 EXPRESS。
+ * 4. 每流行为门控: 窗口内速率低于稀疏阈值 -> 保持 Express/High;
+ *    持续高于阈值 -> 降级到按包大小的档位 (Normal/Bulk), 即便命中 hint 端口。
+ * 5. 小交互包 (<256B) -> HIGH
+ * 6. 大包 (>=1400B) -> BULK
+ * 7. 其余 -> NORMAL
  */
 /* Configurable priority-port bitmap (game/web boost), set via /proc/net/neoq_prio */
 static DECLARE_BITMAP(neoq_prio_portmap, 65536);
 
 /* Outbound-ACK rwnd boost = single-side downstream "window deception", percent (100=off).
- * Pairs with lotspeed CC (upstream) to form one bidirectional accel system.
- * Set via /proc/net/neoq_boost. */
+ * 默认 100 = 关闭。纯出向 qdisc 看不到对端 SYN-ACK (在收方向), 因此无法得知对端
+ * 的窗口缩放因子 (wscale) -> 重写 window 字段在 wscale!=0 时会被错误左移放大,
+ * 语义不安全。保留代码路径与 /proc/net/neoq_boost 旋钮供显式 opt-in, 默认不动包。
+ * Pairs with lotspeed CC (upstream) to form one bidirectional accel system. */
 static u32 neoq_rwnd_boost = 100;
+
+/* === NEW: CAKE 风格稀疏门控旋钮 (runtime-tunable via /proc/net/neoq_sparse) ===
+ * window_ns: 行为采样窗口 (默认 100ms); thresh_bytes: 窗口内字节阈值, 超过即判为
+ * 批量并降级。默认阈值 = 2*NEOQ_QUANTUM ≈ 3028B/100ms ≈ 0.24Mbps, 一次网页突发
+ * (几百 KB) 会瞬间超过 -> 但网页流多为短突发, 窗口到期 (空闲)后迅速重新稀疏化;
+ * 持续下载在数个窗口内即被钉为批量。0 阈值表示禁用降级 (永远稀疏)。 */
+static u64 neoq_sparse_window_ns = 100ULL * NSEC_PER_MSEC;
+static u32 neoq_sparse_thresh_bytes = 2 * NEOQ_QUANTUM;
 
 /* Global CoDel target/interval (ns), runtime-tunable via /proc/net/neoq_codel.
  * Default 5ms/100ms suits LAN; raise target for high-RTT intercontinental links
@@ -626,9 +654,44 @@ static void neoq_boost_rwnd(struct sk_buff *skb)
     th->window = htons(new_win);
 }
 
+/* === NEW: CAKE 风格每流稀疏门控 ===
+ * 在 ~window_ns 滑动窗口内累计 flow 字节; 窗口到期则衰减(重置)累加器, 并依据刚结束
+ * 窗口的字节量更新 is_bulk_behave; 窗口内一旦累计超过阈值立即钉为批量。
+ * 返回 true 表示该 flow 当前为"稀疏", 可保留 Express/High; false 表示已被降级。
+ * 注: 必须在 enqueue 持 root lock 路径内调用 (无额外加锁), 由调用方保证。 */
+static __always_inline bool flow_is_sparse(struct neoq_flow *flow, u32 pkt_len, u64 now)
+{
+    u32 thresh = READ_ONCE(neoq_sparse_thresh_bytes);
+    u64 window = READ_ONCE(neoq_sparse_window_ns);
+
+    if (thresh == 0)            /* 阈值=0: 禁用降级, 永远稀疏 */
+        return true;
+
+    if (flow->window_start == 0)
+        flow->window_start = now;
+
+    if (now - flow->window_start >= window) {
+        /* 窗口滚动: 用刚结束窗口的字节量决定稀疏/批量, 然后重置累加器。
+         * 空闲期(几乎无字节)会把 flow 重新判回稀疏 -> 网页突发后快速恢复。 */
+        flow->is_bulk_behave = (flow->bytes_window >= thresh) ? 1 : 0;
+        flow->bytes_window = 0;
+        flow->window_start = now;
+    }
+
+    flow->bytes_window += pkt_len;
+    if (flow->bytes_window >= thresh)   /* 窗口内即时触发降级 */
+        flow->is_bulk_behave = 1;
+
+    return !flow->is_bulk_behave;
+}
+
+/* 单次分类: 头部解析一次, flow 已在手(含 retrans 分支)。
+ * 行为分类核心 (修复 P1): hint 端口只提权小包; 持续高速率的 flow 即便命中 hint
+ * 端口或 <256B 规则也被降级到按大小决定的档位。 */
 static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
                                                     const struct sk_buff *skb,
                                                     struct neoq_flow *flow,
+                                                    u64 now,
                                                     bool *is_retrans_out)
 {
     const struct iphdr *iph;
@@ -639,16 +702,29 @@ static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
     u32 pkt_len;
     int offset;
     bool is_retrans = false;
+    bool sparse = true;
+    bool port_hint = false;
 
     *is_retrans_out = false;
     pkt_len = qdisc_pkt_len(skb);
 
-    /* Fast path for small packets - likely ACKs or control */
+    /* === 硬规则: 任何流量都无条件保持 Express === */
+    /* 小包(ACK/控制) */
     if (pkt_len < 128)
         return NEOQ_TIER_EXPRESS;
 
-    if (skb->protocol != htons(ETH_P_IP))
+    /* 每流行为门控(对 >=128B 的包才有意义); flow 为空时(legacy 路径)按稀疏处理 */
+    if (flow)
+        sparse = flow_is_sparse(flow, pkt_len, now);
+
+    if (skb->protocol != htons(ETH_P_IP)) {
+        /* P6: v6 不解析端口/retrans, 仅按大小分档, 不会误进 Express(除<128已返回) */
+        if (pkt_len >= 1400)
+            return NEOQ_TIER_BULK;
+        if (pkt_len < 256 && sparse)
+            return NEOQ_TIER_HIGH;
         return NEOQ_TIER_NORMAL;
+    }
 
     iph = ip_hdr(skb);
     if (unlikely(!iph))
@@ -663,24 +739,24 @@ static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
             sport = ntohs(th->source);
             dport = ntohs(th->dest);
 
-            /* === KEY OPTIMIZATION: Retransmit detection === */
+            /* === KEY: Retransmit detection (现可靠, 全局流表) -> Express === */
             if (flow) {
                 is_retrans = is_tcp_retransmit(skb, flow);
                 *is_retrans_out = is_retrans;
-
-                /* Retransmit packets get EXPRESS priority for fast recovery */
                 if (is_retrans)
                     return NEOQ_TIER_EXPRESS;
             }
 
-            /* Pure ACK - highest priority */
+            /* 纯 ACK -> Express (硬规则) */
             if (ntohs(iph->tot_len) == offset + (th->doff << 2) &&
                 th->ack && !th->syn && !th->fin)
                 return NEOQ_TIER_EXPRESS;
 
-            /* SYN/FIN - connection control, high priority */
-            if (th->syn || th->fin)
-                return NEOQ_TIER_HIGH;
+            /* SYN/FIN/RST -> 连接控制, 硬规则 Express(快速建连/拆连)
+             * (原为 HIGH, 但 SYN/FIN/RST 都是稀疏控制包, 提到 Express 更合理且
+             *  不受 behavior gate 影响) */
+            if (th->syn || th->fin || th->rst)
+                return NEOQ_TIER_EXPRESS;
         }
     } else if (proto == IPPROTO_UDP) {
         uh = (const struct udphdr *)((const u8 *)iph + offset);
@@ -690,52 +766,50 @@ static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
         }
     }
 
-    /* Configurable priority ports (game/web), dynamic via /proc/net/neoq_prio */
-    if (test_bit(dport, neoq_prio_portmap) || test_bit(sport, neoq_prio_portmap))
-        return NEOQ_TIER_EXPRESS;
-
-    /* HTTP/HTTPS boost */
+    /* === 端口 hint: 只对小包(<256B)提权; 大包永不因 hint 进 Express === */
+    port_hint = test_bit(dport, neoq_prio_portmap) ||
+                test_bit(sport, neoq_prio_portmap);
     if (q->http_boost) {
         if (dport == HTTP_PORT || sport == HTTP_PORT ||
-            dport == HTTPS_PORT || sport == HTTPS_PORT)
-            return NEOQ_TIER_EXPRESS;
-
-        if (dport == DNS_PORT || sport == DNS_PORT ||
+            dport == HTTPS_PORT || sport == HTTPS_PORT ||
+            dport == DNS_PORT || sport == DNS_PORT ||
             dport == SSH_PORT || sport == SSH_PORT)
-            return NEOQ_TIER_EXPRESS;
+            port_hint = true;
     }
 
-    /* Interactive/gaming traffic */
-    if (pkt_len < 256)
-        return NEOQ_TIER_HIGH;
+    /* hint 端口 + 小包 + 稀疏 -> Express; 否则落入大小/行为分档。
+     * 大包(>=1400)直接绕过 hint 进 Bulk -> HTTPS 大下载不再霸占 Express。 */
+    if (port_hint && pkt_len < 256 && sparse)
+        return NEOQ_TIER_EXPRESS;
 
-    /* Gaming/VoIP UDP ports */
-    if (proto == IPPROTO_UDP) {
+    /* 大包 -> Bulk (P1: 早于交互/HIGH 判定, 端口 hint 已无法救它) */
+    if (pkt_len >= 1400)
+        return NEOQ_TIER_BULK;
+
+    /* 小交互包: 仅稀疏流享受 HIGH; 高速流降级 Normal */
+    if (pkt_len < 256) {
+        if (sparse)
+            return NEOQ_TIER_HIGH;
+        return NEOQ_TIER_NORMAL;
+    }
+
+    /* Gaming/VoIP UDP 端口 (中等包), 仅稀疏流 -> HIGH */
+    if (proto == IPPROTO_UDP && sparse) {
         if ((sport >= 16384 && sport <= 32767) ||
             (dport >= 16384 && dport <= 32767))
             return NEOQ_TIER_HIGH;
     }
 
-    /* Large packets - bulk */
-    if (pkt_len >= 1400)
-        return NEOQ_TIER_BULK;
-
     return NEOQ_TIER_NORMAL;
-}
-
-/* Legacy wrapper for compatibility */
-static __always_inline u8 classify_packet(struct neoq_sched_data *q,
-                                          const struct sk_buff *skb)
-{
-    bool is_retrans;
-    return classify_packet_enhanced(q, skb, NULL, &is_retrans);
 }
 
 /* ========================================================================
  * Flow Hashing - Set Associative
  * ======================================================================== */
 
-static u32 flow_hash(struct neoq_tier *tier, const struct sk_buff *skb,
+/* 全局 5-tuple 哈希: 表已上移到 q->flows/tags, 一个连接只占一个槽。
+ * P6: 增加 IPv6 分支, 哈希 v6 地址+端口, 否则所有 v6 流塌缩到同一桶。 */
+static u32 flow_hash(struct neoq_sched_data *q, const struct sk_buff *skb,
                      u32 perturbation)
 {
     const struct iphdr *iph;
@@ -760,14 +834,35 @@ static u32 flow_hash(struct neoq_tier *tier, const struct sk_buff *skb,
                 }
             }
         }
+        hash = jhash_3words(saddr, daddr, (sport << 16) | dport, perturbation);
+        hash ^= proto << 24;
+    } else if (skb->protocol == htons(ETH_P_IPV6)) {
+        const struct ipv6hdr *ip6 = ipv6_hdr(skb);
+
+        if (ip6) {
+            proto = ip6->nexthdr;
+            if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+                const __be16 *ports = (const __be16 *)(ip6 + 1);
+                if ((const u8 *)(ports + 2) <= skb_tail_pointer(skb)) {
+                    sport = (__force u16)ports[0];
+                    dport = (__force u16)ports[1];
+                }
+            }
+            /* 把 16 字节 v6 地址折叠进 jhash; 用 jhash2 散列两个 in6_addr。 */
+            hash = jhash2((const u32 *)&ip6->saddr, 4, perturbation);
+            hash = jhash2((const u32 *)&ip6->daddr, 4, hash);
+            hash = jhash_3words((sport << 16) | dport, proto, 0, hash);
+        } else {
+            hash = jhash_3words(0, 0, 0, perturbation);
+        }
+    } else {
+        hash = jhash_3words(0, 0, 0, perturbation);
     }
 
-    hash = jhash_3words(saddr, daddr, (sport << 16) | dport, perturbation);
-    hash ^= proto << 24;
     reduced = hash % NEOQ_QUEUES;
 
     /* Set-associative lookup */
-    if (likely(tier->tags[reduced] == hash && tier->flows[reduced].set))
+    if (likely(q->tags[reduced] == hash && q->flows[reduced].set))
         return reduced;
 
     {
@@ -777,9 +872,9 @@ static u32 flow_hash(struct neoq_tier *tier, const struct sk_buff *skb,
 
         /* Search for existing flow */
         for (i = 0; i < NEOQ_SET_WAYS; i++, k = (k + 1) % NEOQ_SET_WAYS) {
-            if (tier->tags[outer + k] == hash) {
+            if (q->tags[outer + k] == hash) {
                 if (i)
-                    tier->way_indirect++;
+                    q->way_indirect++;
                 reduced = outer + k;
                 goto found;
             }
@@ -787,18 +882,18 @@ static u32 flow_hash(struct neoq_tier *tier, const struct sk_buff *skb,
 
         /* Find empty slot */
         for (i = 0; i < NEOQ_SET_WAYS; i++, k = (k + 1) % NEOQ_SET_WAYS) {
-            if (!tier->flows[outer + k].set) {
-                tier->way_miss++;
+            if (!q->flows[outer + k].set) {
+                q->way_miss++;
                 reduced = outer + k;
                 goto found;
             }
         }
 
         /* Collision - use original */
-        tier->way_collide++;
+        q->way_collide++;
         reduced = outer + inner;
 found:
-        tier->tags[reduced] = hash;
+        q->tags[reduced] = hash;
     }
 
     return reduced;
@@ -911,6 +1006,122 @@ static inline u64 ewma(u64 avg, u64 sample, u32 weight)
 }
 
 /* ========================================================================
+ * GSO 段计数: limit/q.qlen/tier->packets 以"段"为单位计数 (P7)。
+ * gso_segs 在排队期间不变, 故入队/出队/驱逐均用本函数从 skb 重算, 保证 ++/-- 对称。
+ * ======================================================================== */
+
+static inline u32 neoq_gso_segs(const struct sk_buff *skb)
+{
+    u32 segs = skb_shinfo(skb)->gso_segs;
+    return segs ? segs : 1;
+}
+
+/* 跨档位 WRR 权重 Express:High:Normal:Bulk = 8:4:2:1 (供迁移/入队/出队共用) */
+static const u32 neoq_tier_weight[NEOQ_MAX_TIERS] = { 8, 4, 2, 1 };
+
+/* ========================================================================
+ * 全局流表 <-> 每档 DRR 链表
+ *
+ * 迁移策略 (注释要求):
+ *   一个 5-tuple 只有一个 neoq_flow, 其 skb 队列内嵌在 flow 结构里 (head/tail),
+ *   因此一个 flow 任一时刻只属于一个档位的 DRR 链表。当后续分类把 flow 判到新档位
+ *   而它仍在旧档位排队时, 由于整条队列随 flow 结构一起搬动 (不存在把同一 FIFO 拆到
+ *   两个链表的问题), 我们直接把 flow 整体重挂到新档位的 new_flows, 并把它的 backlog
+ *   字节与 sparse/bulk 计数从旧档位转移到新档位, deficit 重置。即"立即迁移"策略。
+ * ======================================================================== */
+
+/* 把已在某档位排队的 flow 迁移到 new_tier_idx 档位。调用前 flow->set != FLOW_NONE。 */
+static void neoq_flow_migrate(struct neoq_sched_data *q, struct neoq_flow *flow,
+                              u8 new_tier_idx)
+{
+    struct neoq_tier *old = &q->tiers[flow->tier];
+    struct neoq_tier *nt = &q->tiers[new_tier_idx];
+
+    /* 从旧档位计数中扣除 (按当前 set 决定 sparse/bulk 桶) */
+    if (flow->set == FLOW_BULK)
+        old->bulk_cnt--;
+    else
+        old->sparse_cnt--;        /* FLOW_NEW / FLOW_SPARSE */
+
+    /* 转移 backlog 字节 */
+    old->backlog -= flow->backlog;
+    nt->backlog += flow->backlog;
+
+    /* 目标档位此前为空则重置 WRR 赤字 (同 enqueue 新流路径) */
+    if (!nt->sparse_cnt && !nt->bulk_cnt)
+        nt->tier_deficit = (s64)neoq_tier_weight[new_tier_idx] * q->quantum;
+
+    /* 以"新流"身份重挂到新档位, 拿到稀疏优先与新鲜 deficit */
+    list_move_tail(&flow->flowchain, &nt->new_flows);
+    flow->set = FLOW_NEW;
+    flow->tier = new_tier_idx;
+    flow->deficit = nt->quantum;
+    nt->sparse_cnt++;
+}
+
+/* 从指定档位驱逐一个包以腾出空间 (P3)。
+ * 选该档 backlog 最大的 flow (排除 skip 指向的到来包自身的 flow), 丢其 *队首* 包
+ * (单链表无 O(1) 队尾, 队首丢弃对 AQM 等效且更廉价)。完整记账并在 flow 排空时摘链。
+ * 返回被丢字节数, 0 表示该档无可驱逐对象。 */
+static u32 neoq_evict_from_tier(struct Qdisc *sch, u8 tier_idx,
+                                const struct neoq_flow *skip)
+{
+    struct neoq_sched_data *q = qdisc_priv(sch);
+    struct neoq_tier *tier = &q->tiers[tier_idx];
+    struct neoq_flow *flow, *victim = NULL;
+    struct sk_buff *skb;
+    u32 len, gso, idx;
+
+    list_for_each_entry(flow, &tier->new_flows, flowchain) {
+        if (flow == skip)
+            continue;
+        if (!victim || flow->backlog > victim->backlog)
+            victim = flow;
+    }
+    list_for_each_entry(flow, &tier->old_flows, flowchain) {
+        if (flow == skip)
+            continue;
+        if (!victim || flow->backlog > victim->backlog)
+            victim = flow;
+    }
+    if (!victim)
+        return 0;
+
+    skb = flow_dequeue(victim);
+    if (!skb)
+        return 0;
+
+    idx = victim - q->flows;
+    len = qdisc_pkt_len(skb);
+    gso = neoq_gso_segs(skb);
+
+    q->backlogs[idx] -= len;
+    victim->backlog -= len;
+    tier->backlog -= len;
+    sch->qstats.backlog -= len;
+    q->memory_used -= skb->truesize;
+    sch->q.qlen -= gso;
+
+    victim->dropped++;
+    tier->dropped++;
+    qdisc_tree_reduce_backlog(sch, gso, len);
+    qdisc_qstats_drop(sch);
+    kfree_skb(skb);
+
+    /* flow 排空 -> 摘链, 与 dequeue 空流路径保持一致 */
+    if (!victim->head) {
+        list_del_init(&victim->flowchain);
+        if (victim->set == FLOW_BULK)
+            tier->bulk_cnt--;
+        else
+            tier->sparse_cnt--;
+        victim->set = FLOW_NONE;
+        q->flows_cnt--;
+    }
+    return len;
+}
+
+/* ========================================================================
  * Enqueue - Enhanced with Retransmit Priority & Flow State
  * ======================================================================== */
 
@@ -920,66 +1131,31 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     struct neoq_sched_data *q = qdisc_priv(sch);
     struct neoq_tier *tier;
     struct neoq_flow *flow;
-    u32 idx, len;
-    u8 tier_idx, original_tier;
+    u32 idx, len, gso;
+    u8 tier_idx;
     bool is_retrans = false;
+    bool new_flow;
+    u64 now;
 
     len = qdisc_pkt_len(skb);
+    gso = neoq_gso_segs(skb);
 
     /* Downstream window deception: enlarge advertised rwnd on outbound ACKs */
     neoq_boost_rwnd(skb);
 
-    /* Limits check */
-    if (unlikely(sch->q.qlen >= q->limit ||
-                 q->memory_used + skb->truesize > q->memory_limit)) {
-        qdisc_qstats_drop(sch);
-        __qdisc_drop(skb, to_free);
-        return NET_XMIT_DROP;
-    }
+    /* === 单次分类 (P2): 解析头部一次 -> flow_hash 一次 -> 拿到 flow -> 分类一次 ===
+     * enqueue_time 在分类前写入, 供 sparse 门控读取同一时钟。 */
+    now = ktime_get_ns();
+    get_neoq_cb(skb)->enqueue_time = now;
 
-    /* First pass classification (without flow context for hash) */
-    original_tier = classify_packet(q, skb);
-    tier = &q->tiers[original_tier];
-    idx = flow_hash(tier, skb, q->perturbation);
-    flow = &tier->flows[idx];
+    idx = flow_hash(q, skb, q->perturbation);
+    flow = &q->flows[idx];
 
-    /* Second pass: enhanced classification with flow context for retransmit */
-    tier_idx = classify_packet_enhanced(q, skb, flow, &is_retrans);
-
-    /* If retransmit detected, upgrade to EXPRESS tier */
-    if (is_retrans && tier_idx == NEOQ_TIER_EXPRESS && original_tier != NEOQ_TIER_EXPRESS) {
-        /* Move to Express tier for retransmit */
-        tier = &q->tiers[NEOQ_TIER_EXPRESS];
-        idx = flow_hash(tier, skb, q->perturbation);
-        flow = &tier->flows[idx];
-        tier_idx = NEOQ_TIER_EXPRESS;
-    }
-
-    /* Update flow state based on retransmit status */
-    update_flow_state(flow, is_retrans);
-
-    /* Set enqueue time */
-    get_neoq_cb(skb)->enqueue_time = ktime_get_ns();
-
-    /* Add to flow */
-    flow_queue_add(flow, skb);
-
-    /* Update stats */
-    tier->backlogs[idx] += len;
-    flow->backlog += len;
-    tier->backlog += len;
-    sch->qstats.backlog += len;
-    q->memory_used += skb->truesize;
-    sch->q.qlen++;
-    tier->packets++;
-    tier->bytes += len;
-
-    /* Flow management */
-    if (flow->set == FLOW_NONE) {
-        list_add_tail(&flow->flowchain, &tier->new_flows);
-        flow->set = FLOW_NEW;
-        flow->tier = tier_idx;
-        flow->deficit = tier->quantum;
+    /* 全新槽位: 先把每流检测状态清零 *再* 分类, 使 retrans/sparse 看到干净状态。
+     * 此时尚未挂链 (tier 未知); 若随后被拒纳, 槽位仍为 FLOW_NONE 的干净零态。 */
+    new_flow = (flow->set == FLOW_NONE);
+    if (new_flow) {
+        /* 与原 FLOW_NONE 初始化集合一致 (仅顺序提前), 外加新增的 sparse 门控字段。 */
         flow->flow_state = FLOW_STATE_NEW;
         flow->loss_protect_level = LOSS_PROTECT_NONE;
         flow->highest_seq = 0;
@@ -988,9 +1164,86 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
         flow->startup_packets = 0;
         flow->srtt_us = 0;
         flow->rtt_min_us = 0;
+        flow->bytes_window = 0;
+        flow->window_start = 0;
+        flow->is_bulk_behave = 0;
+    }
+
+    tier_idx = classify_packet_enhanced(q, skb, flow, now, &is_retrans);
+    tier = &q->tiers[tier_idx];
+
+    /* === 限额检查 (P3/P7: 以段计数; 溢出时对 Express/High 驱逐低优先级队列) === */
+    if (unlikely(sch->q.qlen + gso > q->limit ||
+                 q->memory_used + skb->truesize > q->memory_limit)) {
+        if (tier_idx == NEOQ_TIER_EXPRESS || tier_idx == NEOQ_TIER_HIGH) {
+            /* 从最低优先级的非空档位 (Bulk 优先) 驱逐, 直到能容纳到来的包。
+             * 到来包为 Express/High, 只驱逐 vt>tier_idx 的更低档位, 故被驱逐的绝不是
+             * 到来包自身的 flow。 */
+            int vt;
+
+            for (vt = NEOQ_MAX_TIERS - 1; vt > (int)tier_idx; vt--) {
+                while (sch->q.qlen + gso > q->limit ||
+                       q->memory_used + skb->truesize > q->memory_limit) {
+                    /* skip=flow: 绝不驱逐到来包自身的 flow (它即将上迁并入队),
+                     * 否则 new_flow/flow->set 失效, 迁移会双重扣减计数。 */
+                    if (!neoq_evict_from_tier(sch, vt, flow))
+                        break;          /* 该档已无可驱逐对象, 换更高档位 */
+                }
+                if (sch->q.qlen + gso <= q->limit &&
+                    q->memory_used + skb->truesize <= q->memory_limit)
+                    break;
+            }
+            /* 仍放不下 (无更低优先级流量可驱逐) -> 只能丢弃到来的包 */
+            if (sch->q.qlen + gso > q->limit ||
+                q->memory_used + skb->truesize > q->memory_limit) {
+                qdisc_qstats_drop(sch);
+                __qdisc_drop(skb, to_free);
+                return NET_XMIT_DROP;
+            }
+        } else {
+            /* Normal/Bulk: 维持原行为, 丢弃到来的包 */
+            qdisc_qstats_drop(sch);
+            __qdisc_drop(skb, to_free);
+            return NET_XMIT_DROP;
+        }
+    }
+
+    /* === 确认纳入: 此后才推进 flow 生命周期状态 (只统计真正入队的包) === */
+    update_flow_state(flow, is_retrans);
+
+    /* === Flow 链表管理必须在字节记账之前 ===
+     * 迁移会把 flow->backlog (本包之前的旧 backlog) 在档位间整体搬移; 若先把本包的 len
+     * 计入, 迁移会重复计 len。故先迁移/挂链使 flow->tier == tier_idx, 再统一记账。 */
+    if (new_flow) {
+        /* 全新 flow: 挂入当前档位 new_flows。
+         * 若该档位此前为空, 重置 WRR 赤字为 w*quantum -> Express 一有流量即获满额度,
+         * 不被 Bulk 反压 (P5 延迟下界关键)。 */
+        if (!tier->sparse_cnt && !tier->bulk_cnt)
+            tier->tier_deficit = (s64)neoq_tier_weight[tier_idx] * q->quantum;
+        list_add_tail(&flow->flowchain, &tier->new_flows);
+        flow->set = FLOW_NEW;
+        flow->tier = tier_idx;
+        flow->deficit = tier->quantum;
         tier->sparse_cnt++;
         q->flows_cnt++;
+    } else if (flow->tier != tier_idx) {
+        /* 已排队的 flow 改判到新档位 -> 整体迁移 (见 neoq_flow_migrate 注释) */
+        neoq_flow_migrate(q, flow, tier_idx);
     }
+
+    /* Add to flow (physical) */
+    flow_queue_add(flow, skb);
+
+    /* Update stats (字节/truesize 不按段; qlen/packets 按段)。
+     * 此处 tier == &q->tiers[tier_idx] == flow 当前所在档位, 与 flow->tier 一致。 */
+    q->backlogs[idx] += len;
+    flow->backlog += len;
+    tier->backlog += len;
+    sch->qstats.backlog += len;
+    q->memory_used += skb->truesize;
+    sch->q.qlen += gso;
+    tier->packets += gso;
+    tier->bytes += len;
 
     return NET_XMIT_SUCCESS;
 }
@@ -1005,22 +1258,62 @@ static struct sk_buff *neoq_dequeue_flow(struct Qdisc *sch,
 {
     struct neoq_sched_data *q = qdisc_priv(sch);
     struct sk_buff *skb;
-    u32 len, idx;
+    u32 len, idx, gso;
 
-    idx = flow - tier->flows;
+    idx = flow - q->flows;          /* 全局表索引 */
     skb = flow_dequeue(flow);
     if (!skb)
         return NULL;
 
     len = qdisc_pkt_len(skb);
-    tier->backlogs[idx] -= len;
+    gso = neoq_gso_segs(skb);        /* 与入队加的段数相同 (P7 对称) */
+    q->backlogs[idx] -= len;
     flow->backlog -= len;
     tier->backlog -= len;
     sch->qstats.backlog -= len;
     q->memory_used -= skb->truesize;
-    sch->q.qlen--;
+    sch->q.qlen -= gso;
 
     return skb;
+}
+
+/* === NEW: 跨档位防饿死 WRR (P4) ===
+ * 权重 Express:High:Normal:Bulk = 8:4:2:1 (按字节赤字)。工作保持: 空闲档不消耗份额。
+ * 选取规则: 由高到低找第一个"非空且赤字>0"的档位; 若所有非空档位赤字都已耗尽, 则只给
+ * 非空档位补充 w*quantum (空闲档不累积), 再重试。新激活的档位在 enqueue 中把赤字重置
+ * 为 w*quantum, 因此 Express 一有包就立刻拿到额度, 不会被 Bulk 反压。
+ * 单次 dequeue 仅出一个包, 故最多一个低档 GSO 包(≤64KB≈0.5ms@1Gbps)排在 Express 前。 */
+static int neoq_pick_tier(struct neoq_sched_data *q)
+{
+    int t;
+
+    /* 补充循环不能设固定上限: 一个 64KB GSO 包可把低权重档的赤字打到
+     * 约 -64K, 每轮仅补 weight*quantum (最低 256), 限 2 轮会导致
+     * 非空队列被误判为空 -> qdisc 假空停摆。每轮每个非空档至少 +256,
+     * 至多 ~43 轮必有档位转正, 循环必然终止且不触碰 skb。 */
+    for (;;) {
+        bool any = false;
+
+        for (t = 0; t < NEOQ_MAX_TIERS; t++) {
+            struct neoq_tier *tier = &q->tiers[t];
+
+            if (!tier->sparse_cnt && !tier->bulk_cnt)
+                continue;
+            any = true;
+            if (tier->tier_deficit > 0)
+                return t;
+        }
+        if (!any)
+            return -1;          /* 无任何非空档位 */
+
+        /* 所有非空档位赤字耗尽 -> 仅补充非空档位 (空闲档不累积额度) */
+        for (t = 0; t < NEOQ_MAX_TIERS; t++) {
+            struct neoq_tier *tier = &q->tiers[t];
+
+            if (tier->sparse_cnt || tier->bulk_cnt)
+                tier->tier_deficit += (s64)neoq_tier_weight[t] * q->quantum;
+        }
+    }
 }
 
 static struct sk_buff *neoq_dequeue(struct Qdisc *sch)
@@ -1031,6 +1324,7 @@ static struct sk_buff *neoq_dequeue(struct Qdisc *sch)
     struct list_head *head;
     struct sk_buff *skb;
     u64 now, delay;
+    u32 plen, gso;
     int t;
 
 begin:
@@ -1039,89 +1333,97 @@ begin:
 
     now = ktime_get_ns();
 
-    /* Try each tier in priority order */
-    for (t = 0; t < NEOQ_MAX_TIERS; t++) {
-        tier = &q->tiers[t];
-
-        if (!tier->sparse_cnt && !tier->bulk_cnt)
-            continue;
+    /* WRR 选档 (替代纯严格优先级) */
+    t = neoq_pick_tier(q);
+    if (t < 0)
+        return NULL;
+    tier = &q->tiers[t];
 
 retry:
-        /* New flows first (sparse priority) */
-        head = &tier->new_flows;
+    /* New flows first (sparse priority) */
+    head = &tier->new_flows;
+    if (list_empty(head)) {
+        head = &tier->old_flows;
         if (list_empty(head)) {
-            head = &tier->old_flows;
-            if (list_empty(head))
-                continue;
+            /* 该档计数与链表不一致兜底; 正常不会到达。原严格优先级实现此处 continue
+             * 跳到下一档, WRR 重写后外层 for 已不存在。为防 qlen!=0 却 return NULL 造成
+             * qdisc 失速(假"空"队列直到下次 enqueue 才被唤醒), 这里自愈: 把该档计数清零
+             * 使 neoq_pick_tier 不再选中它, 再 goto begin 重新选档。每次最多重选
+             * NEOQ_MAX_TIERS 档, 保证终止, 且不触碰任何 skb / qlen, 无泄漏。 */
+            tier->sparse_cnt = 0;
+            tier->bulk_cnt = 0;
+            goto begin;
         }
-
-        flow = list_first_entry(head, struct neoq_flow, flowchain);
-
-        /* DRR check */
-        if (flow->deficit <= 0) {
-            flow->deficit += tier->quantum;
-            list_move_tail(&flow->flowchain, &tier->old_flows);
-
-            if (flow->set == FLOW_NEW || flow->set == FLOW_SPARSE) {
-                flow->set = FLOW_BULK;
-                tier->sparse_cnt--;
-                tier->bulk_cnt++;
-            }
-            goto retry;
-        }
-
-        /* Get packet with CoDel */
-        while (1) {
-            skb = neoq_dequeue_flow(sch, tier, flow);
-            if (!skb) {
-                /* Flow empty - remove */
-                list_del_init(&flow->flowchain);
-                if (flow->set == FLOW_NEW || flow->set == FLOW_SPARSE)
-                    tier->sparse_cnt--;
-                else if (flow->set == FLOW_BULK)
-                    tier->bulk_cnt--;
-                flow->set = FLOW_NONE;
-                q->flows_cnt--;
-                goto begin;
-            }
-
-            /* CoDel - but don't drop last packet */
-            if (!codel_should_drop(flow, tier, now, skb) || !flow->head)
-                break;
-
-            /* Try ECN mark first */
-            if (q->ecn && INET_ECN_set_ce(skb)) {
-                tier->ecn_marked++;
-                flow->ecn_marked = 1;
-                break;
-            }
-
-            /* Drop */
-            flow->dropped++;
-            tier->dropped++;
-            flow->deficit -= qdisc_pkt_len(skb);
-            qdisc_tree_reduce_backlog(sch, 1, qdisc_pkt_len(skb));
-            qdisc_qstats_drop(sch);
-            kfree_skb(skb);
-        }
-
-        /* Update delay stats */
-        delay = now - get_neoq_cb(skb)->enqueue_time;
-        tier->avg_delay = ewma(tier->avg_delay, delay, 8);
-        tier->peak_delay = ewma(tier->peak_delay, delay,
-                                delay > tier->peak_delay ? 2 : 8);
-        if (delay < tier->base_delay || tier->base_delay == ~0ULL)
-            tier->base_delay = delay;
-
-        flow->deficit -= qdisc_pkt_len(skb);
-        qdisc_bstats_update(sch, skb);
-        q->total_packets++;
-        q->total_bytes += qdisc_pkt_len(skb);
-
-        return skb;
     }
 
-    return NULL;
+    flow = list_first_entry(head, struct neoq_flow, flowchain);
+
+    /* DRR check (档内每流) */
+    if (flow->deficit <= 0) {
+        flow->deficit += tier->quantum;
+        list_move_tail(&flow->flowchain, &tier->old_flows);
+
+        if (flow->set == FLOW_NEW || flow->set == FLOW_SPARSE) {
+            flow->set = FLOW_BULK;
+            tier->sparse_cnt--;
+            tier->bulk_cnt++;
+        }
+        goto retry;
+    }
+
+    /* Get packet with CoDel */
+    while (1) {
+        skb = neoq_dequeue_flow(sch, tier, flow);
+        if (!skb) {
+            /* Flow empty - remove */
+            list_del_init(&flow->flowchain);
+            if (flow->set == FLOW_NEW || flow->set == FLOW_SPARSE)
+                tier->sparse_cnt--;
+            else if (flow->set == FLOW_BULK)
+                tier->bulk_cnt--;
+            flow->set = FLOW_NONE;
+            q->flows_cnt--;
+            goto begin;
+        }
+
+        /* CoDel - but don't drop last packet */
+        if (!codel_should_drop(flow, tier, now, skb) || !flow->head)
+            break;
+
+        /* Try ECN mark first */
+        if (q->ecn && INET_ECN_set_ce(skb)) {
+            tier->ecn_marked++;
+            flow->ecn_marked = 1;
+            break;
+        }
+
+        /* Drop (P7: 段计数) */
+        gso = neoq_gso_segs(skb);
+        plen = qdisc_pkt_len(skb);
+        flow->dropped++;
+        tier->dropped++;
+        flow->deficit -= plen;
+        qdisc_tree_reduce_backlog(sch, gso, plen);
+        qdisc_qstats_drop(sch);
+        kfree_skb(skb);
+    }
+
+    /* Update delay stats */
+    delay = now - get_neoq_cb(skb)->enqueue_time;
+    tier->avg_delay = ewma(tier->avg_delay, delay, 8);
+    tier->peak_delay = ewma(tier->peak_delay, delay,
+                            delay > tier->peak_delay ? 2 : 8);
+    if (delay < tier->base_delay || tier->base_delay == ~0ULL)
+        tier->base_delay = delay;
+
+    plen = qdisc_pkt_len(skb);
+    flow->deficit -= plen;
+    tier->tier_deficit -= plen;     /* WRR: 按服务字节扣减档位赤字 */
+    qdisc_bstats_update(sch, skb);
+    q->total_packets++;
+    q->total_bytes += plen;
+
+    return skb;
 }
 
 static struct sk_buff *neoq_peek(struct Qdisc *sch)
@@ -1153,27 +1455,40 @@ static struct sk_buff *neoq_peek(struct Qdisc *sch)
  * Init / Reset / Destroy
  * ======================================================================== */
 
-static void neoq_clear_tier(struct Qdisc *sch, struct neoq_tier *tier)
+/* 清空全局流表里所有 skb (表已不再每档独立), 并复位每个 flow 槽。 */
+static void neoq_clear_flows(struct Qdisc *sch)
 {
     struct neoq_sched_data *q = qdisc_priv(sch);
     struct sk_buff *skb;
     int i;
 
+    if (!q->flows)
+        return;
+
     for (i = 0; i < NEOQ_QUEUES; i++) {
-        struct neoq_flow *flow = &tier->flows[i];
+        struct neoq_flow *flow = &q->flows[i];
         while ((skb = flow_dequeue(flow)) != NULL) {
             sch->qstats.backlog -= qdisc_pkt_len(skb);
             q->memory_used -= skb->truesize;
-            sch->q.qlen--;
+            sch->q.qlen -= neoq_gso_segs(skb);      /* 与入队段数对称 */
             kfree_skb(skb);
         }
-        tier->backlogs[i] = 0;
+        q->backlogs[i] = 0;
         INIT_LIST_HEAD(&flow->flowchain);
         flow->set = FLOW_NONE;
+        flow->backlog = 0;
     }
+}
+
+/* 复位单个档位的 DRR 链表与计数 (skb 已由 neoq_clear_flows 释放) */
+static void neoq_clear_tier(struct neoq_tier *tier)
+{
+    INIT_LIST_HEAD(&tier->new_flows);
+    INIT_LIST_HEAD(&tier->old_flows);
     tier->sparse_cnt = 0;
     tier->bulk_cnt = 0;
     tier->backlog = 0;
+    tier->tier_deficit = 0;
 }
 
 static int neoq_init(struct Qdisc *sch, struct nlattr *opt,
@@ -1196,39 +1511,37 @@ static int neoq_init(struct Qdisc *sch, struct nlattr *opt,
 
     get_random_bytes(&q->perturbation, sizeof(q->perturbation));
 
-    /* Allocate tiers */
+    /* Allocate tiers (仅元数据, flows 已全局) */
     tier_size = sizeof(struct neoq_tier) * NEOQ_MAX_TIERS;
     q->tiers = kvzalloc(tier_size, GFP_KERNEL);
     if (!q->tiers)
         return -ENOMEM;
 
-    /* Allocate per-tier flow arrays */
+    /* === 分配单一全局流表 (替代每档独立表) === */
     flow_size = sizeof(struct neoq_flow) * NEOQ_QUEUES;
-    total = 0;
+    q->flows = kvzalloc(flow_size, GFP_KERNEL);
+    q->backlogs = kvzalloc(sizeof(u32) * NEOQ_QUEUES, GFP_KERNEL);
+    q->tags = kvzalloc(sizeof(u32) * NEOQ_QUEUES, GFP_KERNEL);
+    if (!q->flows || !q->backlogs || !q->tags)
+        goto err_free;
+
+    total = flow_size + sizeof(u32) * NEOQ_QUEUES * 2;
+
+    for (j = 0; j < NEOQ_QUEUES; j++) {
+        INIT_LIST_HEAD(&q->flows[j].flowchain);
+        q->flows[j].rec_inv_sqrt = ~0U;
+    }
 
     for (i = 0; i < NEOQ_MAX_TIERS; i++) {
         struct neoq_tier *tier = &q->tiers[i];
 
-        tier->flows = kvzalloc(flow_size, GFP_KERNEL);
-        tier->backlogs = kvzalloc(sizeof(u32) * NEOQ_QUEUES, GFP_KERNEL);
-        tier->tags = kvzalloc(sizeof(u32) * NEOQ_QUEUES, GFP_KERNEL);
-
-        if (!tier->flows || !tier->backlogs || !tier->tags)
-            goto err_free;
-
-        total += flow_size + sizeof(u32) * NEOQ_QUEUES * 2;
-
         INIT_LIST_HEAD(&tier->new_flows);
         INIT_LIST_HEAD(&tier->old_flows);
         tier->quantum = q->quantum;
+        tier->tier_deficit = 0;
         tier->codel_interval = (u64)q->interval * NSEC_PER_USEC;
         tier->codel_target = (u64)q->target * NSEC_PER_USEC;
         tier->base_delay = ~0ULL;
-
-        for (j = 0; j < NEOQ_QUEUES; j++) {
-            INIT_LIST_HEAD(&tier->flows[j].flowchain);
-            tier->flows[j].rec_inv_sqrt = ~0U;
-        }
     }
 
     qdisc_watchdog_init(&q->watchdog, sch);
@@ -1238,21 +1551,20 @@ static int neoq_init(struct Qdisc *sch, struct nlattr *opt,
     neoq_active_qdisc = sch;
     spin_unlock_bh(&neoq_lock);
 
-    pr_info("NeoQ v%s: %d tiers x %d queues, %zu KB allocated\n",
+    pr_info("NeoQ v%s: %d tiers, global %d-queue flow table, %zu KB allocated\n",
             NEOQ_VERSION, NEOQ_MAX_TIERS, NEOQ_QUEUES, total / 1024);
 
     return 0;
 
 err_free:
-    for (i = 0; i < NEOQ_MAX_TIERS; i++) {
-        if (q->tiers[i].flows)
-            kvfree(q->tiers[i].flows);
-        if (q->tiers[i].backlogs)
-            kvfree(q->tiers[i].backlogs);
-        if (q->tiers[i].tags)
-            kvfree(q->tiers[i].tags);
-    }
+    kvfree(q->flows);
+    kvfree(q->backlogs);
+    kvfree(q->tags);
     kvfree(q->tiers);
+    q->flows = NULL;
+    q->backlogs = NULL;
+    q->tags = NULL;
+    q->tiers = NULL;
     return -ENOMEM;
 }
 
@@ -1264,8 +1576,9 @@ static void neoq_reset(struct Qdisc *sch)
     if (!q->tiers)
         return;
 
+    neoq_clear_flows(sch);              /* 释放全局表中所有 skb + 复位 flow 槽 */
     for (i = 0; i < NEOQ_MAX_TIERS; i++)
-        neoq_clear_tier(sch, &q->tiers[i]);
+        neoq_clear_tier(&q->tiers[i]);  /* 复位每档链表/计数 */
 
     q->memory_used = 0;
     q->flows_cnt = 0;
@@ -1274,7 +1587,6 @@ static void neoq_reset(struct Qdisc *sch)
 static void neoq_destroy(struct Qdisc *sch)
 {
     struct neoq_sched_data *q = qdisc_priv(sch);
-    int i;
 
     /* Unregister from proc stats */
     spin_lock_bh(&neoq_lock);
@@ -1285,14 +1597,15 @@ static void neoq_destroy(struct Qdisc *sch)
     qdisc_watchdog_cancel(&q->watchdog);
     neoq_reset(sch);
 
-    if (q->tiers) {
-        for (i = 0; i < NEOQ_MAX_TIERS; i++) {
-            kvfree(q->tiers[i].flows);
-            kvfree(q->tiers[i].backlogs);
-            kvfree(q->tiers[i].tags);
-        }
-        kvfree(q->tiers);
-    }
+    /* 各结构各释放一次 */
+    kvfree(q->flows);
+    kvfree(q->backlogs);
+    kvfree(q->tags);
+    kvfree(q->tiers);
+    q->flows = NULL;
+    q->backlogs = NULL;
+    q->tags = NULL;
+    q->tiers = NULL;
 }
 
 /* ========================================================================
@@ -1394,7 +1707,7 @@ static int neoq_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
     /* Global stats */
     if (nla_put_u32(d->skb, TCA_NEOQ_STATS_MEMORY_USED, q->memory_used) ||
         nla_put_u32(d->skb, TCA_NEOQ_STATS_MEMORY_LIMIT, q->memory_limit) ||
-        nla_put_u32(d->skb, TCA_NEOQ_STATS_FLOWS_TOTAL, NEOQ_QUEUES * NEOQ_MAX_TIERS) ||
+        nla_put_u32(d->skb, TCA_NEOQ_STATS_FLOWS_TOTAL, NEOQ_QUEUES) ||
         nla_put_u32(d->skb, TCA_NEOQ_STATS_FLOWS_ACTIVE, q->flows_cnt))
         goto nla_put_failure;
 
@@ -1439,9 +1752,13 @@ static int neoq_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
             nla_put_u32(d->skb, TCA_NEOQ_TIN_STATS_AVG_DELAY_US, avg_us) ||
             nla_put_u32(d->skb, TCA_NEOQ_TIN_STATS_PEAK_DELAY_US, peak_us) ||
             nla_put_u32(d->skb, TCA_NEOQ_TIN_STATS_BASE_DELAY_US, base_us) ||
-            nla_put_u32(d->skb, TCA_NEOQ_TIN_STATS_WAY_INDIRECT, tier->way_indirect) ||
-            nla_put_u32(d->skb, TCA_NEOQ_TIN_STATS_WAY_MISS, tier->way_miss) ||
-            nla_put_u32(d->skb, TCA_NEOQ_TIN_STATS_WAY_COLLIDE, tier->way_collide))
+            /* way_* 哈希表统计已全局, 仅在 tier 0 (Express) 上报真实值, 其余报 0 */
+            nla_put_u32(d->skb, TCA_NEOQ_TIN_STATS_WAY_INDIRECT,
+                        i == 0 ? q->way_indirect : 0) ||
+            nla_put_u32(d->skb, TCA_NEOQ_TIN_STATS_WAY_MISS,
+                        i == 0 ? q->way_miss : 0) ||
+            nla_put_u32(d->skb, TCA_NEOQ_TIN_STATS_WAY_COLLIDE,
+                        i == 0 ? q->way_collide : 0))
             goto nla_put_failure;
 
         nla_nest_end(d->skb, ts);
@@ -1482,7 +1799,7 @@ static int neoq_stats_show(struct seq_file *m, void *v)
     seq_puts(m, "===============================================\n");
     seq_printf(m, " Queue Length:    %u / %u packets\n", sch->q.qlen, q->limit);
     seq_printf(m, " Memory:          %u / %u bytes\n", q->memory_used, q->memory_limit);
-    seq_printf(m, " Active Flows:    %u / %u\n", q->flows_cnt, NEOQ_QUEUES * NEOQ_MAX_TIERS);
+    seq_printf(m, " Active Flows:    %u / %u\n", q->flows_cnt, NEOQ_QUEUES);
     seq_printf(m, " HTTP Boost:      %s\n", q->http_boost ? "ON" : "OFF");
     seq_printf(m, " ECN:             %s\n", q->ecn ? "ON" : "OFF");
     seq_printf(m, " Target Delay:    %u us\n", q->target);
@@ -1674,6 +1991,45 @@ static const struct proc_ops neoq_codel_proc_ops = {
 };
 static struct proc_dir_entry *neoq_codel_entry;
 
+/* === /proc/net/neoq_sparse: CAKE 风格稀疏门控窗口/阈值 === */
+static int neoq_sparse_show(struct seq_file *m, void *v)
+{
+    seq_printf(m, "window_us=%llu thresh_bytes=%u\nusage: echo \"<window_us> <thresh_bytes>\" > /proc/net/neoq_sparse  (thresh=0 disables demotion)\n",
+               READ_ONCE(neoq_sparse_window_ns) / 1000,
+               READ_ONCE(neoq_sparse_thresh_bytes));
+    return 0;
+}
+static int neoq_sparse_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, neoq_sparse_show, NULL);
+}
+static ssize_t neoq_sparse_write(struct file *file, const char __user *ubuf,
+                                 size_t len, loff_t *ppos)
+{
+    char buf[64];
+    unsigned int win = 0, thr = 0;
+    int got;
+    size_t n = min(len, sizeof(buf) - 1);
+
+    if (copy_from_user(buf, ubuf, n))
+        return -EFAULT;
+    buf[n] = '\0';
+    got = sscanf(buf, "%u %u", &win, &thr);
+    if (got >= 1 && win)
+        WRITE_ONCE(neoq_sparse_window_ns, (u64)win * 1000);
+    if (got >= 2)                       /* thr=0 合法: 表示禁用降级 */
+        WRITE_ONCE(neoq_sparse_thresh_bytes, thr);
+    return len;
+}
+static const struct proc_ops neoq_sparse_proc_ops = {
+    .proc_open    = neoq_sparse_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+    .proc_write   = neoq_sparse_write,
+};
+static struct proc_dir_entry *neoq_sparse_entry;
+
 /* ========================================================================
  * Module Registration
  * ======================================================================== */
@@ -1725,6 +2081,10 @@ static int __init neoq_module_init(void)
     if (neoq_codel_entry)
         pr_info("NeoQ: CoDel target/interval at /proc/net/neoq_codel\n");
 
+    neoq_sparse_entry = proc_create("neoq_sparse", 0644, init_net.proc_net, &neoq_sparse_proc_ops);
+    if (neoq_sparse_entry)
+        pr_info("NeoQ: Sparse gate window/thresh at /proc/net/neoq_sparse\n");
+
     return 0;
 }
 
@@ -1738,6 +2098,8 @@ static void __exit neoq_module_exit(void)
         proc_remove(neoq_boost_entry);
     if (neoq_codel_entry)
         proc_remove(neoq_codel_entry);
+    if (neoq_sparse_entry)
+        proc_remove(neoq_sparse_entry);
 
     unregister_qdisc(&neoq_qdisc_ops);
     pr_info("NeoQ: Unloaded\n");

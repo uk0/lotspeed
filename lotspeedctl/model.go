@@ -29,6 +29,12 @@ type sample struct {
 	TS           int64       `json:"ts"`
 	ChangedParam string      `json:"changed_param,omitempty"`
 	Delta        float64     `json:"delta,omitempty"`
+	// NeoQ experience signals captured alongside this sample (omitempty so legacy
+	// model.json — which lacks them — still loads; zero is the natural "no NeoQ
+	// data" value). ExpressPeakUs is the Express recent-peak delay (us) at the
+	// window-best cycle; T3GoodputDelta is bulk bytes moved that window.
+	ExpressPeakUs  float64 `json:"express_peak_us,omitempty"`
+	T3GoodputDelta uint64  `json:"t3_goodput_delta,omitempty"`
 }
 
 type model struct {
@@ -196,11 +202,13 @@ func maxInt(a, b int) int {
 // record appends a new (feature, params, score) sample and persists.
 // Called by optimize after convergence. changedParam/delta carry the B1
 // single-coordinate credit (empty/zero is fine — UCB then falls back to
-// full-set crediting for this sample).
-func (m *model) record(f linkFeature, p paramSet, score float64, changedParam string, delta float64) error {
+// full-set crediting for this sample). expressPeakUs/t3Goodput carry the NeoQ
+// experience signals for the window-best cycle (zero when stats were unavailable).
+func (m *model) record(f linkFeature, p paramSet, score float64, changedParam string, delta float64, expressPeakUs float64, t3Goodput uint64) error {
 	m.Samples = append(m.Samples, sample{
 		Feature: f, Params: p, Score: score, TS: time.Now().Unix(),
 		ChangedParam: changedParam, Delta: delta,
+		ExpressPeakUs: expressPeakUs, T3GoodputDelta: t3Goodput,
 	})
 	// cap at 500 samples (FIFO) — keep model lightweight.
 	if len(m.Samples) > 500 {
@@ -217,8 +225,12 @@ func cmdModel(args []string) error {
 	if len(args) == 0 || args[0] == "show" {
 		fmt.Printf("model at %s\nsamples: %d\n", modelPath(), len(m.Samples))
 		for i, s := range m.Samples {
-			fmt.Printf("  [%d] rtt=%.0fms bw=%.0fM loss=%.1f%% jitter=%.0fms score=%.3f params=%v\n",
-				i, s.Feature.RttMs, s.Feature.BwMbps, s.Feature.LossPct*100, s.Feature.Jitter, s.Score, s.Params)
+			xp := ""
+			if s.ExpressPeakUs > 0 || s.T3GoodputDelta > 0 {
+				xp = fmt.Sprintf(" xpeak=%.0fus t3d=%dB", s.ExpressPeakUs, s.T3GoodputDelta)
+			}
+			fmt.Printf("  [%d] rtt=%.0fms bw=%.0fM loss=%.1f%% jitter=%.0fms score=%.3f%s params=%v\n",
+				i, s.Feature.RttMs, s.Feature.BwMbps, s.Feature.LossPct*100, s.Feature.Jitter, s.Score, xp, s.Params)
 		}
 		// Also replay all samples through a fresh UCB bandit and show per-param
 		// best arm + sample count — this is what UCB learned across all sessions.
@@ -232,6 +244,7 @@ func cmdModel(args []string) error {
 				{"fast_alpha", "", 4, 40, 4, 0},
 				{"loss_thresh", "", 2, 24, 2, 0},
 				{"hd_rho_max", "", 250, 400, 25, 0},
+				{"neoq_sparse_thresh", neoqSparseProc, 1514, 12112, 1514, 0},
 				{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 0},
 			}
 			ucb := newUCB(tuns, 0)

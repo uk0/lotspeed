@@ -14,6 +14,16 @@ type metrics struct {
 	bwMbps  float64
 	rttMs   float64
 	lossPct float64 // 0..1
+
+	// NeoQ experience signals, sampled in the SAME measure() window as bw/rtt/loss
+	// so all signals share one observation window. nqOK=false when the new sch_neoq
+	// qdisc isn't loaded (/proc/net/neoq_ml missing) — then the experience term is
+	// skipped and score() is exactly the legacy formula (backward compat).
+	nqOK           bool
+	t0PeakDelayUs  float64 // Express recent-peak delay (reset-on-read) — experience signal
+	t0DeltaPkts    uint64  // Express pkts THIS window (from a t0_pkts delta) — activity gate
+	t3GoodputDelta uint64  // Bulk bytes THIS window (from a t3_bytes delta)
+	bulkFlows      uint64  // concurrent bulk flows (mixed-workload gate for neoq_sparse_thresh)
 }
 
 // tunable parameter with a safe range.
@@ -30,6 +40,7 @@ type optimizer struct {
 	iface       string
 	interval    time.Duration
 	alpha, beta float64 // delay & loss penalty weights
+	gamma       float64 // Express-delay (experience) penalty weight; 0 => term off
 	tun         []tunable
 	ti          int // current tunable index
 	dir         int // probe direction +1/-1
@@ -41,6 +52,9 @@ type optimizer struct {
 	prevBytes   uint64
 	prevOut     uint64
 	prevRetr    uint64
+	prevT0Pkts  uint64  // NeoQ: cumulative Express pkts at last measure() (for delta)
+	prevT3Bytes uint64  // NeoQ: cumulative Bulk bytes at last measure() (for delta)
+	nqPrimed    bool    // NeoQ: prev*T0/T3 counters baselined (skip first-cycle bogus delta)
 	codelRtt    float64 // EWMA RTT (ms) driving NeoQ CoDel target/interval
 	smScore     float64 // EWMA-smoothed score — stable steering signal (抚平)
 	bestKnown   float64 // best smoothed score seen — stability reference
@@ -64,9 +78,38 @@ type optimizer struct {
 	// frozen (skipped when advancing o.ti). Unfrozen on a minRtt regime shift.
 	frozen       map[string]bool
 	freezeMinRtt float64 // minRtt at the time the last freeze was decided
+
+	// mixedWorkload (re-evaluated each OPT cycle from the live NeoQ stats) gates
+	// which params nextTi may select. NeoQ-only params (neoq_sparse_thresh) are a
+	// no-op unless the workload is genuinely mixed (bulk_flows>=1 AND Express active),
+	// so on single-flow/idle traffic we skip them in the rotation rather than let
+	// them absorb exploration credit — the neoq_boost lesson. Unlike frozen this is
+	// transient: re-checked every cycle, never persisted.
+	mixedWorkload bool
 }
 
-func newOptimizer(iface string, interval time.Duration) *optimizer {
+// neoqOnly reports whether a tunable only makes sense under a mixed (bulk +
+// interactive) workload. Such params are skipped in the probe rotation when the
+// current cycle isn't mixed (see nextTi). neoq_sparse_thresh demotes a flow from
+// the Express-eligible sparse class to bulk once it exceeds the byte threshold —
+// pure no-op when there's at most one flow or no Express traffic to protect.
+func (t *tunable) neoqOnly() bool { return t.name == "neoq_sparse_thresh" }
+
+// Experience-term constants (NeoQ Express-delay penalty).
+const (
+	// expressDelayBudgetUs is the Express (t0) recent-peak delay we treat as "fully
+	// spent". Express measures ~1-5us under pure bulk load today, so any sustained
+	// climb toward ms-scale means interactive traffic is queuing behind bulk. 5ms.
+	expressDelayBudgetUs = 5000.0
+	// expressActivityFloorPkts is the minimum Express pkts in a window for the delay
+	// reading to be trusted. Below it the tier is essentially idle and a stray peak
+	// is noise, not experience — so we neither score nor probe-gate on it (~50 pkts).
+	expressActivityFloorPkts = 50
+	// defaultGamma weights the Express-delay penalty in score(). 0 disables the term.
+	defaultGamma = 0.3
+)
+
+func newOptimizer(iface string, interval time.Duration, gamma float64) *optimizer {
 	o := &optimizer{
 		// beta=1.0 (goodput-accurate): the score measures wire throughput (iface
 		// tx+rx, which includes retransmits). beta*loss discounts that by the
@@ -74,7 +117,7 @@ func newOptimizer(iface string, interval time.Duration) *optimizer {
 		// retransmits beyond their goodput cost: on a lossy intercontinental link
 		// being aggressive (high retr) is the point, and the measured win is huge
 		// (+186% vs bbr; bbr collapses to 2M on loss spikes, aggressive holds 36-87M).
-		iface: iface, interval: interval, alpha: 0.5, beta: 1.0,
+		iface: iface, interval: interval, alpha: 0.5, beta: 1.0, gamma: gamma,
 		dir: 1, phase: "EXPLORE", bestScore: -1e9,
 		probedTi: -1, frozen: map[string]bool{},
 		tun: []tunable{
@@ -89,6 +132,15 @@ func newOptimizer(iface string, interval time.Duration) *optimizer {
 			// hd_rho_max kept high (250..400): full Hybla high-delay rho keeps
 			// high-RTT cwnd ramping aggressively. (Was observed stuck at 0 = boost off.)
 			{"hd_rho_max", "", 250, 400, 25, 400},
+			// neoq_sparse_thresh: CAKE-style sparse-gate byte threshold per 100ms
+			// window (1..8 MTUs); the window stays fixed at 100000us. A flow under
+			// this many bytes/window stays "sparse" (Express-eligible); above it it's
+			// demoted to bulk. Written as "100000 <bytes>" (see apply()). Default
+			// 3028 = 2*MTU = the kernel default. ANTI-NOISE: this arm is only SELECTED
+			// for probing when the cycle shows a genuinely mixed workload (see nextTi
+			// + mixedWorkload) — on single-flow/idle traffic it's a no-op and would
+			// otherwise absorb exploration credit (the neoq_boost lesson).
+			{"neoq_sparse_thresh", neoqSparseProc, 1514, 12112, 1514, 3028},
 			// NOTE: neoq_boost was REMOVED from the tun list (B4) — it is a no-op on
 			// single-flow traffic (it only reshapes the downstream rwnd across
 			// concurrent flows) so probing it (~28% of the old exploration budget)
@@ -193,10 +245,34 @@ func (o *optimizer) measure() metrics {
 		loss = float64(dretr) / float64(dout)
 	}
 	bw := float64(dbytes) * 8 / o.interval.Seconds() / 1e6
-	return metrics{bwMbps: bw, rttMs: avgSrttMs(), lossPct: loss}
+	m := metrics{bwMbps: bw, rttMs: avgSrttMs(), lossPct: loss}
+	// NeoQ experience signals, sampled in this same window so they line up with
+	// bw/rtt/loss. Absent file (qdisc not loaded) => nqOK stays false and score()
+	// falls back to the legacy formula. t0_pkts/t3_bytes are cumulative — diff them
+	// against the previous reading exactly like the iface byte counters above. The
+	// first primed cycle's delta is suppressed (counters could predate this run).
+	if nq, ok := readNeoqML(); ok {
+		m.nqOK = true
+		m.t0PeakDelayUs = float64(nq.t0PeakDelayUs)
+		m.bulkFlows = nq.bulkFlows
+		if o.nqPrimed {
+			m.t0DeltaPkts = nq.t0Pkts - o.prevT0Pkts
+			m.t3GoodputDelta = nq.t3Bytes - o.prevT3Bytes
+		}
+		o.prevT0Pkts, o.prevT3Bytes, o.nqPrimed = nq.t0Pkts, nq.t3Bytes, true
+	}
+	return m
 }
 
 // score = bw/peakBw - alpha*max(0, rtt/minRtt-1) - beta*loss
+//
+//	[ - gamma*clamp(t0_peak_delay_us/expressDelayBudgetUs, 0, 2.0) ]
+//
+// The bracketed Express-delay (experience) term is added ONLY when the NeoQ stats
+// are available (nqOK) AND there was meaningful Express traffic this cycle
+// (t0DeltaPkts > expressActivityFloorPkts). Without those — i.e. on a box with no
+// new qdisc, or an idle Express tier — the score is EXACTLY the legacy formula, so
+// gamma=0 (or stats-off) reproduces the prior behavior bit-for-bit.
 func (o *optimizer) score(m metrics) float64 {
 	// C3: decaying reference. peakBw ratchets up on a new peak but decays
 	// slowly otherwise, so a one-time lucky EXPLORE burst doesn't permanently
@@ -221,14 +297,25 @@ func (o *optimizer) score(m metrics) float64 {
 		}
 	}
 	s -= o.beta * m.lossPct
+	// Experience term: penalize Express (interactive/ACK/retransmit) queuing delay.
+	// Gated on stats availability + real Express activity so it never fires on a box
+	// without the new qdisc or on an idle tier (where a stray peak is just noise).
+	if o.gamma > 0 && m.nqOK && m.t0DeltaPkts > expressActivityFloorPkts {
+		s -= o.gamma * clampF(m.t0PeakDelayUs/expressDelayBudgetUs, 0, 2.0)
+	}
 	return s
 }
 
 func (o *optimizer) apply(t *tunable) {
 	v := strconv.Itoa(t.cur)
-	if t.path != "" {
+	switch {
+	case t.path == neoqSparseProc:
+		// Sparse gate expects "<window_us> <thresh_bytes>" (kernel sscanf "%u %u").
+		// Window is held fixed at 100000us; t.cur is the byte threshold.
+		_ = os.WriteFile(t.path, []byte("100000 "+v), 0o644)
+	case t.path != "":
 		_ = os.WriteFile(t.path, []byte(v), 0o644)
-	} else {
+	default:
 		_ = writeSysctl(t.name, v)
 	}
 }
@@ -287,6 +374,14 @@ func (o *optimizer) settle(rttMs float64) {
 	time.Sleep(d)
 	o.prevBytes = ifaceBytes(o.iface)
 	o.prevOut, o.prevRetr = readSnmpTcp()
+	// Re-baseline the NeoQ cumulative counters too, so the next measure() window's
+	// t0_pkts/t3_bytes deltas cover only steady state (consistent with the iface/snmp
+	// re-baseline above). This read also resets the kernel's reset-on-read Express
+	// peak, so the peak the next measure() sees is the settled window's, not the
+	// config-change transient's. Harmless no-op when the qdisc isn't loaded.
+	if nq, ok := readNeoqML(); ok {
+		o.prevT0Pkts, o.prevT3Bytes, o.nqPrimed = nq.t0Pkts, nq.t3Bytes, true
+	}
 }
 
 func clampDur(v, lo, hi time.Duration) time.Duration {
@@ -306,7 +401,8 @@ func cmdOptimize(args []string) error {
 	interval := 5 * time.Second
 	iface := ""
 	target := ""
-	algo := "coord" // "coord" (coordinate ascent) | "ucb" (UCB1 bandit per param)
+	algo := "coord"       // "coord" (coordinate ascent) | "ucb" (UCB1 bandit per param)
+	gamma := defaultGamma // Express-delay penalty weight; --gamma 0 disables the term
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--interval":
@@ -331,10 +427,17 @@ func cmdOptimize(args []string) error {
 				algo = args[i+1]
 				i++
 			}
+		case "--gamma":
+			if i+1 < len(args) {
+				if g, e := strconv.ParseFloat(args[i+1], 64); e == nil && g >= 0 {
+					gamma = g
+				}
+				i++
+			}
 		}
 	}
 	if iface == "" {
-		return fmt.Errorf("usage: optimize --iface <dev> [--interval N] [--target IP] [--algo coord|ucb]")
+		return fmt.Errorf("usage: optimize --iface <dev> [--interval N] [--target IP] [--algo coord|ucb] [--gamma G]")
 	}
 	// Always record samples passively from whatever real traffic the kernel
 	// is moving. --target is now purely informational — if set, it's stamped
@@ -345,12 +448,14 @@ func cmdOptimize(args []string) error {
 	rttSamples := []float64{}
 	bwSamples := []float64{}
 	type windowBestT struct {
-		score        float64
-		params       paramSet
-		loss         float64
-		changedParam string  // B1: the coordinate whose move reached this best score
-		delta        float64 // B1: that move's score change (raw, pre-conditioning)
-		badLink      bool    // B2: was this window-best captured during link weather?
+		score         float64
+		params        paramSet
+		loss          float64
+		changedParam  string  // B1: the coordinate whose move reached this best score
+		delta         float64 // B1: that move's score change (raw, pre-conditioning)
+		badLink       bool    // B2: was this window-best captured during link weather?
+		expressPeakUs float64 // NeoQ: Express recent-peak delay at the best cycle
+		t3Goodput     uint64  // NeoQ: bulk bytes moved in the best cycle's window
 	}
 	windowBest := windowBestT{score: -1e9}
 	windowCycle := 0
@@ -365,7 +470,7 @@ func cmdOptimize(args []string) error {
 		return fmt.Errorf("set CC=lotspeed (need root?): %w", err)
 	}
 
-	o := newOptimizer(iface, interval)
+	o := newOptimizer(iface, interval, gamma)
 	// UCB bandit: pre-load it with all prior samples so a fresh process
 	// inherits learning from previous runs (crucial for systemd auto-restart).
 	// Instantiated in BOTH modes: in coord mode it backs delta-credit (B1) and the
@@ -415,15 +520,28 @@ func cmdOptimize(args []string) error {
 			fmt.Printf("warm-start from model (k=%d samples): %d params applied\n", len(mdl.Samples), applied)
 		}
 	}
-	fmt.Printf("optimize: iface=%s interval=%v phase=EXPLORE (aggressive grab, tx+rx)\n", iface, interval)
+	nq0, nqUp := readNeoqML()
+	fmt.Printf("optimize: iface=%s interval=%v gamma=%.2f neoq_ml=%v phase=EXPLORE (aggressive grab, tx+rx)\n",
+		iface, interval, gamma, nqUp)
 	o.prevBytes = ifaceBytes(iface)
 	o.prevOut, o.prevRetr = readSnmpTcp()
+	// Prime the NeoQ cumulative-counter baseline alongside iface/snmp so the first
+	// measure() produces a real delta (not a suppressed first-cycle one).
+	if nqUp {
+		o.prevT0Pkts, o.prevT3Bytes, o.nqPrimed = nq0.t0Pkts, nq0.t3Bytes, true
+	}
 
 	for {
 		time.Sleep(interval)
 		m := o.measure()
 		sc := o.score(m)
 		ts := time.Now().Format("15:04:05")
+
+		// Anti-noise gate for NeoQ-only params: a genuinely mixed workload needs
+		// concurrent bulk flows AND live Express traffic this window. Re-evaluated
+		// every cycle; consumed by nextTi to keep neoq_sparse_thresh out of the probe
+		// rotation when it would be a no-op. Stays false when stats are unavailable.
+		o.mixedWorkload = m.nqOK && m.bulkFlows >= 1 && m.t0DeltaPkts >= expressActivityFloorPkts
 
 		// N3: drive RTT-adaptive CoDel for NeoQ from the measured RTT (smoothed).
 		if m.rttMs > 0 {
@@ -493,6 +611,8 @@ func cmdOptimize(args []string) error {
 				windowBest.delta = 0
 			}
 			windowBest.badLink = badLink
+			windowBest.expressPeakUs = m.t0PeakDelayUs
+			windowBest.t3Goodput = m.t3GoodputDelta
 		}
 		windowCycle++
 		if windowCycle >= recordEveryN && len(rttSamples) >= 3 && len(bwSamples) >= 3 && windowBest.params != nil {
@@ -510,13 +630,13 @@ func cmdOptimize(args []string) error {
 			// params to avoid on bad-link states (high loss / RTT spike).
 			if feat.BwMbps < 5 {
 				fmt.Printf("    -> sample SKIPPED (no real traffic: bw=%.0fM)\n", feat.BwMbps)
-			} else if err := loadModel().record(feat, windowBest.params, windowBest.score, windowBest.changedParam, windowBest.delta); err == nil {
+			} else if err := loadModel().record(feat, windowBest.params, windowBest.score, windowBest.changedParam, windowBest.delta, windowBest.expressPeakUs, windowBest.t3Goodput); err == nil {
 				tag := "good"
 				if windowBest.badLink || windowBest.score < 0 {
 					tag = "BAD-LINK"
 				}
-				fmt.Printf("    -> sample recorded [%s] (model now has %d, score=%.3f, bw=%.0fM loss=%.1f%% changed=%s d=%.3f)\n",
-					tag, len(loadModel().Samples), windowBest.score, feat.BwMbps, feat.LossPct*100, windowBest.changedParam, windowBest.delta)
+				fmt.Printf("    -> sample recorded [%s] (model now has %d, score=%.3f, bw=%.0fM loss=%.1f%% changed=%s d=%.3f xpeak=%.0fus t3d=%dB)\n",
+					tag, len(loadModel().Samples), windowBest.score, feat.BwMbps, feat.LossPct*100, windowBest.changedParam, windowBest.delta, windowBest.expressPeakUs, windowBest.t3Goodput)
 			}
 			windowCycle = 0
 			windowBest = windowBestT{score: -1e9}
@@ -715,23 +835,37 @@ func cmdOptimize(args []string) error {
 		// (B5) so the next measure() window covers only the new config's steady
 		// state — not the old config's tail plus this one's ramp-up.
 		o.probedTi, o.probedVal, o.prevScore, o.havePrev = o.ti, nv, o.smScore, (nv != prev)
-		fmt.Printf("%s OPT bw=%.0f rtt=%.1f loss=%.2f%% sm=%.3f best=%.3f | next %s=%d (settle)\n",
-			ts, m.bwMbps, m.rttMs, m.lossPct*100, o.smScore, o.bestScore, t.name, nv)
+		nqInfo := ""
+		if m.nqOK {
+			mix := ""
+			if o.mixedWorkload {
+				mix = " MIXED"
+			}
+			nqInfo = fmt.Sprintf(" | xpeak=%.0fus bulk=%d t0d=%d%s", m.t0PeakDelayUs, m.bulkFlows, m.t0DeltaPkts, mix)
+		}
+		fmt.Printf("%s OPT bw=%.0f rtt=%.1f loss=%.2f%% sm=%.3f best=%.3f | next %s=%d (settle)%s\n",
+			ts, m.bwMbps, m.rttMs, m.lossPct*100, o.smScore, o.bestScore, t.name, nv, nqInfo)
 		o.settle(m.rttMs)
 	}
 }
 
-// nextTi returns the index of the next non-frozen tunable after i, wrapping
-// around. If every tunable is frozen it returns the next index anyway (so the
-// loop still advances and the cycle still measures/records — freeze only steers
-// which param we PROBE, it must never deadlock the loop).
+// nextTi returns the index of the next SELECTABLE tunable after i, wrapping
+// around. A tunable is skipped when (a) it's frozen (B4 effect-size), or (b) it's
+// a NeoQ-only param and the current cycle isn't a mixed workload (the anti-noise
+// gate — neoqOnly params are no-ops on single-flow/idle traffic and must not
+// absorb credit). If every tunable is skipped it returns the next index anyway so
+// the loop never deadlocks — selection only steers which param we PROBE.
 func (o *optimizer) nextTi(i int) int {
 	n := len(o.tun)
 	for k := 1; k <= n; k++ {
 		j := (i + k) % n
-		if !o.frozen[o.tun[j].name] {
-			return j
+		if o.frozen[o.tun[j].name] {
+			continue
 		}
+		if o.tun[j].neoqOnly() && !o.mixedWorkload {
+			continue
+		}
+		return j
 	}
 	return (i + 1) % n
 }

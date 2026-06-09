@@ -197,6 +197,12 @@ struct neoq_xstats {
 struct neoq_skb_cb {
     u64     enqueue_time;
     u32     adjusted_len;
+    /* === NEW: retrans 免疫标记 ===
+     * retrans 判定发生在 enqueue (classify 路径), 丢弃判定在 dequeue (CoDel)。
+     * 该标记随 skb 旅行, 使 dequeue 无需在 highest_seq 已前移后重新解析 TCP seq。
+     * cb 布局: 8(enqueue_time)+4(adjusted_len)+1(is_retrans)=13B, 经 u64 对齐 ->
+     * sizeof(struct)=16B <= QDISC_CB_PRIV_LEN(20B), 由下方 validate 保证。 */
+    u8      is_retrans;
 };
 
 static struct neoq_skb_cb *get_neoq_cb(const struct sk_buff *skb)
@@ -286,6 +292,10 @@ struct neoq_tier {
     u64                 avg_delay;
     u64                 peak_delay;
     u64                 base_delay;
+    /* === NEW: 供 /proc/net/neoq_ml 的"近期峰值", read-on-reset 语义 ===
+     * 与 peak_delay 同步更新, 但仅 neoq_ml 读取时清零, 使 tuner 看到最近窗口的峰值
+     * 而非全时段峰值。human-readable 的 /proc/net/neoq 仍用 peak_delay (全时段)。 */
+    u64                 peak_delay_ml;
 
     /* CoDel config */
     u64                 codel_interval;
@@ -333,6 +343,13 @@ struct neoq_sched_data {
     /* Global stats */
     u64                 total_packets;
     u64                 total_bytes;
+
+    /* === NEW: retrans 免疫效果计数 (供 /proc/net/neoq_ml) ===
+     * retrans_seen: enqueue 处判为 retrans 的包数;
+     * retrans_protected: dequeue 处本应被 CoDel 丢弃、却因免疫而保留(交付或仅 ECN 标记)
+     *   的 retrans 包数 -> 即本特性的有效性计数。 */
+    u64                 retrans_seen;
+    u64                 retrans_protected;
 
     struct qdisc_watchdog watchdog;
 };
@@ -1211,6 +1228,12 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     /* === 确认纳入: 此后才推进 flow 生命周期状态 (只统计真正入队的包) === */
     update_flow_state(flow, is_retrans);
 
+    /* retrans 免疫标记随 skb 旅行到 dequeue (CoDel 丢弃判定处)。
+     * 仅对真正入队的包置位/计数 (溢出丢弃路径已提前 return)。 */
+    get_neoq_cb(skb)->is_retrans = is_retrans ? 1 : 0;
+    if (is_retrans)
+        q->retrans_seen++;
+
     /* === Flow 链表管理必须在字节记账之前 ===
      * 迁移会把 flow->backlog (本包之前的旧 backlog) 在档位间整体搬移; 若先把本包的 len
      * 计入, 迁移会重复计 len。故先迁移/挂链使 flow->tier == tier_idx, 再统一记账。 */
@@ -1386,9 +1409,27 @@ retry:
             goto begin;
         }
 
-        /* CoDel - but don't drop last packet */
+        /* CoDel - but don't drop last packet。
+         * 注: codel_should_drop 总是先于免疫判定执行, CoDel 状态机 (count/drop_next/
+         * dropping/rec_inv_sqrt) 对每个包 (含 retrans) 一律照常推进; 免疫只改变"本包"
+         * 的动作 (丢 vs 交付), 绝不篡改状态转移。故非 retrans 流量的状态机与改前逐字
+         * 一致, 不会卡死成恒丢/恒不丢; retrans 已"消费"掉这一次 drop token, 下一次
+         * due 触发时落到届时队首的包 (即把丢弃动作顺延到下一个非 retrans 包)。 */
         if (!codel_should_drop(flow, tier, now, skb) || !flow->head)
             break;
+
+        /* === NEW: retrans 免疫 (仅针对 CoDel 触发的丢弃) ===
+         * 250ms RTT 下丢一个重传包会让恢复时间翻倍, 是最坏结果。本应被丢的 retrans:
+         * 若 ECN-capable 则改打 CE (拥塞信号但不丢包); 否则直接交付。两种情况都 break
+         * (交付该包), 绝不落入下方丢弃路径。limit/溢出驱逐仍对所有包生效 (满队列就是满)。 */
+        if (get_neoq_cb(skb)->is_retrans) {
+            if (INET_ECN_set_ce(skb)) {
+                tier->ecn_marked++;
+                flow->ecn_marked = 1;
+            }
+            q->retrans_protected++;
+            break;
+        }
 
         /* Try ECN mark first */
         if (q->ecn && INET_ECN_set_ce(skb)) {
@@ -1413,6 +1454,9 @@ retry:
     tier->avg_delay = ewma(tier->avg_delay, delay, 8);
     tier->peak_delay = ewma(tier->peak_delay, delay,
                             delay > tier->peak_delay ? 2 : 8);
+    /* 近期峰值: 取真实最大值 (而非 EWMA), 由 neoq_ml 读取时清零 -> "上次读取以来的峰值"。 */
+    if (delay > tier->peak_delay_ml)
+        tier->peak_delay_ml = delay;
     if (delay < tier->base_delay || tier->base_delay == ~0ULL)
         tier->base_delay = delay;
 
@@ -1489,6 +1533,7 @@ static void neoq_clear_tier(struct neoq_tier *tier)
     tier->bulk_cnt = 0;
     tier->backlog = 0;
     tier->tier_deficit = 0;
+    tier->peak_delay_ml = 0;    /* 近期峰值随复位归零 */
 }
 
 static int neoq_init(struct Qdisc *sch, struct nlattr *opt,
@@ -1582,6 +1627,8 @@ static void neoq_reset(struct Qdisc *sch)
 
     q->memory_used = 0;
     q->flows_cnt = 0;
+    q->retrans_seen = 0;        /* retrans 免疫计数随复位归零 */
+    q->retrans_protected = 0;
 }
 
 static void neoq_destroy(struct Qdisc *sch)
@@ -2030,6 +2077,76 @@ static const struct proc_ops neoq_sparse_proc_ops = {
 };
 static struct proc_dir_entry *neoq_sparse_entry;
 
+/* === /proc/net/neoq_ml: 机器可读单行 key=value, 供 Go tuner 每隔数秒解析 ===
+ * 与 neoq_stats_show 共用 neoq_lock。键名短且稳定 (即 CLI 的 API), 切勿随意改名。
+ * peak_delay_us 为"上次读取以来"的峰值 -> 本处 read-on-reset 清零 (human-readable 的
+ * /proc/net/neoq 不受影响, 仍是全时段 EWMA 峰值)。 */
+static int neoq_ml_show(struct seq_file *m, void *v)
+{
+    struct Qdisc *sch;
+    struct neoq_sched_data *q;
+    u32 sparse_total = 0, bulk_total = 0;
+    int i;
+
+    spin_lock_bh(&neoq_lock);
+    sch = neoq_active_qdisc;
+    if (!sch) {
+        spin_unlock_bh(&neoq_lock);
+        /* 无活动实例: 仍输出零值单行, 使 tuner 解析逻辑统一 (无需特判空文件)。 */
+        seq_puts(m,
+            "qlen=0 mem=0 flows=0 sparse_flows=0 bulk_flows=0 "
+            "t0_pkts=0 t0_bytes=0 t0_drops=0 t0_marks=0 t0_avg_delay_us=0 t0_peak_delay_us=0 "
+            "t1_pkts=0 t1_bytes=0 t1_drops=0 t1_marks=0 t1_avg_delay_us=0 t1_peak_delay_us=0 "
+            "t2_pkts=0 t2_bytes=0 t2_drops=0 t2_marks=0 t2_avg_delay_us=0 t2_peak_delay_us=0 "
+            "t3_pkts=0 t3_bytes=0 t3_drops=0 t3_marks=0 t3_avg_delay_us=0 t3_peak_delay_us=0 "
+            "retrans_seen=0 retrans_protected=0\n");
+        return 0;
+    }
+
+    q = qdisc_priv(sch);
+
+    for (i = 0; i < NEOQ_MAX_TIERS; i++) {
+        sparse_total += q->tiers[i].sparse_cnt;
+        bulk_total += q->tiers[i].bulk_cnt;
+    }
+
+    seq_printf(m, "qlen=%u mem=%u flows=%u sparse_flows=%u bulk_flows=%u",
+               sch->q.qlen, q->memory_used, q->flows_cnt,
+               sparse_total, bulk_total);
+
+    for (i = 0; i < NEOQ_MAX_TIERS; i++) {
+        struct neoq_tier *tier = &q->tiers[i];
+        u64 avg_us = tier->avg_delay / 1000;
+        u64 peak_us = tier->peak_delay_ml / 1000;
+
+        seq_printf(m,
+            " t%d_pkts=%llu t%d_bytes=%llu t%d_drops=%u t%d_marks=%u t%d_avg_delay_us=%llu t%d_peak_delay_us=%llu",
+            i, tier->packets, i, tier->bytes, i, tier->dropped,
+            i, tier->ecn_marked, i, avg_us, i, peak_us);
+
+        tier->peak_delay_ml = 0;        /* read-on-reset: 清掉已上报的近期峰值 */
+    }
+
+    seq_printf(m, " retrans_seen=%llu retrans_protected=%llu\n",
+               q->retrans_seen, q->retrans_protected);
+
+    spin_unlock_bh(&neoq_lock);
+    return 0;
+}
+
+static int neoq_ml_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, neoq_ml_show, NULL);
+}
+
+static const struct proc_ops neoq_ml_proc_ops = {
+    .proc_open    = neoq_ml_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+};
+static struct proc_dir_entry *neoq_ml_entry;
+
 /* ========================================================================
  * Module Registration
  * ======================================================================== */
@@ -2085,6 +2202,10 @@ static int __init neoq_module_init(void)
     if (neoq_sparse_entry)
         pr_info("NeoQ: Sparse gate window/thresh at /proc/net/neoq_sparse\n");
 
+    neoq_ml_entry = proc_create("neoq_ml", 0444, init_net.proc_net, &neoq_ml_proc_ops);
+    if (neoq_ml_entry)
+        pr_info("NeoQ: Machine-readable stats at /proc/net/neoq_ml\n");
+
     return 0;
 }
 
@@ -2100,6 +2221,8 @@ static void __exit neoq_module_exit(void)
         proc_remove(neoq_codel_entry);
     if (neoq_sparse_entry)
         proc_remove(neoq_sparse_entry);
+    if (neoq_ml_entry)
+        proc_remove(neoq_ml_entry);
 
     unregister_qdisc(&neoq_qdisc_ops);
     pr_info("NeoQ: Unloaded\n");

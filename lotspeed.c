@@ -28,6 +28,8 @@
 #include <linux/spinlock.h>
 #include <linux/random.h>
 #include <linux/inet_diag.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 /* ============== 版本和常量 ============== */
 
@@ -834,6 +836,14 @@ static DEFINE_SPINLOCK(ls_hist_lock);
 static struct kmem_cache *ls_hist_cache;
 static atomic_t ls_hist_count = ATOMIC_INIT(0);
 
+/* hist v3 观测计数: hits = lookup 通过 TTL+样本数闸门的次数;
+ * seeds = bw 种子实际写入滤波器的次数。
+ * lookup 跑在 RCU 读侧、不持 ls_hist_lock,递增无锁,故用 atomic64。
+ * 经 hist_clear 触发器与表一并清零。 */
+static atomic64_t ls_hist_hits = ATOMIC64_INIT(0);
+static atomic64_t ls_hist_seeds = ATOMIC64_INIT(0);
+static struct proc_dir_entry *ls_hist_proc;
+
 /* sysctl write-only trigger: `echo 1 > /proc/sys/net/ipv4/lotspeed/hist_clear`
  * flushes the whole per-IP cache. Used by CLI to nuke poisoned entries from
  * earlier broken runs. */
@@ -855,9 +865,42 @@ static int ls_hist_clear_handler(const struct ctl_table *table, int write,
 		freed++;
 	}
 	atomic_set(&ls_hist_count, 0);
+	/* 观测计数随表清零, A/B 实验可从零起算 */
+	atomic64_set(&ls_hist_hits, 0);
+	atomic64_set(&ls_hist_seeds, 0);
 	spin_unlock_bh(&ls_hist_lock);
 	pr_info("lotspeed: hist_clear flushed %d entries\n", freed);
 	*ppos += *lenp;
+	return 0;
+}
+
+/* hist v3 观测: /proc/net/lotspeed_hist 只读 dump。
+ * 首行汇总: hits=<N> seeds=<N> entries=<N>,随后每表项一行。
+ *
+ * 锁选择: 本表所有释放路径 (hist_update 淘汰 / hist_clear / 模块卸载)
+ * 均为 hash_del + 立即 kmem_cache_free,并未经 RCU 宽限期延迟释放
+ * (表项里的 rcu_head 从未接入 kfree_rcu)。RCU 读侧遍历挡不住表项在
+ * 遍历途中被释放,故此处持 ls_hist_lock 自旋锁遍历。
+ * seq_printf 只写预分配缓冲区、不睡眠,持锁安全;全表扫描的代价与
+ * 既有淘汰路径 (hash_for_each 找最旧项) 相当。 */
+static int ls_hist_proc_show(struct seq_file *m, void *v)
+{
+	struct ls_hist_entry *entry;
+	int bkt;
+	u64 now = get_jiffies_64();
+
+	spin_lock_bh(&ls_hist_lock);
+	seq_printf(m, "hits=%llu seeds=%llu entries=%d\n",
+	           (u64)atomic64_read(&ls_hist_hits),
+	           (u64)atomic64_read(&ls_hist_seeds),
+	           atomic_read(&ls_hist_count));
+	hash_for_each(ls_hist_table, bkt, entry, node) {
+		seq_printf(m, "daddr=%pI4 bw_bytes_sec=%llu rtt_min_us=%u samples=%u age_ms=%u\n",
+		           &entry->daddr, entry->bw_bytes_sec,
+		           entry->rtt_min_us, entry->sample_cnt,
+		           jiffies_to_msecs(now - entry->last_update_jif));
+	}
+	spin_unlock_bh(&ls_hist_lock);
 	return 0;
 }
 
@@ -1507,18 +1550,23 @@ static void ls_hist_lookup(struct sock *sk)
 				u64 bw_seed = div64_u64(entry->bw_bytes_sec << BW_SCALE,
 				                        (u64)mss * USEC_PER_SEC);
 
+				/* v3 观测: 命中 = 通过 TTL+样本数闸门 */
+				atomic64_inc(&ls_hist_hits);
+
 				if (bw_seed > 0) {
 					/* 折扣后写入 bw 滤波器: 只动 bw_hi[0] (即时生效),
 					 * 不碰 bw_hi[1] (留给真实样本) / bw_lo / inflight 界。 */
 					u32 seed = (u32)(bw_seed * 7 / 10);
 					u32 floor = READ_ONCE(ls_params.hist_min_cwnd_bound);
 					u32 cwnd;
+					u64 rate;
 					/* 用于 cwnd 计算的 RTT: 握手 srtt (SYN-ACK 后, usec);
 					 * 为零则退回 entry->rtt_min_us — 仅参与本地计算,
 					 * 绝不写回 ls->min_rtt_us。 */
 					u32 rtt_us = (tp->srtt_us >> 3) ? : entry->rtt_min_us;
 
 					ls->bw_hi[0] = seed;
+					atomic64_inc(&ls_hist_seeds);
 
 					/* 适度 cwnd: seed 带宽 × 握手 RTT 的 BDP (gain=1.0,
 					 * 与 ls_bdp 同式但不依赖 ls->min_rtt_us)。 */
@@ -1529,6 +1577,19 @@ static void ls_hist_lookup(struct sock *sk)
 					/* 保持 STARTUP: 只种,不冻结,仍在新路探测真实带宽。 */
 					ls_update_high_delay_path(sk);
 					ls_update_rho(sk);
+
+					/* v3: pacing 立即生效。sk_pacing_rate 只在每 ACK
+					 * 的 cong_control 路径重算,只种 bw_hi[0] 的话,
+					 * 首个数据飞行仍按内核初始 pacing 速率发出,种子
+					 * 要等第一个 ACK 才真正起效 — 白浪费 1 个 RTT,
+					 * 短流的收益全淹没在噪声里。此处直接按当前
+					 * STARTUP pacing gain 预置 (ls_enter_startup 已在
+					 * ls_init 中先行设置;ls_bw_to_pacing_rate 内部
+					 * 已按 sk_max_pacing_rate 钳制)。首个 ACK 起由
+					 * cong_control 重算接管,种子偏差可自我修正。 */
+					rate = ls_bw_to_pacing_rate(sk, seed,
+					                            ls->pacing_gain);
+					WRITE_ONCE(sk->sk_pacing_rate, rate);
 				}
 			}
 			break;
@@ -2523,8 +2584,21 @@ static int __init lotspeed_v2_init(void)
 		hash_init(ls_hist_table);
 	}
 
+	/* hist v3 观测: 只读统计 dump (无条件注册 —
+	 * hist 关闭时表恒空,正好用于 on/off A/B 对照)。 */
+	ls_hist_proc = proc_create_single("lotspeed_hist", 0444,
+	                                  init_net.proc_net,
+	                                  ls_hist_proc_show);
+	if (!ls_hist_proc) {
+		if (ls_hist_cache)
+			kmem_cache_destroy(ls_hist_cache);
+		unregister_net_sysctl_table(ls_sysctl_header);
+		return -ENOMEM;
+	}
+
 	ret = tcp_register_congestion_control(&lotspeed_v2_ops);
 	if (ret) {
+		proc_remove(ls_hist_proc);
 		if (ls_hist_cache)
 			kmem_cache_destroy(ls_hist_cache);
 		unregister_net_sysctl_table(ls_sysctl_header);
@@ -2545,6 +2619,10 @@ static void __exit lotspeed_v2_exit(void)
 	int bkt;
 
 	tcp_unregister_congestion_control(&lotspeed_v2_ops);
+
+	/* 先摘 proc 项: proc_remove 会等在途读者退出,之后 dump 不可能
+	 * 再运行,后面清表 / 销毁 slab 不存在并发窗口。 */
+	proc_remove(ls_hist_proc);
 
 	if (ls_hist_cache) {
 		spin_lock_bh(&ls_hist_lock);

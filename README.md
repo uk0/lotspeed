@@ -6,7 +6,7 @@
 
 
 <div align=center>
-    <img src="https://github.com/uk0/lotspeed/blob/merge_bl/logo.png" width="400" height="400" />
+    <img src="https://github.com/uk0/lotspeed/blob/adaptive-accel/logo.png" width="400" height="400" />
 </div>
 
 
@@ -254,7 +254,7 @@ sysctl 可调参数 (/proc/sys/net/ipv4/lotspeed/)
 
 
 <div align=center>
-    <img src="https://github.com/uk0/lotspeed/blob/merge_bl/zeta-tcp.png" width="1024" height="768" />
+    <img src="https://github.com/uk0/lotspeed/blob/adaptive-accel/zeta-tcp.png" width="1024" height="768" />
 </div>
 
 
@@ -294,7 +294,7 @@ iperf3 -c green1 -p 35201 -R -t 30
 
 | 项 | 值 |
 |---|---|
-| 加速端 | 美东 colo VPS (198.23.x.x), kernel `6.18.2-bbrv3`, 仅加速端部署 lotspeed + sch_neoq + lotspeedctl |
+| 加速端 | 美东 VPS, kernel `6.18.2-bbrv3`, 仅加速端部署 lotspeed + sch_neoq + lotspeedctl |
 | 接收端 | 国内测试机 (NAT 出口), 标准 bbr 客户端, **什么都不装** (单边加速) |
 | 链路 | RTT 13↔264ms 跨时段漂移, 丢包 0.8%↔10%, 国际链路常态抖动 |
 | 方向 | `iperf3 -R` 接收端拉加速端 (下载方向), 30s/轮, 交替轮换抵消链路漂移 |

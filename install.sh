@@ -5,7 +5,7 @@
 # GitHub: https://github.com/uk0/lotspeed
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/merge_bl/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/adaptive-accel/install.sh | sudo bash
 #   Or run locally: sudo bash install.sh
 #
 
@@ -13,7 +13,7 @@ set -e
 
 # ================= 配置区域 =================
 GITHUB_REPO="uk0/lotspeed"
-GITHUB_BRANCH="merge_bl"
+GITHUB_BRANCH="adaptive-accel"
 INSTALL_DIR="/opt/lotspeed"
 VERSION="2.2"
 CONFIG_FILE="/etc/lotspeed.conf"
@@ -1430,6 +1430,10 @@ show_completion() {
     print_box_row "Auto-Tune (Network Optimization)" "center" "${CYAN}"
     print_kv_row "Analyze Network" "$INSTALL_DIR/lotspeed-autotune.sh" "${CYAN}"
     print_kv_row "Start Daemon" "$INSTALL_DIR/lotspeed-autotune.sh daemon" "${CYAN}"
+    print_box_div "${CYAN}"
+    print_box_row "Adaptive Learning Loop (lotspeedctl, optional)" "center" "${CYAN}"
+    print_kv_row "Build & install" "see README 'lotspeedctl' section" "${CYAN}"
+    print_kv_row "Observability" "cat /proc/net/{neoq_ml,lotspeed_hist}" "${CYAN}"
     print_box_div "${CYAN}"
     print_box_row "Run 'lotspeed' for interactive menu" "center" "${CYAN}"
     print_box_bottom "${CYAN}"

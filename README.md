@@ -1,5 +1,6 @@
-### lotspeed merge_bl (⚠️实验性分支，谨慎使用)
+### lotspeed adaptive-accel — 自适应加速分支
 
+> CC 抗丢包 + NeoQ 行为化调度 + lotspeedctl 学习闭环 + hist 短流加速。全部特性在真实洲际链路上 A/B 验证（见 [CHANGELOG](CHANGELOG.md) 与下方测试报告）。
 
 * 前置条件 `kernel 6.18.2-bbrv3 or later`
 
@@ -110,9 +111,9 @@ Files:
 
 ```bash
 # 1. install lotspeed module and helper script
-curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/refs/heads/merge_bl/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/refs/heads/adaptive-accel/install.sh | sudo bash
 #   or
-wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/refs/heads/merge_bl/install.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/refs/heads/adaptive-accel/install.sh | sudo bash
 
 ```
 
@@ -125,7 +126,7 @@ wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/refs/heads/merge_bl/ins
 
 # 下载代码/编译
 
-git clone https://github.com/uk0/lotspeed.git 
+git clone -b adaptive-accel https://github.com/uk0/lotspeed.git
 
 cd lotspeed && make
 
@@ -198,10 +199,11 @@ ss -ti
 - 防止瞬时抖动导致吞吐下滑
 - 冻结期保持 85% 窗口下限
 
-6. 历史缓存
-- 按目标 IP 缓存 BW/RTT 信息
-- 重连时快速恢复到最佳状态
-- TTL 20 分钟，最多 8192 条目
+6. 历史缓存 (hist v3 — 短流加速)
+- 按目标 IP 缓存带宽，新连接直接种 bw 滤波器 (×0.7 折扣) 并立即设置 pacing rate — 跳过慢启动
+- 长连接每 10s 周期写入 (隧道场景也能填充缓存)，连接关闭时最终落盘
+- 实测: 256KB 短流完成时间中位 -19%、尾延迟 -49% (暖缓存, 100% 命中)
+- TTL 20 分钟，最多 8192 条目; 可观测: `cat /proc/net/lotspeed_hist` (hits/seeds 计数 + 全表)
 
 7. 快速路径优化
 - app-limited 且无拥塞信号时跳过模型更新
@@ -230,8 +232,11 @@ sysctl 可调参数 (/proc/sys/net/ipv4/lotspeed/)
 |          | ecn_alpha_gain | 16     | EWMA 增益 (1/16)   |
 |          | ecn_thresh     | 50     | ECN 阈值 (%)       |
 | 快速路径 | fast_path      | 1      | 启用快速路径       |
-| 历史     | hist_enable    | 1      | 启用历史缓存       |
+| 抗丢包   | loss_thresh    | 2      | 丢包率门控 (%): 实测丢包低于该值不退避 — 洲际抗丢包核心 |
+| 启动     | startup_gain   | 300    | STARTUP 增益 (3x)  |
+| 历史     | hist_enable    | 1      | 启用历史缓存 (v3 种 bw+pacing) |
 |          | hist_ttl_sec   | 1200   | 缓存 TTL (20分钟)  |
+|          | hist_min_cwnd_bound | 64 | hist 种子 cwnd 兜底下界 |
 
   ---
 适用场景
@@ -487,22 +492,36 @@ systemctl enable --now lotspeedctl
 体系的另一半在 NeoQ qdisc 侧,都通过 `/proc/net/` 接口运行时可调,daemon/optimize 会自动用上:
 
 ```bash
-# 游戏/网页优先级 (流量自动进 EXPRESS tier)
+# 端口提示 (仅对小包 <256B 提速; 大包按行为分类, 端口提示不再放行 bulk)
 echo "+27015 +443 +5201" > /proc/net/neoq_prio
 echo "clear" > /proc/net/neoq_prio
 cat /proc/net/neoq_prio
 
-# 下行 rwnd 诱骗 (单边双向加速;100=off,>=100 倍数放大出站 ACK 窗口)
-echo 250 > /proc/net/neoq_boost
+# sparse/bulk 行为门控: 窗口内速率低于阈值的流保持 Express/High (网页/交互),
+# 持续超阈值自动降级 Bulk (下载) — 临界点按流自适应, 与端口无关
+echo "100000 3028" > /proc/net/neoq_sparse     # 100ms 窗口, 3028B 阈值 (≈0.24Mbps)
+
+# Express 防滥用: 上一窗口重传占比超过该值的 bulk 流, 其重传不再升 Express (0=关)
+echo 15 > /proc/net/neoq_retrans
+
+# 下行 rwnd 诱骗 — 默认 100=off。egress-only qdisc 无法获知对端 window scaling,
+# 该改写无法做对, 仅留作显式实验开关, 不建议开启
+cat /proc/net/neoq_boost
 
 # CoDel target/interval (高 RTT 链路需要放大 target,默认 5ms 适合 LAN)
 echo "150000 300000" > /proc/net/neoq_codel    # 150ms target, 300ms interval
+
+# 机器可读统计 (lotspeedctl 体验闭环消费; 每档 pkts/bytes/drops/延迟 + 重传计数)
+cat /proc/net/neoq_ml
+# CC 侧 hist 缓存可观测 (hits/seeds + 全表)
+cat /proc/net/lotspeed_hist
 ```
 
 ### lotspeed CC 注意事项
 
-- **`hist_enable`**:per-IP 历史缓存。开启后早期版本可能命中坏 entry 导致连接卡住。生产建议先 `echo 0 > /proc/sys/net/ipv4/lotspeed/hist_enable` 或者 `lotspeedctl hist-clear`,再开启;新版内核已加 `hist_min_cwnd_bound` 兜底与写入前 sanity check
-- **卸载顺序**:务必先 `sysctl -w net.ipv4.tcp_congestion_control=bbr` 再 `rmmod`,否则旧 socket 卡住模块卸不掉
+- **`hist_enable`**:per-IP 历史缓存,v3 后建议开启(短流加速实测有效)。早期毒化 bug 已由 `hist_min_cwnd_bound` 兜底 + 写入 sanity check + 种子自愈(错误种子一个滤波窗内被真实样本覆盖)三重防护;诊断/重置用 `echo 1 > /proc/sys/net/ipv4/lotspeed/hist_clear`,行为可由 `cat /proc/net/lotspeed_hist` 实时观测
+- **`optimize --target <ip>`**:强烈建议带上目标 IP — 混合出口(近端 CDN 几 ms + 洲际数百 ms 并存)下全机测量会被近端连接污染 minRtt,学习信号失真;per-target 模式下 rtt/loss/bw 全部来自该目标的 socket 增量
+- **卸载顺序**:务必先 `sysctl -w net.ipv4.tcp_congestion_control=bbr` 再 `rmmod`。注意三类隐蔽引用持有者:执行 rmmod 的 ssh 会话自己(需在切换 CC 之后新建会话)、LISTEN socket(服务在 CC=lotspeed 时段启动则其 listener 持引用,如 iperf3/代理面板)、容器 netns 的默认 CC。`ss -K` 清理时要覆盖全部 connected 状态而非仅 established
 
 ### 设计原则
 

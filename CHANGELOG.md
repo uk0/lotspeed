@@ -1,6 +1,6 @@
 # Changelog
 
-## learn_speed_v1 (2026-06)
+## adaptive-accel (2026-06)
 
 行为化调度 + 学习闭环分支。全部特性在真实洲际链路（美东 colo → 国内，RTT 13↔264ms 漂移、丢包 2-10%）上完成 A/B 验证，对照为同内核 BBR v3。
 

@@ -99,7 +99,7 @@ Files:
 
 * `merge_bl`: lotspeed merge_bl 基于学习历史记录的模式进行加速，并且洲际场景抖动不会降速避让,并且整合了BBRv3的优点。
 
-* `learn_speed_v1`: 在 merge_bl 之上的行为化调度 + 学习闭环分支:
+* `adaptive-accel`: 在 merge_bl 之上的行为化调度 + 学习闭环分支:
   - **CC**: min_rtt 双窗口修复(过期窗/PROBE_RTT 重新生效, BBRv3 式浅排空), CRUISE headroom 按 loss 压力门控, loss_thresh 丢包率门控(实测最优 lt=2)
   - **NeoQ**: CAKE 式 sparse/bulk 行为分类(临界点按流速率自适应, 不依赖端口), 全局 5-tuple flow 表, 跨档 WRR 8:4:2:1 防饿死, 满队列从最低档驱逐, **重传包 CoDel 免疫**(丢恢复包在 250ms 链路 = 恢复时间翻倍), `/proc/net/neoq_ml` 机器可读统计
   - **lotspeedctl**: 每参数 Δ 信用分配(因果归因, 不再拟合链路噪声), 体验感知 score(`--gamma`, Express 排队延迟惩罚), bad-link 周期跳过, apply 后 settle, KNN 同 regime 邻居门控
@@ -283,7 +283,7 @@ iperf3 -c green1 -p 35201 -R -t 30
 ![f7525becdae16659ddfd54d99efe0f66.png](img/f7525becdae16659ddfd54d99efe0f66.png)
 
 
-### 真实洲际链路测试报告 — lotspeed vs BBR v3 (learn_speed_v1, 2026-06)
+### 真实洲际链路测试报告 — lotspeed vs BBR v3 (adaptive-accel, 2026-06)
 
 #### 测试环境
 

@@ -42,6 +42,7 @@
 #define LS_PROBE_RTT_MODE_MS    200
 #define LS_PROBE_RTT_WIN_MS     5000
 #define LS_MIN_RTT_WIN_SEC      10
+#define LS_HIST_UPDATE_INTERVAL_SEC 10  /* 长连接周期性回写 hist 的最小间隔 */
 #define LS_BW_PROBE_BASE_US     (2 * USEC_PER_SEC)
 #define LS_BW_PROBE_RAND_US     (1 * USEC_PER_SEC)
 #define LS_BW_PROBE_MAX_ROUNDS  63
@@ -804,9 +805,14 @@ struct lotspeed {
 	u8      tlp_probes_out;         /* TLP 探测计数 */
 	u8      startup_ecn_rounds;     /* 启动阶段 ECN 轮次 */
 
-	/* 总计: 8 + 80 + 10 + 8 + 4 + 8 = 118 bytes
-	 * 对齐到 120 bytes (满足 u64 对齐)
-	 * 小于 ICSK_CA_PRIV_SIZE (128 bytes)
+	/* hist v2: 长连接周期性回写时间戳 (jiffies32)。
+	 * 实占偏移 124..127 — 正好填入此前为 u64 对齐而产生的尾部 4 字节
+	 * 填充,故 sizeof 仍为 128,不突破 ICSK_CA_PRIV_SIZE。 */
+	u32     hist_update_stamp;      /* 上次 hist_update 的 tcp_jiffies32 */
+
+	/* 实测 sizeof(struct lotspeed) == 128 == ICSK_CA_PRIV_SIZE (64-bit)。
+	 * 之前的字段末端在偏移 124,尾部 4 字节为对齐填充;hist_update_stamp
+	 * 复用该填充,不增加结构体大小。BUILD_BUG_ON 仍然成立。
 	 */
 };
 
@@ -1480,20 +1486,47 @@ static void ls_hist_lookup(struct sock *sk)
 			u64 age_ms = jiffies_to_msecs(get_jiffies_64() - entry->last_update_jif);
 			if (age_ms < (u64)READ_ONCE(ls_params.hist_ttl_sec) * 1000 &&
 			    entry->sample_cnt >= 3 &&
-			    entry->rtt_min_us > 0) {
-				ls->min_rtt_us = entry->rtt_min_us;
-				ls->probe_rtt_min_us = entry->rtt_min_us;
-				if (entry->bw_bytes_sec > 0 && tp->mss_cache > 0) {
-					u32 cwnd = SAFE_DIV(entry->bw_bytes_sec * entry->rtt_min_us,
-					                    (u64)tp->mss_cache * USEC_PER_SEC);
+			    entry->bw_bytes_sec > 0 && tp->mss_cache > 0) {
+				/* hist v2 语义: 种带宽,不种 min_rtt。
+				 *
+				 * 本 CC 是 pacing 驱动: 发送闸门 = pacing_rate = bw * gain,
+				 * 而 bw 从零冷启动 → 旧版只种 cwnd 对 256KB 短流毫无意义
+				 * (慢启动仍要 5×RTT)。v2 直接把历史带宽喂进 bw 滤波器,
+				 * pacing_rate 立即起飞,短流首个 RTT 即可满速发送。
+				 *
+				 * 不再种 min_rtt: 13↔264ms 漂移路径上,13ms era 的旧值
+				 * 在 264ms 窗口命中会令 cwnd_target = bw*min_rtt 缩小约 20x,
+				 * 拖死短流的整个生命周期 (残留毒性,故彻底删除)。
+				 *
+				 * 自愈: 真实 bw 样本写入 bw_hi[1],经 ls_take_bw_sample 的
+				 * 最大滤波;若 seed 偏高,真实样本超过它后 ls_bw() 立即取真实值;
+				 * 若无样本超过,advance 一次后 bw_hi[0] 被 bw_hi[1] 覆盖、再一次
+				 * 彻底清掉 — 错误 seed 在约 2 个 bw 滤波窗内自然消解。
+				 * 30% 安全折扣 (×7/10) 抵御换路/过冲。 */
+				u32 mss = tp->mss_cache;
+				u64 bw_seed = div64_u64(entry->bw_bytes_sec << BW_SCALE,
+				                        (u64)mss * USEC_PER_SEC);
+
+				if (bw_seed > 0) {
+					/* 折扣后写入 bw 滤波器: 只动 bw_hi[0] (即时生效),
+					 * 不碰 bw_hi[1] (留给真实样本) / bw_lo / inflight 界。 */
+					u32 seed = (u32)(bw_seed * 7 / 10);
 					u32 floor = READ_ONCE(ls_params.hist_min_cwnd_bound);
-					/* hist-derived cwnd as a warm-start hint, floored against
-					 * a CLI-tunable lower bound (avoids 2Mbps lockup on RTT-mismatch).
-					 * Keep STARTUP mode so we still probe real bandwidth on the
-					 * new path — hist only seeds, never freezes. */
+					u32 cwnd;
+					/* 用于 cwnd 计算的 RTT: 握手 srtt (SYN-ACK 后, usec);
+					 * 为零则退回 entry->rtt_min_us — 仅参与本地计算,
+					 * 绝不写回 ls->min_rtt_us。 */
+					u32 rtt_us = (tp->srtt_us >> 3) ? : entry->rtt_min_us;
+
+					ls->bw_hi[0] = seed;
+
+					/* 适度 cwnd: seed 带宽 × 握手 RTT 的 BDP (gain=1.0,
+					 * 与 ls_bdp 同式但不依赖 ls->min_rtt_us)。 */
+					cwnd = (u32)(((u64)seed * rtt_us) >> BW_SCALE);
 					cwnd = max(cwnd, floor);
 					tcp_snd_cwnd_set(tp, clamp_t(u32, cwnd,
 						ls_get_min_cwnd(), ls_get_max_cwnd()));
+					/* 保持 STARTUP: 只种,不冻结,仍在新路探测真实带宽。 */
 					ls_update_high_delay_path(sk);
 					ls_update_rho(sk);
 				}
@@ -2150,6 +2183,18 @@ static void ls_main(struct sock *sk, const struct rate_sample *rs)
 	if (!ls->initialized)
 		return;
 
+	/* hist v2: 长连接 (代理隧道) 周期性回写带宽样本。
+	 * 旧版仅在 ls_release 回写,长连接永不贡献样本 → 缓存恒冷。
+	 * 闸门为单次 time_after: 每 10s 最多触发一次;未到期时零额外开销。
+	 * ls_hist_update 内部在 hist_enable=0 时于加锁前 return,不会取锁;
+	 * 同时要求 full_bw_reached && cwnd>=32 (沿用),短/未探测连接不写。
+	 * 到期即推进时间戳 (无论是否真正写入),避免禁用时每个 ACK 重入。 */
+	if (time_after(tcp_jiffies32,
+	               ls->hist_update_stamp + LS_HIST_UPDATE_INTERVAL_SEC * HZ)) {
+		ls->hist_update_stamp = tcp_jiffies32;
+		ls_hist_update(sk);
+	}
+
 	ls_update_round_start(sk, rs);
 	if (ls->round_start) {
 		ls->rounds_since_probe = min_t(u32, ls->rounds_since_probe + 1, 255);
@@ -2272,6 +2317,10 @@ static void ls_init(struct sock *sk)
 
 	/* 丢包追踪 */
 	ls->loss_round_delivered = tp->delivered + 1;
+
+	/* hist v2: 把周期性回写锚定到连接起点,确保首次写入前有完整 10s 预热
+	 * (否则在长运行主机上 tcp_jiffies32 很大,seed=0 会令首个 ACK 即触发)。 */
+	ls->hist_update_stamp = tcp_jiffies32;
 
 	/* RACK-TLP 初始化 */
 	ls->rack_rtt_us = 0;

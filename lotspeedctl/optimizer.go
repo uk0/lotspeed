@@ -38,6 +38,7 @@ type tunable struct {
 // optimizer keeps all state in memory across the loop.
 type optimizer struct {
 	iface       string
+	target      string // --target IP: when set, measure() scopes ALL link signals to this peer's sockets (per-link). Empty => machine-wide.
 	interval    time.Duration
 	alpha, beta float64 // delay & loss penalty weights
 	gamma       float64 // Express-delay (experience) penalty weight; 0 => term off
@@ -52,10 +53,22 @@ type optimizer struct {
 	prevBytes   uint64
 	prevOut     uint64
 	prevRetr    uint64
-	prevT0Pkts  uint64  // NeoQ: cumulative Express pkts at last measure() (for delta)
-	prevT3Bytes uint64  // NeoQ: cumulative Bulk bytes at last measure() (for delta)
-	nqPrimed    bool    // NeoQ: prev*T0/T3 counters baselined (skip first-cycle bogus delta)
-	codelRtt    float64 // EWMA RTT (ms) driving NeoQ CoDel target/interval
+	// Per-target counter baselines (used only when o.target != ""). ss exposes
+	// LIFETIME totals per socket; we sum them across the target's sockets and diff
+	// against these to get per-cycle deltas, exactly like the machine-wide snmp/iface
+	// counters above. tgtPrimed guards the first-cycle bogus delta. Sockets churn
+	// (connections open/close between cycles), so when the summed lifetime totals
+	// DECREASE — a tracked socket closed — measure() re-baselines instead of emitting
+	// a negative delta (see ssTarget + the measureTarget() churn guard).
+	prevTgtRetr  uint64
+	prevTgtSegs  uint64
+	prevTgtAcked uint64
+	tgtPrimed    bool
+	prevTgtLoss  float64 // last good loss value, returned on a churn re-baseline cycle
+	prevT0Pkts   uint64  // NeoQ: cumulative Express pkts at last measure() (for delta)
+	prevT3Bytes  uint64  // NeoQ: cumulative Bulk bytes at last measure() (for delta)
+	nqPrimed     bool    // NeoQ: prev*T0/T3 counters baselined (skip first-cycle bogus delta)
+	codelRtt     float64 // EWMA RTT (ms) driving NeoQ CoDel target/interval
 
 	// rttRing holds the last jitterRingLen per-cycle RTT samples (ms). Its MAD is
 	// the jitter signal in score(). Only CLEAN cycles push here — bad-link cycles
@@ -132,7 +145,7 @@ const (
 	jitterDelta = 0.2
 )
 
-func newOptimizer(iface string, interval time.Duration, gamma float64) *optimizer {
+func newOptimizer(iface, target string, interval time.Duration, gamma float64) *optimizer {
 	o := &optimizer{
 		// beta=1.0 (goodput-accurate): the score measures wire throughput (iface
 		// tx+rx, which includes retransmits). beta*loss discounts that by the
@@ -140,7 +153,7 @@ func newOptimizer(iface string, interval time.Duration, gamma float64) *optimize
 		// retransmits beyond their goodput cost: on a lossy intercontinental link
 		// being aggressive (high retr) is the point, and the measured win is huge
 		// (+186% vs bbr; bbr collapses to 2M on loss spikes, aggressive holds 36-87M).
-		iface: iface, interval: interval, alpha: 0.5, beta: 1.0, gamma: gamma,
+		iface: iface, target: target, interval: interval, alpha: 0.5, beta: 1.0, gamma: gamma,
 		dir: 1, phase: "EXPLORE", bestScore: -1e9,
 		probedTi: -1, frozen: map[string]bool{},
 		tun: []tunable{
@@ -238,7 +251,87 @@ func autoDetectPeer() string {
 	return best
 }
 
-// avgSrttMs averages srtt across established sockets (ss -ti).
+// ssField returns the RAW value token of a per-socket `ss` key formatted as
+// `<key>:<value>` (e.g. "bytes_acked:1235" -> "1235", "rtt:3.5/1.75" -> "3.5/1.75",
+// "retrans:5/12" -> "5/12") — i.e. the chars after the colon up to the next space,
+// with NO "/" handling (the caller picks which side of an "X/Y" pair it needs: rtt
+// wants X=srtt, retrans wants Y=lifetime total). ok=false when the key is absent.
+// The key matches only as a WHOLE token (preceded by start-of-line or a space) so
+// "rtt:" never matches inside "minrtt:" and "segs_out:" never inside
+// "data_segs_out:". Defensive: a zero-loss socket omits "retrans:" entirely.
+func ssField(line, key string) (string, bool) {
+	probe := key + ":"
+	from := 0
+	for {
+		k := strings.Index(line[from:], probe)
+		if k < 0 {
+			return "", false
+		}
+		k += from
+		if k == 0 || line[k-1] == ' ' {
+			s := line[k+len(probe):]
+			if j := strings.IndexByte(s, ' '); j >= 0 {
+				s = s[:j]
+			}
+			return s, true
+		}
+		from = k + len(probe)
+	}
+}
+
+// ssFloatX parses key `key` and returns the X of an "X/Y" value (or the whole value
+// if there's no "/") as a float. Used for rtt:srtt/rttvar — we want srtt (X). ok is
+// false when the key is absent or X doesn't parse.
+func ssFloatX(line, key string) (float64, bool) {
+	s, ok := ssField(line, key)
+	if !ok {
+		return 0, false
+	}
+	if j := strings.IndexByte(s, '/'); j >= 0 {
+		s = s[:j]
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// ssUintY parses key `key` and returns the Y of an "X/Y" value as a uint. Used for
+// retrans:fastRetrans/lifetimeRetrans — we want the LIFETIME total (Y), which the
+// optimizer diffs per cycle. If there's no "/" the whole value is parsed (a kernel
+// that emits a bare count). ok is false when the key is absent or Y doesn't parse.
+func ssUintY(line, key string) (uint64, bool) {
+	s, ok := ssField(line, key)
+	if !ok {
+		return 0, false
+	}
+	if j := strings.IndexByte(s, '/'); j >= 0 {
+		s = s[j+1:]
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// ssUint parses key `key` as a plain uint (no "/" form). Used for segs_out and
+// bytes_acked. ok is false when absent or non-numeric.
+func ssUint(line, key string) (uint64, bool) {
+	s, ok := ssField(line, key)
+	if !ok {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// avgSrttMs averages srtt across established sockets (machine-wide; ss -ti). Used
+// in PASSIVE mode. The srtt is the `rtt:X/Y` field's X (ms float).
 func avgSrttMs() float64 {
 	out, err := exec.Command("ss", "-ti", "state", "established").Output()
 	if err != nil {
@@ -247,18 +340,12 @@ func avgSrttMs() float64 {
 	var sum float64
 	var n int
 	for _, ln := range strings.Split(string(out), "\n") {
-		k := strings.Index(ln, "rtt:")
-		if k < 0 {
+		v, ok := ssFloatX(ln, "rtt")
+		if !ok || v <= 0 {
 			continue
 		}
-		s := ln[k+4:]
-		if j := strings.IndexAny(s, "/ "); j > 0 {
-			s = s[:j]
-		}
-		if v, err := strconv.ParseFloat(s, 64); err == nil && v > 0 {
-			sum += v
-			n++
-		}
+		sum += v
+		n++
 	}
 	if n == 0 {
 		return 0
@@ -266,7 +353,75 @@ func avgSrttMs() float64 {
 	return sum / float64(n)
 }
 
-func (o *optimizer) measure() metrics {
+// ssTargetStat is the per-cycle aggregate over a single target's ESTABLISHED
+// sockets, parsed from `ss -tin dst <target>`. rttMs is the mean srtt; the three
+// counters are SUMMED LIFETIME totals across the target's sockets (the optimizer
+// diffs them against the previous cycle). socks is how many sockets contributed —
+// 0 means ss saw none this cycle (the caller then falls back to iface bytes).
+type ssTargetStat struct {
+	rttMs float64
+	retr  uint64 // sum of lifetime retrans:X/Y (Y = total retransmits)
+	segs  uint64 // sum of lifetime segs_out:N
+	acked uint64 // sum of lifetime bytes_acked:N
+	socks int
+}
+
+// ssTarget runs `ss -tin dst <target>` (no -p: we don't need process info and
+// omitting it is faster) and aggregates the per-socket fields for that peer only.
+// This is the per-link replacement for the machine-wide avgSrttMs/snmp/iface
+// signals: on a box carrying mixed traffic (proxy egress at 0.3-13ms alongside
+// accelerated 50-264ms flows) the machine-wide floor is anchored by the wrong
+// regime, poisoning the score. On exec error returns a zero stat (socks=0), which
+// the caller treats as "no per-link signal this cycle".
+func ssTarget(target string) ssTargetStat {
+	out, err := exec.Command("ss", "-tin", "state", "established", "dst", target).Output()
+	if err != nil {
+		return ssTargetStat{}
+	}
+	return parseSSTarget(string(out))
+}
+
+// parseSSTarget aggregates the per-socket fields from `ss -tin` output: mean srtt,
+// and the SUMMED LIFETIME retrans/segs_out/bytes_acked totals across all sockets
+// in the output. socks counts the socket lines seen. Parsing is defensive — a
+// socket missing a field (e.g. retrans: omitted when its lifetime count is zero)
+// just contributes 0 for it. Split from ssTarget so it's unit-testable on a fixture
+// (mirrors the readNeoqML/parseNeoqML split).
+func parseSSTarget(out string) ssTargetStat {
+	var st ssTargetStat
+	var rttSum float64
+	var rttN int
+	for _, ln := range strings.Split(out, "\n") {
+		// A socket's stats line is the one carrying the rtt field; the address line
+		// (Local/Peer) has none. Use rtt presence to identify a real socket line.
+		if _, ok := ssField(ln, "rtt"); !ok {
+			continue
+		}
+		st.socks++
+		if v, ok := ssFloatX(ln, "rtt"); ok && v > 0 { // srtt = X of rtt:X/Y
+			rttSum += v
+			rttN++
+		}
+		if v, ok := ssUintY(ln, "retrans"); ok { // lifetime total = Y of retrans:X/Y
+			st.retr += v
+		}
+		if v, ok := ssUint(ln, "segs_out"); ok {
+			st.segs += v
+		}
+		if v, ok := ssUint(ln, "bytes_acked"); ok {
+			st.acked += v
+		}
+	}
+	if rttN > 0 {
+		st.rttMs = rttSum / float64(rttN)
+	}
+	return st
+}
+
+// measureMachine derives bw/rtt/loss machine-wide: iface tx+rx bytes for bw,
+// /proc/net/snmp OutSegs/RetransSegs for loss, ss -ti mean srtt for rtt. This is
+// the PASSIVE/idle path and is byte-for-byte the original measure() behavior.
+func (o *optimizer) measureMachine() metrics {
 	cur := ifaceBytes(o.iface)
 	dbytes := cur - o.prevBytes
 	o.prevBytes = cur
@@ -278,7 +433,88 @@ func (o *optimizer) measure() metrics {
 		loss = float64(dretr) / float64(dout)
 	}
 	bw := float64(dbytes) * 8 / o.interval.Seconds() / 1e6
-	m := metrics{bwMbps: bw, rttMs: avgSrttMs(), lossPct: loss}
+	return metrics{bwMbps: bw, rttMs: avgSrttMs(), lossPct: loss}
+}
+
+// measureTarget derives bw/rtt/loss scoped to o.target's sockets only (--target
+// mode). rtt = mean srtt over those sockets; loss = Δretrans/Δsegs_out; bw =
+// Δbytes_acked. The retrans/segs/acked counters are SUMMED LIFETIME totals, so we
+// diff them against the previous cycle's sums (primed on the first cycle, whose
+// delta is suppressed). CHURN: sockets open/close between cycles, so a summed
+// lifetime total can DROP when a tracked socket closes — a naive delta would go
+// negative (uint underflow). On any such drop we re-baseline this cycle (adopt the
+// new lower totals) and return the previous good loss rather than a bogus delta;
+// bw falls back to iface bytes for the cycle. When ss sees ZERO sockets this cycle
+// (none established to the target right now) we also fall back to iface bytes for
+// bw and leave rtt/loss at 0 (no per-link signal — score() guards rtt>0/loss>=0).
+func (o *optimizer) measureTarget() metrics {
+	st := ssTarget(o.target)
+	// iface byte delta is always advanced so the counter never drifts, and is the
+	// bw fallback when ss yields no usable per-link byte signal this cycle.
+	cur := ifaceBytes(o.iface)
+	dbytes := cur - o.prevBytes
+	o.prevBytes = cur
+	ifaceBw := float64(dbytes) * 8 / o.interval.Seconds() / 1e6
+	return o.targetMetrics(st, ifaceBw)
+}
+
+// targetMetrics turns one per-target ss snapshot into metrics, advancing the
+// optimizer's per-target counter baselines. ifaceBw is the iface tx+rx bw for this
+// window, used as the bw fallback. Pure of I/O (the exec/iface reads happen in
+// measureTarget) so the churn/re-baseline logic is unit-testable.
+//
+//   - socks==0: no sockets to the target this cycle. Keep the baselines (don't prime
+//     off an empty read), fall back to iface bw, hold the last loss.
+//   - rebased (first primed cycle OR any summed lifetime total DROPPED because a
+//     tracked socket closed): adopt the new totals, emit NO delta this cycle —
+//     iface bw + last loss — so a closed socket can't produce a negative delta.
+//   - normal: loss = Δretrans/Δsegs_out (hold last loss if no new segments);
+//     bw = Δbytes_acked (the target's acknowledged goodput; iface fallback if zero).
+func (o *optimizer) targetMetrics(st ssTargetStat, ifaceBw float64) metrics {
+	if st.socks == 0 {
+		return metrics{bwMbps: ifaceBw, rttMs: st.rttMs, lossPct: o.lossFallback()}
+	}
+	rebased := !o.tgtPrimed ||
+		st.retr < o.prevTgtRetr || st.segs < o.prevTgtSegs || st.acked < o.prevTgtAcked
+	var loss, bw float64
+	if rebased {
+		loss = o.lossFallback()
+		bw = ifaceBw
+	} else {
+		dretr := st.retr - o.prevTgtRetr
+		dsegs := st.segs - o.prevTgtSegs
+		dacked := st.acked - o.prevTgtAcked
+		if dsegs > 0 {
+			loss = float64(dretr) / float64(dsegs)
+		} else {
+			loss = o.lossFallback() // no new segments this cycle: hold last loss
+		}
+		// Δbytes_acked is the goodput actually acknowledged by the target; prefer it
+		// over iface bytes (which include unrelated mixed traffic). If somehow zero
+		// (no new acks despite live sockets), fall back to iface bytes.
+		if dacked > 0 {
+			bw = float64(dacked) * 8 / o.interval.Seconds() / 1e6
+		} else {
+			bw = ifaceBw
+		}
+		o.prevTgtLoss = loss
+	}
+	o.prevTgtRetr, o.prevTgtSegs, o.prevTgtAcked, o.tgtPrimed = st.retr, st.segs, st.acked, true
+	return metrics{bwMbps: bw, rttMs: st.rttMs, lossPct: loss}
+}
+
+// lossFallback is the loss value to report on a cycle where a fresh per-link loss
+// delta can't be computed (churn re-baseline, no new segments, or no sockets):
+// the last good per-link loss, which is 0 until the first real delta lands.
+func (o *optimizer) lossFallback() float64 { return o.prevTgtLoss }
+
+func (o *optimizer) measure() metrics {
+	var m metrics
+	if o.target != "" {
+		m = o.measureTarget()
+	} else {
+		m = o.measureMachine()
+	}
 	// NeoQ experience signals, sampled in this same window so they line up with
 	// bw/rtt/loss. Absent file (qdisc not loaded) => nqOK stays false and score()
 	// falls back to the legacy formula. t0_pkts/t3_bytes are cumulative — diff them
@@ -417,6 +653,16 @@ func (o *optimizer) settle(rttMs float64) {
 	time.Sleep(d)
 	o.prevBytes = ifaceBytes(o.iface)
 	o.prevOut, o.prevRetr = readSnmpTcp()
+	// Per-target mode: re-baseline the target's summed lifetime ss counters too, so
+	// the next measure() window's loss/bw deltas cover only steady state (consistent
+	// with the iface/snmp re-baseline above). Leave tgtPrimed/prevTgtLoss as-is when
+	// no sockets are up right now, so we don't prime off an empty read or forget the
+	// last good loss across a config change.
+	if o.target != "" {
+		if st := ssTarget(o.target); st.socks > 0 {
+			o.prevTgtRetr, o.prevTgtSegs, o.prevTgtAcked, o.tgtPrimed = st.retr, st.segs, st.acked, true
+		}
+	}
 	// Re-baseline the NeoQ cumulative counters too, so the next measure() window's
 	// t0_pkts/t3_bytes deltas cover only steady state (consistent with the iface/snmp
 	// re-baseline above). This read also resets the kernel's reset-on-read Express
@@ -507,14 +753,16 @@ func cmdOptimize(args []string) error {
 	if target != "" {
 		feat.Target = target
 		fmt.Printf("optimize: explicit target=%s, model=%s\n", target, modelPath())
+		fmt.Printf("measure scope: target=%s (per-link)\n", target)
 	} else {
 		fmt.Printf("optimize: PASSIVE mode (peer auto-detected per cycle), model=%s\n", modelPath())
+		fmt.Printf("measure scope: machine-wide\n")
 	}
 	if err := os.WriteFile(ccPath, []byte("lotspeed"), 0o644); err != nil {
 		return fmt.Errorf("set CC=lotspeed (need root?): %w", err)
 	}
 
-	o := newOptimizer(iface, interval, gamma)
+	o := newOptimizer(iface, target, interval, gamma)
 	// UCB bandit: pre-load it with all prior samples so a fresh process
 	// inherits learning from previous runs (crucial for systemd auto-restart).
 	// Instantiated in BOTH modes: in coord mode it backs delta-credit (B1) and the
@@ -569,6 +817,15 @@ func cmdOptimize(args []string) error {
 		iface, interval, gamma, nqUp)
 	o.prevBytes = ifaceBytes(iface)
 	o.prevOut, o.prevRetr = readSnmpTcp()
+	// Per-target mode: prime the target's summed lifetime ss counters alongside
+	// iface/snmp so the first measure() yields a real delta. If no sockets are up
+	// yet, leave it unprimed — the first measureTarget() with sockets self-primes
+	// via its !tgtPrimed re-baseline branch.
+	if target != "" {
+		if st := ssTarget(target); st.socks > 0 {
+			o.prevTgtRetr, o.prevTgtSegs, o.prevTgtAcked, o.tgtPrimed = st.retr, st.segs, st.acked, true
+		}
+	}
 	// Prime the NeoQ cumulative-counter baseline alongside iface/snmp so the first
 	// measure() produces a real delta (not a suppressed first-cycle one).
 	if nqUp {

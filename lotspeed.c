@@ -1528,7 +1528,7 @@ static void ls_hist_lookup(struct sock *sk)
 		if (entry->daddr == daddr) {
 			u64 age_ms = jiffies_to_msecs(get_jiffies_64() - entry->last_update_jif);
 			if (age_ms < (u64)READ_ONCE(ls_params.hist_ttl_sec) * 1000 &&
-			    entry->sample_cnt >= 3 &&
+			    entry->sample_cnt >= 2 &&
 			    entry->bw_bytes_sec > 0 && tp->mss_cache > 0) {
 				/* hist v2 语义: 种带宽,不种 min_rtt。
 				 *

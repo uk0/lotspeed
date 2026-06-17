@@ -132,6 +132,7 @@ struct lotspeed_params {
 	unsigned int loss_thresh;       /* 丢包率阈值 (百分比) */
 	unsigned int full_loss_cnt;     /* STARTUP 退出的丢包事件数 */
 	unsigned int headroom_loss_gain;/* 丢包正比窗口收紧增益 (0=关; 100=丢包10%时额外10% headroom) */
+	unsigned int delay_cap_thresh;  /* 延迟门控封顶阈值 %: srtt>min_rtt*(100+x)% 时封顶 cwnd 到 BDP*1.25 (0=关) */
 	unsigned int inflight_headroom; /* inflight 安全余量 (百分比) */
 
 	/* 带宽探测参数 */
@@ -220,6 +221,7 @@ static struct lotspeed_params ls_params = {
 	.loss_thresh        = 2,            /* 2% 丢包率阈值 */
 	.full_loss_cnt      = 6,            /* STARTUP 退出丢包事件数 */
 	.headroom_loss_gain = 100,          /* 丢包正比窗口收紧: 丢包10%→额外10% headroom (BDP floor 保底) */
+	.delay_cap_thresh   = 50,           /* 延迟门控封顶: srtt>1.5*min_rtt (队列堆积) 时封顶 cwnd 抗 bufferbloat */
 	.inflight_headroom  = 15,           /* 15% inflight 余量 */
 
 	/* 带宽探测参数 */
@@ -591,6 +593,13 @@ static struct ctl_table ls_sysctl_table[] = {
 	{
 		.procname       = "headroom_loss_gain",
 		.data           = &ls_params.headroom_loss_gain,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0644,
+		.proc_handler   = proc_douintvec,
+	},
+	{
+		.procname       = "delay_cap_thresh",
+		.data           = &ls_params.delay_cap_thresh,
 		.maxlen         = sizeof(unsigned int),
 		.mode           = 0644,
 		.proc_handler   = proc_douintvec,
@@ -1864,6 +1873,32 @@ static void ls_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 
 apply_cap:
 	cwnd = clamp_t(u32, cwnd, ls_get_min_cwnd(), ls_get_max_cwnd());
+
+	/* 黑科技 — 延迟门控窗口封顶 (抗 bufferbloat,直接降延迟):
+	 * 实测在高丢包/速率受限路径上,窗口会跑飞到 max_cwnd 并把瓶颈队列撑满
+	 * (RTT 250ms → 1秒+)。当 smoothed RTT 超过 min_rtt 的 (100+thresh)% 时,
+	 * 说明队列正在堆积,把 cwnd 硬性封顶到 BDP*1.25 (留小余量给 ACK 聚合)。
+	 * 这与 inflight_hi/丢包响应完全无关 —— 即使随机丢包不触发退避或丢包响应
+	 * 失效,也能阻止窗口跑飞。pacing 仍按 bw 控速,封顶只削减 BDP 之上的过量
+	 * 在途 → 队列排空 → 延迟回落,吞吐不变 (延迟是过量窗口最直接的证据,
+	 * 比丢包更早更准)。仅 full_bw_reached 后生效 (STARTUP 需填管探测带宽);
+	 * delay_cap_thresh=0 关闭。 */
+	if (ls->full_bw_reached) {
+		u32 dthr = READ_ONCE(ls_params.delay_cap_thresh);
+
+		if (dthr && ls->min_rtt_us && ls->min_rtt_us != ~0U) {
+			u32 srtt = tp->srtt_us >> 3;
+			u32 trip = ls->min_rtt_us +
+			           (u32)((u64)ls->min_rtt_us * dthr / 100);
+
+			if (srtt > trip) {
+				u32 bdp = ls_bdp(sk, ls_bw(sk), LS_UNIT);
+				u32 dcap = max(bdp + (bdp >> 2), ls_get_min_cwnd());
+
+				cwnd = min(cwnd, dcap);
+			}
+		}
+	}
 
 	/* CRUISE headroom 仅在本周期实际承受过丢包/ECN 退避压力时才施加:
 	 * inflight_lo != ~0U 表示已被 loss/ECN 下界压制 (每周期 CRUISE→REFILL 时复位为 ~0U)。

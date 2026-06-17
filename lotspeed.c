@@ -1896,6 +1896,12 @@ apply_cap:
 				u32 dcap = max(bdp + (bdp >> 2), ls_get_min_cwnd());
 
 				cwnd = min(cwnd, dcap);
+				/* 同时下拉探测上界,否则 FAST/PROBE_UP 会在下个 ACK 把 cwnd
+				 * 重新顶回 inflight_hi → cwnd 在 dcap↔inflight_hi 之间震荡,
+				 * RTT 尖峰回弹。把 inflight_hi 收到 dcap 形成稳定低位运行点;
+				 * 队列排空后 PROBE_UP 仍会按需重新探高。 */
+				if (ls->inflight_hi != ~0U)
+					ls->inflight_hi = min(ls->inflight_hi, dcap);
 			}
 		}
 	}

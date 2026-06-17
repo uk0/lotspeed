@@ -131,6 +131,7 @@ struct lotspeed_params {
 	/* 丢包检测参数 */
 	unsigned int loss_thresh;       /* 丢包率阈值 (百分比) */
 	unsigned int full_loss_cnt;     /* STARTUP 退出的丢包事件数 */
+	unsigned int headroom_loss_gain;/* 丢包正比窗口收紧增益 (0=关; 100=丢包10%时额外10% headroom) */
 	unsigned int inflight_headroom; /* inflight 安全余量 (百分比) */
 
 	/* 带宽探测参数 */
@@ -218,6 +219,7 @@ static struct lotspeed_params ls_params = {
 	/* 丢包检测参数 */
 	.loss_thresh        = 2,            /* 2% 丢包率阈值 */
 	.full_loss_cnt      = 6,            /* STARTUP 退出丢包事件数 */
+	.headroom_loss_gain = 100,          /* 丢包正比窗口收紧: 丢包10%→额外10% headroom (BDP floor 保底) */
 	.inflight_headroom  = 15,           /* 15% inflight 余量 */
 
 	/* 带宽探测参数 */
@@ -587,6 +589,13 @@ static struct ctl_table ls_sysctl_table[] = {
 		.proc_handler   = proc_douintvec,
 	},
 	{
+		.procname       = "headroom_loss_gain",
+		.data           = &ls_params.headroom_loss_gain,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0644,
+		.proc_handler   = proc_douintvec,
+	},
+	{
 		.procname       = "full_loss_cnt",
 		.data           = &ls_params.full_loss_cnt,
 		.maxlen         = sizeof(unsigned int),
@@ -743,7 +752,7 @@ struct lotspeed {
 	u32     prior_cwnd;             /* 保存的 cwnd */
 	u32     cycle_stamp;            /* 周期开始 (jiffies32) */
 	u32     brave_freeze_until;     /* 勇敢模式冻结截止 */
-	u32     loss_round_delivered;   /* 丢包轮 delivered */
+	u32     prior_lost;             /* 上轮边界 tp->lost 快照 (算每轮丢包数) */
 	u32     ack_epoch_acked;        /* 采样期 ACK 数 */
 	u32     alpha_last_delivered;   /* 上次 ECN alpha 计算时的 delivered */
 	u32     alpha_last_delivered_ce;/* 上次 ECN alpha 计算时的 delivered_ce */
@@ -798,7 +807,7 @@ struct lotspeed {
 	u8      tlp_high_seq_set:1;     /* TLP high_seq 已设置 */
 	u8      tlp_in_progress:1;      /* TLP 探测进行中 */
 	u8      rack_reord_seen:1;      /* RACK 观察到乱序 */
-	u8      unused:5;
+	u8      loss_rate_pct:5;        /* 连续丢包率 EWMA (0-31%,驱动窗口收紧) */
 
 	/* === RACK-TLP 状态 (8 bytes) === */
 	u32     rack_rtt_us;            /* RACK 使用的 RTT */
@@ -1111,15 +1120,39 @@ static u32 ls_inflight(struct sock *sk, u32 bw, int gain)
 static u32 ls_inflight_with_headroom(struct sock *sk)
 {
 	struct lotspeed *ls = inet_csk_ca(sk);
-	u32 headroom;
+	u32 headroom, cap, bdp_floor, gain;
 
 	if (ls->inflight_hi == ~0U)
 		return ~0U;
 
+	/* 基础 headroom: inflight_hi 的 1/16 (~6.25%),BBR v3 默认 */
 	headroom = ls->inflight_hi >> 4;
+
+	/* 黑科技 — 丢包正比窗口收紧:
+	 * 路径受限链路 (ISP per-flow 限速) 上,BDP 之上的每个在途包都是纯丢包暴露
+	 * (零吞吐收益,因为没有更多带宽可发现)。丢包率越高 → headroom 越大 →
+	 * cap 越逼近 BDP,减少绝对丢包数 → 减少重传 → 提高 goodput;窗口更小 →
+	 * 瓶颈队列更短 → 降低延迟。loss_rate_pct 为连续 EWMA (0-31%)。
+	 * 额外 headroom = inflight_hi * loss% * gain / 10000。
+	 * gain=0 关闭 (退回 BBR v3 默认行为)。 */
+	gain = READ_ONCE(ls_params.headroom_loss_gain);
+	if (gain && ls->loss_rate_pct) {
+		u32 extra = (u32)(((u64)ls->inflight_hi *
+		                   ls->loss_rate_pct * gain) / 10000);
+		headroom += extra;
+	}
 	headroom = max(headroom, 1U);
 
-	return max_t(s32, ls->inflight_hi - headroom, ls_get_min_cwnd());
+	cap = (headroom < ls->inflight_hi) ?
+	      ls->inflight_hi - headroom : ls_get_min_cwnd();
+
+	/* 关键不变量: cap 永不低于真实 BDP (gain=1.0)。窗口收紧只修剪 BDP 之上的
+	 * 过量在途,绝不切入 BDP 本身 —— 这是"窗口变小但吞吐不降"的保证,
+	 * 也是避免 PROBE_UP 增速回归 (6e641f4) 那类吞吐塌陷的安全闸。 */
+	bdp_floor = ls_bdp(sk, ls_bw(sk), LS_UNIT);
+	cap = max(cap, bdp_floor);
+
+	return max_t(u32, cap, ls_get_min_cwnd());
 }
 
 /* ============== Pacing 速率 ============== */
@@ -1246,6 +1279,20 @@ static u32 ls_update_round_start(struct sock *sk, const struct rate_sample *rs)
 		round_delivered = tp->delivered - ls->next_rtt_delivered;
 		ls->next_rtt_delivered = tp->delivered;
 		ls->round_start = 1;
+
+		/* 连续丢包率 EWMA: 本轮 lost/delivered,5-bit 饱和于 31%。
+		 * 驱动丢包正比窗口收紧 (ls_inflight_with_headroom)。
+		 * tp->lost 单调累计,decrease 时取 0 兜底。 */
+		{
+			u32 round_lost = (tp->lost > ls->prior_lost) ?
+			                 tp->lost - ls->prior_lost : 0;
+			ls->prior_lost = tp->lost;
+			if (round_delivered > 0) {
+				u32 spc = min_t(u32, 31,
+				                round_lost * 100 / round_delivered);
+				ls->loss_rate_pct = (ls->loss_rate_pct * 7 + spc) / 8;
+			}
+		}
 	}
 
 	return round_delivered;
@@ -2377,7 +2424,8 @@ static void ls_init(struct sock *sk)
 	ls->has_seen_rtt = 0;
 
 	/* 丢包追踪 */
-	ls->loss_round_delivered = tp->delivered + 1;
+	ls->prior_lost = tp->lost;
+	ls->loss_rate_pct = 0;
 
 	/* hist v2: 把周期性回写锚定到连接起点,确保首次写入前有完整 10s 预热
 	 * (否则在长运行主机上 tcp_jiffies32 很大,seed=0 会令首个 ACK 即触发)。 */

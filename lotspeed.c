@@ -221,7 +221,7 @@ static struct lotspeed_params ls_params = {
 	.loss_thresh        = 2,            /* 2% 丢包率阈值 */
 	.full_loss_cnt      = 6,            /* STARTUP 退出丢包事件数 */
 	.headroom_loss_gain = 100,          /* 丢包正比窗口收紧: 丢包10%→额外10% headroom (BDP floor 保底) */
-	.delay_cap_thresh   = 50,           /* 延迟门控封顶: srtt>1.5*min_rtt (队列堆积) 时封顶 cwnd 抗 bufferbloat */
+	.delay_cap_thresh   = 0,            /* 延迟门控封顶: 默认关 (netem 已验证 6x 缩窗+RTT 落地+吞吐持平; 待 RTT 漂移真机 A/B + 迟滞硬化后再默认开) */
 	.inflight_headroom  = 15,           /* 15% inflight 余量 */
 
 	/* 带宽探测参数 */

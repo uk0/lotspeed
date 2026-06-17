@@ -1875,21 +1875,26 @@ apply_cap:
 	cwnd = clamp_t(u32, cwnd, ls_get_min_cwnd(), ls_get_max_cwnd());
 
 	/* 黑科技 — 延迟门控窗口封顶 (抗 bufferbloat,直接降延迟):
-	 * 实测在高丢包/速率受限路径上,窗口会跑飞到 max_cwnd 并把瓶颈队列撑满
-	 * (RTT 250ms → 1秒+)。当 smoothed RTT 超过 min_rtt 的 (100+thresh)% 时,
-	 * 说明队列正在堆积,把 cwnd 硬性封顶到 BDP*1.25 (留小余量给 ACK 聚合)。
-	 * 这与 inflight_hi/丢包响应完全无关 —— 即使随机丢包不触发退避或丢包响应
-	 * 失效,也能阻止窗口跑飞。pacing 仍按 bw 控速,封顶只削减 BDP 之上的过量
-	 * 在途 → 队列排空 → 延迟回落,吞吐不变 (延迟是过量窗口最直接的证据,
-	 * 比丢包更早更准)。仅 full_bw_reached 后生效 (STARTUP 需填管探测带宽);
-	 * delay_cap_thresh=0 关闭。 */
-	if (ls->full_bw_reached) {
+	 * 站立队列 = 在途超过 BDP 的最直接证据 (比丢包更早更准)。srtt 超过 min_rtt
+	 * 的阈值即把 cwnd 封顶到 BDP*1.25,排空队列、延迟回落;pacing 仍按 bw 控速 → 吞吐不变。
+	 *
+	 * 不再 gated on full_bw_reached: 高丢包下 full_bw 平台检测会被压低的 bw 样本反复
+	 * 复位 → 流卡在 STARTUP, 而旧版封顶被 full_bw 门挡住, 窗口照样跑飞撑爆队列
+	 * (实测 cwnd 卡 max_cwnd、RTT 1-4s)。改为直接看队列信号、按相位两级阈值快速决策
+	 * (每 ACK 仅几步比较, 热路径轻):
+	 *   - 稳态 (full_bw_reached): srtt > min_rtt*(1+thresh%)      正常封顶
+	 *   - STARTUP/DRAIN:          srtt > min_rtt*(1+3*thresh%)    容忍填管瞬态队列,只截病态 bloat
+	 * STARTUP 正常 ramp 退出时队列约 1 BDP (srtt~2x); 3x 阈值 (thresh=50 → 2.5x) 给足余量
+	 * 不误伤探测, 卡死流的 4-16x bloat 仍被截住。delay_cap_thresh=0 关闭。 */
+	{
 		u32 dthr = READ_ONCE(ls_params.delay_cap_thresh);
 
 		if (dthr && ls->min_rtt_us && ls->min_rtt_us != ~0U) {
 			u32 srtt = tp->srtt_us >> 3;
+			/* STARTUP/DRAIN 用 3 倍阈值容忍正常 ramp 的瞬态队列 */
+			u32 mult = ls->full_bw_reached ? dthr : dthr * 3;
 			u32 trip = ls->min_rtt_us +
-			           (u32)((u64)ls->min_rtt_us * dthr / 100);
+			           (u32)((u64)ls->min_rtt_us * mult / 100);
 
 			if (srtt > trip) {
 				u32 bdp = ls_bdp(sk, ls_bw(sk), LS_UNIT);
@@ -1899,7 +1904,7 @@ apply_cap:
 				/* 同时下拉探测上界,否则 FAST/PROBE_UP 会在下个 ACK 把 cwnd
 				 * 重新顶回 inflight_hi → cwnd 在 dcap↔inflight_hi 之间震荡,
 				 * RTT 尖峰回弹。把 inflight_hi 收到 dcap 形成稳定低位运行点;
-				 * 队列排空后 PROBE_UP 仍会按需重新探高。 */
+				 * 队列排空后 PROBE_UP 仍会按需重新探高 (见 LS_BW_PROBE_UP 的 bloated 门控)。 */
 				if (ls->inflight_hi != ~0U)
 					ls->inflight_hi = min(ls->inflight_hi, dcap);
 			}

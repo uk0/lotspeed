@@ -1897,8 +1897,17 @@ apply_cap:
 			           (u32)((u64)ls->min_rtt_us * mult / 100);
 
 			if (srtt > trip) {
-				u32 bdp = ls_bdp(sk, ls_bw(sk), LS_UNIT);
-				u32 dcap = max(bdp + (bdp >> 2), ls_get_min_cwnd());
+				/* 封顶目标用"队列比例"估计 BDP, 不用 bw 估计:
+				 * STARTUP 下 bw 样本会被突发 ACK 拉高失真 (实测 ls_bw 偏高 5x →
+				 * BDP*1.25 算出 ≈max_cwnd, 封顶形同虚设)。in_flight 中真正填管的
+				 * 部分 = in_flight × min_rtt/srtt (srtt=min_rtt+排队, 填管占比 min_rtt/srtt),
+				 * ×1.25 留余量。这是 Vegas/FAST/Copa 的时延型 BDP 估计, bw 无关、
+				 * STARTUP/稳态都稳健。用 in_flight (已发数据, RTT 内稳定) 而非 cwnd,
+				 * 避免逐 ACK 复合过削。 */
+				u32 inflt = tcp_packets_in_flight(tp);
+				u32 dcap = (u32)(((u64)inflt * ls->min_rtt_us) / srtt);
+
+				dcap = max(dcap + (dcap >> 2), ls_get_min_cwnd());
 
 				cwnd = min(cwnd, dcap);
 				/* 同时下拉探测上界,否则 FAST/PROBE_UP 会在下个 ACK 把 cwnd

@@ -2260,7 +2260,21 @@ static void ls_update_cycle_phase(struct sock *sk, const struct rate_sample *rs)
 
 	case LS_BW_PROBE_UP:
 		if (ls->full_bw_reached || ls->loss_too_high || ls->ecn_in_round) {
-			if (ls->inflight_hi == ~0U || inflight > ls->inflight_hi)
+			u32 dthr = READ_ONCE(ls_params.delay_cap_thresh);
+			bool bloated = false;
+
+			/* 站立队列存在 (srtt 超 min_rtt 的 trip) 时不再抬高 inflight_hi:
+			 * 队列即已到/超容量, 再探高只会喂大 bufferbloat, 且会顶翻延迟门控
+			 * 封顶造成 cwnd 震荡。队列排空 (srtt 回落) 后自然恢复探高。
+			 * 仅 delay_cap_thresh>0 时生效, 关时退回原 BBR 探测行为。 */
+			if (dthr && ls->min_rtt_us && ls->min_rtt_us != ~0U) {
+				u32 trip = ls->min_rtt_us +
+				           (u32)((u64)ls->min_rtt_us * dthr / 100);
+				bloated = (tcp_sk(sk)->srtt_us >> 3) > trip;
+			}
+
+			if (!bloated &&
+			    (ls->inflight_hi == ~0U || inflight > ls->inflight_hi))
 				ls->inflight_hi = inflight;
 			ls_enter_probe_bw(sk, LS_BW_PROBE_DOWN);
 		}

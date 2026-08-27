@@ -249,6 +249,14 @@ static struct ctl_table_header *ls_sysctl_header;
 static int ls_hist_clear_handler(const struct ctl_table *table, int write,
                                  void *buffer, size_t *lenp, loff_t *ppos);
 
+/* delay_cap_thresh 的上界。此前它用裸 proc_douintvec, 任何 u32 都能写进去,
+ * 而 ls_update_delay_capped 里 STARTUP 支路要算 dthr*3 —— 巨大值会在 u32 里
+ * 回绕成很小的数, 反而算出偏小的 trip_hi, 让封顶恒定生效并永久禁止 PROBE_UP
+ * 探高。1000% (= 11x min_rtt) 已远超任何有意义的 bloat 容忍度。
+ * 下界只能取 0 (minmax 表达不了"0 或 >= 50"), 0 保留"关闭"语义;非零值的
+ * 有效下限由 ls_update_delay_capped 内部对 mult 的钳制保证。 */
+static unsigned int ls_delay_cap_thresh_max = 1000;
+
 static struct ctl_table ls_sysctl_table[] = {
 	{
 		.procname       = "min_cwnd",
@@ -602,7 +610,9 @@ static struct ctl_table ls_sysctl_table[] = {
 		.data           = &ls_params.delay_cap_thresh,
 		.maxlen         = sizeof(unsigned int),
 		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
+		.proc_handler   = proc_douintvec_minmax,
+		.extra1         = SYSCTL_ZERO,
+		.extra2         = &ls_delay_cap_thresh_max,
 	},
 	{
 		.procname       = "full_loss_cnt",
@@ -776,7 +786,10 @@ struct lotspeed {
 	u8      mode;                   /* ls_mode (0-3) */
 	u8      cycle_idx;              /* ls_bw_phase (0-3) */
 	u16     rho_scale;              /* 高延迟 rho (100=1.0x); u16 支持洲际 >2.55x 补偿 */
-	u8      init_cwnd;              /* 初始 cwnd */
+	/* init_cwnd 本来就只用 7 位 (ls_init 里 min(0x7FU, ...) 显式截断),
+	 * 拆出最高位给延迟封顶的迟滞状态,零字节代价 —— 结构体已满 128。 */
+	u8      init_cwnd:7;            /* 初始 cwnd (0-127) */
+	u8      delay_capped:1;         /* 延迟门控封顶迟滞态: 置位期间持续封顶 */
 	u8      rounds_since_probe;     /* 距上次探测的轮次 */
 	u8      startup_rounds;         /* 启动轮次计数 */
 	u8      full_bw_cnt;            /* 带宽平台计数 */
@@ -810,13 +823,29 @@ struct lotspeed {
 	u8      try_fast_path:1;        /* 尝试快速路径 */
 	u8      full_bw_now:1;          /* 当前达到满带宽 */
 	u8      has_seen_rtt:1;         /* 已观测到 RTT */
-	u8      rack_detect_loss:1;     /* RACK 检测到丢包 */
+	/* 原 rack_detect_loss:1 已删 — 全文件只有声明与清零、零处读取。
+	 * 真实丢包由内核 RACK 经 rs->lost 上报,在 ls_main 消费,该位是死状态。
+	 * 回收出的位用于把 loss_rate_pct 从 5-bit 扩成完整 u8 (见下)。 */
 
-	/* === 标志位 byte 4 (8 bits) - RACK-TLP === */
-	u8      tlp_high_seq_set:1;     /* TLP high_seq 已设置 */
+	/* === 标志位 byte 4 - RACK-TLP === */
+	/* 原 tlp_high_seq_set:1 / rack_reord_seen:1 同样只写不读,一并删除。 */
 	u8      tlp_in_progress:1;      /* TLP 探测进行中 */
-	u8      rack_reord_seen:1;      /* RACK 观察到乱序 */
-	u8      loss_rate_pct:5;        /* 连续丢包率 EWMA (0-31%,驱动窗口收紧) */
+
+	/* 连续丢包率 EWMA。单位是 1/8 %,不是 1% —— 别改回百分比。
+	 * 旧版是 :5 位域 + 整数除法 EWMA (x*7+spc)/8,存在吸收态:
+	 * 从 0 出发时任何 spc<8 都被除成 0,永远抬不起来。实测稳态下
+	 * 真实丢包 1-7% → 该字段恒为 0,8% → 1,10% → 3,12% → 5,
+	 * 于是 README 目标工况 (丢包 2-10%) 里 headroom_loss_gain 默认开着
+	 * 却完全空转。改成 1/8% 分辨率 + 增量式 EWMA 后 1% 丢包即得到 8,
+	 * 消费端 ls_inflight_with_headroom 的分母相应从 10000 改成 80000。
+	 * 注意: "本字段 == 0 等价于无丢包"是 ls_inflight_with_headroom 的前提,
+	 * 它要求 EWMA 双向都能精确收敛 —— 别给更新式加四舍五入偏置,那会造成
+	 * 下界卡死在非零值 (详见 ls_update_round_start 里的 ceil/floor 说明)。
+	 * 满量程 255 = 31.875%,与旧版 31% 饱和点基本一致。
+	 * 位置说明: 删掉的 3 个死位让前面的位域组从 4 字节缩到 3 字节,
+	 * 本字段落在偏移 110,偏移 111 仍是 rack_rtt_us 的 4 字节对齐填充,
+	 * 故 sizeof 仍为 128 == ICSK_CA_PRIV_SIZE。 */
+	u8      loss_rate_pct;
 
 	/* === RACK-TLP 状态 (8 bytes) === */
 	u32     rack_rtt_us;            /* RACK 使用的 RTT */
@@ -862,6 +891,19 @@ static atomic64_t ls_hist_hits = ATOMIC64_INIT(0);
 static atomic64_t ls_hist_seeds = ATOMIC64_INIT(0);
 static struct proc_dir_entry *ls_hist_proc;
 
+/* 表项释放必须过 RCU 宽限期: 读侧 ls_hist_lookup 在 rcu_read_lock() 下
+ * 遍历并解引用表项,写侧若 hash_del + 立即 kmem_cache_free,在途读者就会
+ * 踩到已归还 slab 的内存 (UAF)。lotspeedctl 的 tune 子命令会主动写
+ * hist_clear,这是可被用户态直接触发的真实 crasher,不是理论风险。
+ *
+ * 用不了 kfree_rcu(): 表项来自专用 kmem_cache,必须还回同一个 cache,
+ * 而 kfree_rcu 走的是 kfree 路径。故自备回调。 */
+static void ls_hist_free_rcu(struct rcu_head *h)
+{
+	kmem_cache_free(ls_hist_cache,
+	                container_of(h, struct ls_hist_entry, rcu));
+}
+
 /* sysctl write-only trigger: `echo 1 > /proc/sys/net/ipv4/lotspeed/hist_clear`
  * flushes the whole per-IP cache. Used by CLI to nuke poisoned entries from
  * earlier broken runs. */
@@ -878,8 +920,8 @@ static int ls_hist_clear_handler(const struct ctl_table *table, int write,
 	}
 	spin_lock_bh(&ls_hist_lock);
 	hash_for_each_safe(ls_hist_table, bkt, tmp, entry, node) {
-		hash_del(&entry->node);
-		kmem_cache_free(ls_hist_cache, entry);
+		hash_del_rcu(&entry->node);
+		call_rcu(&entry->rcu, ls_hist_free_rcu);
 		freed++;
 	}
 	atomic_set(&ls_hist_count, 0);
@@ -895,10 +937,11 @@ static int ls_hist_clear_handler(const struct ctl_table *table, int write,
 /* hist v3 观测: /proc/net/lotspeed_hist 只读 dump。
  * 首行汇总: hits=<N> seeds=<N> entries=<N>,随后每表项一行。
  *
- * 锁选择: 本表所有释放路径 (hist_update 淘汰 / hist_clear / 模块卸载)
- * 均为 hash_del + 立即 kmem_cache_free,并未经 RCU 宽限期延迟释放
- * (表项里的 rcu_head 从未接入 kfree_rcu)。RCU 读侧遍历挡不住表项在
- * 遍历途中被释放,故此处持 ls_hist_lock 自旋锁遍历。
+ * 锁选择: 释放路径现在统一走 call_rcu(ls_hist_free_rcu),表项已受 RCU
+ * 宽限期保护,理论上可以改成 rcu_read_lock + hash_for_each_rcu 遍历。
+ * 这里仍然持 ls_hist_lock 自旋锁,是为了让 dump 与写侧互斥、拿到一致快照
+ * (RCU 遍历只保证表项不被释放,不保证 bw_bytes_sec/sample_cnt 等字段的
+ * 就地更新不被撕裂,dump 会读到半新半旧的组合)。
  * seq_printf 只写预分配缓冲区、不睡眠,持锁安全;全表扫描的代价与
  * 既有淘汰路径 (hash_for_each 找最旧项) 相当。 */
 static int ls_hist_proc_show(struct seq_file *m, void *v)
@@ -1141,13 +1184,16 @@ static u32 ls_inflight_with_headroom(struct sock *sk)
 	 * 路径受限链路 (ISP per-flow 限速) 上,BDP 之上的每个在途包都是纯丢包暴露
 	 * (零吞吐收益,因为没有更多带宽可发现)。丢包率越高 → headroom 越大 →
 	 * cap 越逼近 BDP,减少绝对丢包数 → 减少重传 → 提高 goodput;窗口更小 →
-	 * 瓶颈队列更短 → 降低延迟。loss_rate_pct 为连续 EWMA (0-31%)。
-	 * 额外 headroom = inflight_hi * loss% * gain / 10000。
+	 * 瓶颈队列更短 → 降低延迟。loss_rate_pct 为连续 EWMA,
+	 * 单位 1/8 % (0-255 → 0-31.875%),不是百分比。
+	 * 额外 headroom = inflight_hi * loss_rate_pct * gain / 80000。
+	 * 分母 80000 而非 10000: 单位细了 8 倍,分母同步放大 8 倍,
+	 * gain 的语义不变 (gain=100 → 丢包 10% 时额外 10% headroom)。
 	 * gain=0 关闭 (退回 BBR v3 默认行为)。 */
 	gain = READ_ONCE(ls_params.headroom_loss_gain);
 	if (gain && ls->loss_rate_pct) {
 		u32 extra = (u32)(((u64)ls->inflight_hi *
-		                   ls->loss_rate_pct * gain) / 10000);
+		                   ls->loss_rate_pct * gain) / 80000);
 		headroom += extra;
 	}
 	headroom = max(headroom, 1U);
@@ -1349,17 +1395,48 @@ static u32 ls_update_round_start(struct sock *sk, const struct rate_sample *rs)
 		ls->next_rtt_delivered = tp->delivered;
 		ls->round_start = 1;
 
-		/* 连续丢包率 EWMA: 本轮 lost/delivered,5-bit 饱和于 31%。
+		/* 连续丢包率 EWMA: 本轮 lost/delivered,u8 饱和于 31.875%。
 		 * 驱动丢包正比窗口收紧 (ls_inflight_with_headroom)。
-		 * tp->lost 单调累计,decrease 时取 0 兜底。 */
+		 * tp->lost 单调累计,decrease 时取 0 兜底。
+		 *
+		 * 单位是 1/8 %。乘 800 而非 100 —— 旧版按整数百分比存,配上
+		 * (x*7+spc)/8 这个直接赋值形的 EWMA 就产生吸收态: x=0 时任何
+		 * spc<8 算出来还是 0,丢包 1-7% 永远抬不起这个字段,下游的
+		 * headroom 补偿常年为零。
+		 *
+		 * 更新式是增量形,但**绝不能写成"+4 后算术右移"的四舍五入**
+		 * ((s16)(spc8 - pct + 4) >> 3):那个 +4 让步长为 0 的差值区间
+		 * 变成 [-4,+3],即宽度 8 的死区。逐位实测 (从 0 出发、spc8 恒为
+		 * 8 = 1% 丢包): 0→1→2→3→4→5,此后 8-5+4=7,7>>3==0 卡死,
+		 * 稳态是 5 而不是 8。穷举 spc8∈[0,255]: 从下方收敛的不动点恒为
+		 * spc8-3、从上方恒为 spc8+4,256 个取值里 255 个不收敛。
+		 * 最致命的是衰减方向 —— spc8=0 时只掉到 4 就停住,永远回不到 0,
+		 * 于是 ls_inflight_with_headroom 的 `if (gain && loss_rate_pct)`
+		 * 在任何一次丢包事件之后永久为真,干净链路上恒定多扣 headroom,
+		 * 该字段也再不能当"无丢包"谓词使用。
+		 *
+		 * 正确写法: 上行取 ceil、下行取 floor。同为 1/8 增益,双向都精确
+		 * 收敛到 spc8,无死区、无过冲。差值必须先转 s32 再判号:
+		 * spc8 - loss_rate_pct 在 u32 里是回绕的无符号数,直接 >> 会变成
+		 * 加一个巨大正数;s32 下的 d >> 3 才是算术右移 (向下取整)。
+		 * 穷举 256x256 组 (spc8 × 初值) 验证: 0 例不收敛 / 0 例 u8 回绕 /
+		 * 0 例过冲,最坏 31 步收敛。
+		 *
+		 * 乘法走 u64: 乘数从 100 抬到 800 后 u32 溢出阈值降到约 537 万
+		 * 包/轮,虽然 cwnd 远达不到,但这条路每 RTT 只跑一次,不值得
+		 * 为省一次除法留隐患。 */
 		{
 			u32 round_lost = (tp->lost > ls->prior_lost) ?
 			                 tp->lost - ls->prior_lost : 0;
 			ls->prior_lost = tp->lost;
 			if (round_delivered > 0) {
-				u32 spc = min_t(u32, 31,
-				                round_lost * 100 / round_delivered);
-				ls->loss_rate_pct = (ls->loss_rate_pct * 7 + spc) / 8;
+				u32 spc8 = min_t(u32, 255,
+				                 (u32)div_u64((u64)round_lost * 800,
+				                              round_delivered));
+				s32 d = (s32)spc8 - ls->loss_rate_pct;
+
+				ls->loss_rate_pct += (d > 0) ? ((d + 7) >> 3)
+				                             : (d >> 3);
 			}
 		}
 	}
@@ -1763,8 +1840,10 @@ static void ls_hist_update(struct sock *sk)
 			}
 		}
 		if (oldest) {
-			hash_del(&oldest->node);
-			kmem_cache_free(ls_hist_cache, oldest);
+			hash_del_rcu(&oldest->node);
+			/* 延迟到宽限期后归还 slab: 并发的 ls_hist_lookup 可能
+			 * 正握着这个表项 (它只持 rcu_read_lock,不持本锁)。 */
+			call_rcu(&oldest->rcu, ls_hist_free_rcu);
 			atomic_dec(&ls_hist_count);
 		}
 	}
@@ -1776,7 +1855,10 @@ static void ls_hist_update(struct sock *sk)
 		entry->rtt_min_us = ls->min_rtt_us;
 		entry->sample_cnt = 1;
 		entry->last_update_jif = get_jiffies_64();
-		hash_add(ls_hist_table, &entry->node, daddr);
+		/* _rcu 版本自带 store-release: 保证上面这些字段的写入对
+		 * 读侧可见后表项才挂链。普通 hash_add 缺这道屏障,弱序架构
+		 * (arm64) 上读者可能先看到链表指针、后看到未初始化的字段。 */
+		hash_add_rcu(ls_hist_table, &entry->node, daddr);
 		atomic_inc(&ls_hist_count);
 	}
 
@@ -1831,6 +1913,91 @@ static u32 ls_fast_cwnd(struct sock *sk, u32 cwnd, u32 rtt_us)
 	}
 
 	return clamp_t(u32, new_cwnd, ls_get_min_cwnd(), ls_get_max_cwnd());
+}
+
+/* ============== 延迟门控封顶: 迟滞判定 ============== */
+
+/* 黑科技 — 延迟门控窗口封顶 (抗 bufferbloat,直接降延迟) 的**判定**部分。
+ * 站立队列 = 在途超过 BDP 的最直接证据 (比丢包更早更准)。srtt 超过 min_rtt
+ * 的阈值即置 delay_capped,随后由 ls_set_cwnd 把 cwnd 封顶到 BDP*1.25,
+ * 排空队列、延迟回落;pacing 仍按 bw 控速 → 吞吐不变。
+ *
+ * 不再 gated on full_bw_reached: 高丢包下 full_bw 平台检测会被压低的 bw 样本反复
+ * 复位 → 流卡在 STARTUP, 而旧版封顶被 full_bw 门挡住, 窗口照样跑飞撑爆队列
+ * (实测 cwnd 卡 max_cwnd、RTT 1-4s)。改为直接看队列信号、按相位两级阈值快速决策
+ * (每 ACK 仅几步比较, 热路径轻):
+ *   - 稳态 (full_bw_reached): srtt > min_rtt*(1+thresh%)      正常封顶
+ *   - STARTUP/DRAIN:          srtt > min_rtt*(1+3*thresh%)    容忍填管瞬态队列,只截病态 bloat
+ * STARTUP 正常 ramp 退出时队列约 1 BDP (srtt~2x); 3x 阈值 (thresh=50 → 2.5x) 给足余量
+ * 不误伤探测, 卡死流的 4-16x bloat 仍被截住。delay_cap_thresh=0 关闭。
+ *
+ * 迟滞 (delay_capped 位): 旧版每个 ACK 单点比较 srtt>trip, 没有回差 ——
+ * 封顶生效 → 队列排空 → srtt 落回阈值下 → 封顶撤销 → 窗口立刻顶回去 →
+ * srtt 再翻上阈值, 在 trip 附近逐 ACK 抖动开关, RTT 呈锯齿。现在是双阈值:
+ * srtt > hi 置位, 只有 srtt < lo (= hi 的一半超额量) 才清位, 中间带内保持
+ * 已置位状态继续封顶, 形成死区。thresh=50 / min_rtt=165ms 时 hi=247ms,
+ * lo=206ms, 死区 41ms。
+ *
+ * 【为什么判定必须独立成函数、不能塞回 ls_set_cwnd】
+ * 原来判定和施加挤在 ls_set_cwnd 的 apply_cap 块里 —— 那是 delay_capped 的
+ * 唯一写者;而读者在 ls_update_cycle_phase 的 PROBE_UP 分支。两者不在同一
+ * 条路径上:
+ *     ls_main: if (ls_run_fast_path(...)) goto out;   <- 整体跳过 ls_set_cwnd
+ * 但 ls_run_fast_path 内部照样调 ls_update_cycle_phase, 而且它自己不清
+ * try_fast_path (return ls->try_fast_path), 一旦进入就自持。于是这条链成立:
+ *   1. 批量段灌爆队列 → 某个 ACK 上同时置 delay_capped=1 与 try_fast_path=1
+ *   2. 应用转入 app-limited (隧道空转) → 此后每个 ACK 都走快速路径
+ *   3. 队列早已排空、srtt 早已跌回 min_rtt, delay_capped 却冻结在 1 →
+ *      CRUISE→REFILL→PROBE_UP 照常推进, 每次 PROBE_UP 都因该位拒绝抬
+ *      inflight_hi, 直接落 PROBE_DOWN → inflight_hi 只降不升, 流再涨不回来
+ *   4. 同一原因让下面 dthr==0 的显式清位失效: 运行时把 sysctl 调回 0,
+ *      处于快速路径的 socket 永远走不到那行, 位继续粘着 —— 恰是那段注释
+ *      想防的事
+ * 顺带修掉 1 个 ACK 的滞后: 旧版 ls_update_cycle_phase 排在 ls_set_cwnd
+ * 之前, PROBE_UP 读到的永远是上一个 ACK 的判定。
+ * 现在快速路径和慢速路径都在各自的 ls_update_cycle_phase 之前调用本函数。 */
+static void ls_update_delay_capped(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct lotspeed *ls = inet_csk_ca(sk);
+	u32 dthr = READ_ONCE(ls_params.delay_cap_thresh);
+	u32 srtt, mult, lo_pct, trip_hi, trip_lo;
+
+	if (!dthr || !ls->min_rtt_us || ls->min_rtt_us == ~0U) {
+		/* 关闭 / 无 min_rtt 基准: 显式清位。否则运行时把 sysctl 调回 0
+		 * 之后该位会粘住, PROBE_UP 的 bloated 门 (读这个位) 会永久
+		 * 禁止抬高 inflight_hi。 */
+		ls->delay_capped = 0;
+		return;
+	}
+
+	srtt = tp->srtt_us >> 3;
+	/* STARTUP/DRAIN 用 3 倍阈值容忍正常 ramp 的瞬态队列 */
+	mult = ls->full_bw_reached ? dthr : dthr * 3;
+
+	/* 超额百分比下限 50 → 死区下沿 lo_pct >= 25 → trip_lo >= 1.25*min_rtt。
+	 * 这条下限是封顶能不能干活的前提: 施加端算的是
+	 *     dcap = 1.25 * in_flight * min_rtt / srtt
+	 * dcap < in_flight 当且仅当 srtt > 1.25*min_rtt。旧版没有下限,取
+	 * delay_cap_thresh=20 时死区是 [1.10,1.20]*min_rtt, 其中
+	 * dcap ∈ [1.04,1.14]*in_flight > in_flight —— cwnd = min(cwnd, dcap)
+	 * 不再约束任何东西, 封顶停止排队, 但 delay_capped 依然置位、依然禁止
+	 * PROBE_UP 抬 inflight_hi, 退化成"只压不放"。
+	 * 钳在 mult 上而不是钳 dthr: 只钳 dthr 修不好稳态支路 (那里 mult == dthr),
+	 * dthr ∈ [17,49] 时 trip_lo 会反超 trip_hi, 迟滞退化回旧版的单阈值抖动。
+	 * 上界靠 sysctl 的 minmax (<= 1000) 兜住: 裸 proc_douintvec 时 root 写
+	 * 一个巨大值会让 dthr*3 在 u32 里回绕, 算出偏小的 trip_hi → 封顶恒定
+	 * 生效且永久禁止探高。 */
+	mult = max(mult, 50U);
+	lo_pct = mult / 2;
+
+	trip_hi = ls->min_rtt_us + (u32)((u64)ls->min_rtt_us * mult / 100);
+	trip_lo = ls->min_rtt_us + (u32)((u64)ls->min_rtt_us * lo_pct / 100);
+
+	if (srtt > trip_hi)
+		ls->delay_capped = 1;
+	else if (srtt < trip_lo)
+		ls->delay_capped = 0;
 }
 
 /* ============== cwnd 设置 ============== */
@@ -1937,50 +2104,40 @@ static void ls_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 apply_cap:
 	cwnd = clamp_t(u32, cwnd, ls_get_min_cwnd(), ls_get_max_cwnd());
 
-	/* 黑科技 — 延迟门控窗口封顶 (抗 bufferbloat,直接降延迟):
-	 * 站立队列 = 在途超过 BDP 的最直接证据 (比丢包更早更准)。srtt 超过 min_rtt
-	 * 的阈值即把 cwnd 封顶到 BDP*1.25,排空队列、延迟回落;pacing 仍按 bw 控速 → 吞吐不变。
+	/* 延迟门控窗口封顶的**施加**部分。迟滞状态位 delay_capped 由
+	 * ls_update_delay_capped 在本次 ACK 更早的时点算好 —— 判定别挪回这里,
+	 * 原因见那个函数头上的长注释 (快速路径整体跳过 ls_set_cwnd, 判定留在
+	 * 这里会变成永不刷新的陈旧闩锁)。
 	 *
-	 * 不再 gated on full_bw_reached: 高丢包下 full_bw 平台检测会被压低的 bw 样本反复
-	 * 复位 → 流卡在 STARTUP, 而旧版封顶被 full_bw 门挡住, 窗口照样跑飞撑爆队列
-	 * (实测 cwnd 卡 max_cwnd、RTT 1-4s)。改为直接看队列信号、按相位两级阈值快速决策
-	 * (每 ACK 仅几步比较, 热路径轻):
-	 *   - 稳态 (full_bw_reached): srtt > min_rtt*(1+thresh%)      正常封顶
-	 *   - STARTUP/DRAIN:          srtt > min_rtt*(1+3*thresh%)    容忍填管瞬态队列,只截病态 bloat
-	 * STARTUP 正常 ramp 退出时队列约 1 BDP (srtt~2x); 3x 阈值 (thresh=50 → 2.5x) 给足余量
-	 * 不误伤探测, 卡死流的 4-16x bloat 仍被截住。delay_cap_thresh=0 关闭。 */
-	{
-		u32 dthr = READ_ONCE(ls_params.delay_cap_thresh);
+	 * 封顶目标 dcap 每次现算而非缓存 —— 它是 (in_flight, srtt) 的纯函数,
+	 * 结构体也没有 4 字节可以存它。死区下沿被钳到 >= 1.25*min_rtt (见判定
+	 * 函数里的 mult 下限), 因此死区内恒有 dcap <= in_flight, 封顶持续把队列
+	 * 往下排, 直到 srtt 跌破 lo。 */
+	if (ls->delay_capped) {
+		/* 封顶目标用"队列比例"估计 BDP, 不用 bw 估计:
+		 * STARTUP 下 bw 样本会被突发 ACK 拉高失真 (实测 ls_bw 偏高 5x →
+		 * BDP*1.25 算出 ≈max_cwnd, 封顶形同虚设)。in_flight 中真正填管的
+		 * 部分 = in_flight × min_rtt/srtt (srtt=min_rtt+排队, 填管占比 min_rtt/srtt),
+		 * ×1.25 留余量。这是 Vegas/FAST/Copa 的时延型 BDP 估计, bw 无关、
+		 * STARTUP/稳态都稳健。用 in_flight (已发数据, RTT 内稳定) 而非 cwnd,
+		 * 避免逐 ACK 复合过削。
+		 *
+		 * srtt 除法安全: 该位只能由 srtt > trip_hi >= min_rtt >= 1 置起,
+		 * 且 tp->srtt_us 在 tcp_ack 里早已更新完毕, 整个 ls_main 期间不再变化 ——
+		 * 判定与施加之间隔了几个函数也不影响这个不变量。 */
+		u32 srtt = tp->srtt_us >> 3;
+		u32 inflt = tcp_packets_in_flight(tp);
+		u32 dcap = (u32)(((u64)inflt * ls->min_rtt_us) / srtt);
 
-		if (dthr && ls->min_rtt_us && ls->min_rtt_us != ~0U) {
-			u32 srtt = tp->srtt_us >> 3;
-			/* STARTUP/DRAIN 用 3 倍阈值容忍正常 ramp 的瞬态队列 */
-			u32 mult = ls->full_bw_reached ? dthr : dthr * 3;
-			u32 trip = ls->min_rtt_us +
-			           (u32)((u64)ls->min_rtt_us * mult / 100);
+		dcap = max(dcap + (dcap >> 2), ls_get_min_cwnd());
 
-			if (srtt > trip) {
-				/* 封顶目标用"队列比例"估计 BDP, 不用 bw 估计:
-				 * STARTUP 下 bw 样本会被突发 ACK 拉高失真 (实测 ls_bw 偏高 5x →
-				 * BDP*1.25 算出 ≈max_cwnd, 封顶形同虚设)。in_flight 中真正填管的
-				 * 部分 = in_flight × min_rtt/srtt (srtt=min_rtt+排队, 填管占比 min_rtt/srtt),
-				 * ×1.25 留余量。这是 Vegas/FAST/Copa 的时延型 BDP 估计, bw 无关、
-				 * STARTUP/稳态都稳健。用 in_flight (已发数据, RTT 内稳定) 而非 cwnd,
-				 * 避免逐 ACK 复合过削。 */
-				u32 inflt = tcp_packets_in_flight(tp);
-				u32 dcap = (u32)(((u64)inflt * ls->min_rtt_us) / srtt);
-
-				dcap = max(dcap + (dcap >> 2), ls_get_min_cwnd());
-
-				cwnd = min(cwnd, dcap);
-				/* 同时下拉探测上界,否则 FAST/PROBE_UP 会在下个 ACK 把 cwnd
-				 * 重新顶回 inflight_hi → cwnd 在 dcap↔inflight_hi 之间震荡,
-				 * RTT 尖峰回弹。把 inflight_hi 收到 dcap 形成稳定低位运行点;
-				 * 队列排空后 PROBE_UP 仍会按需重新探高 (见 LS_BW_PROBE_UP 的 bloated 门控)。 */
-				if (ls->inflight_hi != ~0U)
-					ls->inflight_hi = min(ls->inflight_hi, dcap);
-			}
-		}
+		cwnd = min(cwnd, dcap);
+		/* 同时下拉探测上界,否则 FAST/PROBE_UP 会在下个 ACK 把 cwnd
+		 * 重新顶回 inflight_hi → cwnd 在 dcap↔inflight_hi 之间震荡,
+		 * RTT 尖峰回弹。把 inflight_hi 收到 dcap 形成稳定低位运行点;
+		 * 队列排空后 PROBE_UP 仍会按需重新探高 (见 LS_BW_PROBE_UP 的 bloated 门控)。 */
+		if (ls->inflight_hi != ~0U)
+			ls->inflight_hi = min(ls->inflight_hi, dcap);
 	}
 
 	/* CRUISE headroom 仅在本周期实际承受过丢包/ECN 退避压力时才施加:
@@ -2257,10 +2414,8 @@ static void ls_rack_tlp_main(struct sock *sk, const struct rate_sample *rs)
 	}
 
 	/* 每轮重置 TLP 计数 */
-	if (ls->round_start) {
+	if (ls->round_start)
 		ls->tlp_probes_out = 0;
-		ls->rack_detect_loss = 0;
-	}
 }
 
 /* ============== PROBE_BW 状态机 ============== */
@@ -2337,20 +2492,19 @@ static void ls_update_cycle_phase(struct sock *sk, const struct rate_sample *rs)
 
 	case LS_BW_PROBE_UP:
 		if (ls->full_bw_reached || ls->loss_too_high || ls->ecn_in_round) {
-			u32 dthr = READ_ONCE(ls_params.delay_cap_thresh);
-			bool bloated = false;
-
-			/* 站立队列存在 (srtt 超 min_rtt 的 trip) 时不再抬高 inflight_hi:
-			 * 队列即已到/超容量, 再探高只会喂大 bufferbloat, 且会顶翻延迟门控
-			 * 封顶造成 cwnd 震荡。队列排空 (srtt 回落) 后自然恢复探高。
-			 * 仅 delay_cap_thresh>0 时生效, 关时退回原 BBR 探测行为。 */
-			if (dthr && ls->min_rtt_us && ls->min_rtt_us != ~0U) {
-				u32 trip = ls->min_rtt_us +
-				           (u32)((u64)ls->min_rtt_us * dthr / 100);
-				bloated = (tcp_sk(sk)->srtt_us >> 3) > trip;
-			}
-
-			if (!bloated &&
+			/* 站立队列存在时不再抬高 inflight_hi: 队列即已到/超容量,
+			 * 再探高只会喂大 bufferbloat, 且会顶翻延迟门控封顶造成 cwnd 震荡。
+			 * 队列排空 (srtt 跌破迟滞下阈) 后自然恢复探高。
+			 *
+			 * 直接读 delay_capped 位, 不再自己算 trip: 此前这里和 ls_set_cwnd
+			 * 的封顶块各算各的阈值 (而且这里漏了 STARTUP/DRAIN 的 3 倍相位系数),
+			 * 两处判定会在阈值附近不一致 —— 一边已封顶、另一边还在抬 inflight_hi。
+			 * 现在共享同一个迟滞状态位。delay_cap_thresh=0 时该位恒为 0,
+			 * 退回原 BBR 探测行为。
+			 * 该位的唯一写者已从 ls_set_cwnd 挪到 ls_update_delay_capped,
+			 * 并且两条路径 (慢速 / 快速) 都在调用本函数之前刷新它 ——
+			 * 别把写者挪回 ls_set_cwnd, 那样快速路径读到的会是陈旧闩锁。 */
+			if (!ls->delay_capped &&
 			    (ls->inflight_hi == ~0U || inflight > ls->inflight_hi))
 				ls->inflight_hi = inflight;
 			ls_enter_probe_bw(sk, LS_BW_PROBE_DOWN);
@@ -2408,6 +2562,10 @@ static bool ls_run_fast_path(struct sock *sk, const struct rate_sample *rs,
 
 	/* 快速路径: 只更新 min_rtt 和周期状态 */
 	ls_check_drain(sk, rs);
+	/* 必须在 ls_update_cycle_phase 之前刷新 delay_capped: 快速路径不调
+	 * ls_set_cwnd (原来那里是该位的唯一写者), 而 PROBE_UP 在这里就要读它。
+	 * 漏掉这行 = 队列排空后该位仍冻结在 1, inflight_hi 只降不升。 */
+	ls_update_delay_capped(sk);
 	ls_update_cycle_phase(sk, rs);
 	ls_update_min_rtt(sk, rs);
 
@@ -2484,6 +2642,10 @@ static void ls_main(struct sock *sk, const struct rate_sample *rs)
 		ls_check_full_bw_reached(sk, rs, bw_sample);
 
 	ls_check_drain(sk, rs);
+	/* 同样必须排在 ls_update_cycle_phase 之前: 判定原来在 ls_set_cwnd 里,
+	 * 而 ls_set_cwnd 排在 ls_update_cycle_phase 之后 → PROBE_UP 读到的
+	 * 永远是上一个 ACK 的 delay_capped, 有 1 个 ACK 的滞后。 */
+	ls_update_delay_capped(sk);
 	ls_update_cycle_phase(sk, rs);
 	ls_update_min_rtt(sk, rs);
 
@@ -2568,10 +2730,7 @@ static void ls_init(struct sock *sk)
 	ls->rack_end_seq = tp->snd_una;
 	ls->rack_xmit_ts = 0;
 	ls->tlp_probes_out = 0;
-	ls->rack_detect_loss = 0;
-	ls->tlp_high_seq_set = 0;
 	ls->tlp_in_progress = 0;
-	ls->rack_reord_seen = 0;
 
 	/* 检测高延迟路径 */
 	ls_update_high_delay_path(sk);
@@ -2812,10 +2971,15 @@ static void __exit lotspeed_v2_exit(void)
 	if (ls_hist_cache) {
 		spin_lock_bh(&ls_hist_lock);
 		hash_for_each_safe(ls_hist_table, bkt, tmp, entry, node) {
-			hash_del(&entry->node);
-			kmem_cache_free(ls_hist_cache, entry);
+			hash_del_rcu(&entry->node);
+			call_rcu(&entry->rcu, ls_hist_free_rcu);
 		}
 		spin_unlock_bh(&ls_hist_lock);
+		/* 必须在 kmem_cache_destroy 之前排空在途 RCU 回调:
+		 * 上面刚排队的 ls_hist_free_rcu 还要往这个 cache 里还对象,
+		 * 先销毁 cache 就是卸载时的 UAF (回调本身也在模块 .text 里,
+		 * 模块卸完再跑回调直接跳进已释放代码段)。 */
+		rcu_barrier();
 		kmem_cache_destroy(ls_hist_cache);
 	}
 

@@ -1173,6 +1173,17 @@ static u64 ls_bw_to_pacing_rate(struct sock *sk, u32 bw, int gain)
 	u32 pacing_margin = READ_ONCE(ls_params.pacing_margin);
 	u64 rate;
 
+	/* bw 未知 (滤波器为空) 时返回 0 而非退到 1 B/s 下界。
+	 *
+	 * 旧代码在此处 max(rate, 1ULL): bw==0 -> 1 字节/秒。内核 EDT pacing
+	 * (ls_init 已置 SK_PACING_NEEDED) 按 len/rate 推进 tcp_wstamp_ns,
+	 * 一个 1448B 段 = +1448 秒;tcp_pacing_check 对普通发送和 RTO 重传一视同仁,
+	 * 于是连接被钉死, 只有退避到 120s 上限的 RTO 重传能挤出来。
+	 * 实测确定性冻结在 22 段 / 31856 字节 (green1, 5 次复现, 2 客户端 2 路径)。
+	 * 返回 0 后由调用方保持既有的种子速率, 绝不写入病态低值。 */
+	if (unlikely(!bw))
+		return 0;
+
 	rate = (u64)bw * tp->mss_cache;
 	rate *= gain;
 	rate >>= LS_SCALE;
@@ -1189,10 +1200,59 @@ static u64 ls_bw_to_pacing_rate(struct sock *sk, u32 bw, int gain)
 	return min_t(u64, rate, READ_ONCE(sk->sk_max_pacing_rate));
 }
 
+/* 初始 pacing 速率播种 —— BBR bbr_init_pacing_rate_from_rtt() 的等价物。
+ *
+ * ls_init 时 bw 滤波器为空 (bw_hi[0]=bw_hi[1]=0 -> ls_bw()==0), 而本 CC 是
+ * pacing 驱动的: 发送闸门是 pacing_rate 而非 cwnd。此前没有任何初始播种 ——
+ * has_seen_rtt 字段自 BBR 移植过来后一直是死旗 (只声明和清零, 无人读写),
+ * 因为用它的那个函数从未被移植。唯一会无条件写 sk_pacing_rate 的是 hist 命中
+ * 分支, 于是"有没有 pacing 种子"一直搭在"hist 是否命中"上 —— 冷目的地即裸奔。
+ *
+ * 用 init_cwnd/RTT 播种一个合理速率, 让第一个 RTT 就能按 STARTUP 增益发送。 */
+static void ls_init_pacing_rate_from_rtt(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct lotspeed *ls = inet_csk_ca(sk);
+	u32 rtt_us;
+	u64 bw, rate;
+
+	if (tp->srtt_us) {		/* 已有 RTT 样本 (被动开: SYN-ACK 之后即有) */
+		rtt_us = max(tp->srtt_us >> 3, 1U);
+		ls->has_seen_rtt = 1;
+	} else {
+		rtt_us = USEC_PER_MSEC;	/* 无样本: 名义 1ms, 首个 RTT 样本到达后重播 */
+	}
+
+	bw = (u64)tcp_snd_cwnd(tp) * BW_UNIT;
+	do_div(bw, rtt_us);
+
+	rate = ls_bw_to_pacing_rate(sk, max_t(u32, (u32)bw, 1U), ls->pacing_gain);
+	if (!rate)
+		return;
+
+	/* 无条件写入: sk_pacing_rate 的初值可能是 sock_init_data 的 ~0UL,
+	 * 也可能是 0 —— ls_set_pacing_rate 的 "rate > 当前值" 门会被这两种初值
+	 * 分别卡死 (前者永不成立, 后者放行病态低值), 故种子必须绕开该门。 */
+	WRITE_ONCE(sk->sk_pacing_rate, rate);
+}
+
 static void ls_set_pacing_rate(struct sock *sk, u32 bw, int gain)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct lotspeed *ls = inet_csk_ca(sk);
-	u64 rate = ls_bw_to_pacing_rate(sk, bw, gain);
+	u64 rate;
+
+	/* 首个真实 RTT 样本到达时补种 (BBR bbr_set_pacing_rate 同款守卫)。
+	 * ls_init 时若尚无 srtt (主动开的 SYN 尚未收到 SYN-ACK), 种子按名义 1ms
+	 * 估算, 这里用真实 RTT 重播一次。 */
+	if (unlikely(!ls->has_seen_rtt && tp->srtt_us))
+		ls_init_pacing_rate_from_rtt(sk);
+
+	rate = ls_bw_to_pacing_rate(sk, bw, gain);
+
+	/* bw 未知 -> 保持现有 (种子) 速率, 不做任何写入 */
+	if (!rate)
+		return;
 
 	/* 高延迟路径: 额外提升 */
 	if (ls->high_delay_path && READ_ONCE(ls_params.hd_enable)) {
@@ -1645,7 +1705,10 @@ static void ls_hist_lookup(struct sock *sk)
 					 * cong_control 重算接管,种子偏差可自我修正。 */
 					rate = ls_bw_to_pacing_rate(sk, seed,
 					                            ls->pacing_gain);
-					WRITE_ONCE(sk->sk_pacing_rate, rate);
+					/* seed 过小导致 rate==0 时不要覆盖 ls_init 播下的
+					 * init_cwnd/RTT 种子 —— 否则又回到零速率冻结。 */
+					if (rate)
+						WRITE_ONCE(sk->sk_pacing_rate, rate);
 				}
 			}
 			break;
@@ -2518,6 +2581,11 @@ static void ls_init(struct sock *sk)
 	ls->next_rtt_delivered = tp->delivered;
 
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
+
+	/* 必须在 ls_enter_startup 之后 (要用它设好的 pacing_gain), 且在
+	 * ls_hist_lookup 之前 —— hist 命中时会用历史带宽覆盖这个种子,
+	 * 冷目的地则保留种子。二者顺序即"兜底在前, 精化在后"。 */
+	ls_init_pacing_rate_from_rtt(sk);
 
 	ls_hist_lookup(sk);
 }

@@ -222,3 +222,64 @@ func TestMeasureDispatchMachineWide(t *testing.T) {
 		t.Errorf("machine-wide measure returned negative bw %.3f", m.bwMbps)
 	}
 }
+
+// C3: parseSSTarget now also extracts the unloaded floor and the queueing delay
+// the shaper's E_remote decomposition needs.
+//
+//	minRttMs     = MIN of the per-socket minrtt (the path's unloaded floor)
+//	queueDelayMs = MEDIAN of the per-socket (srtt - minrtt)
+//
+// Per-socket subtraction is the whole point: this box carries mixed regimes
+// (0.3-13ms proxy egress next to 50-264ms accelerated flows), so a global
+// mean(srtt) - min(minrtt) would be the difference between two unrelated paths.
+func TestParseSSTargetMinRttAndQueueDelay(t *testing.T) {
+	st := parseSSTarget(ssTargetFixture)
+	// minrtt: min(50.0, 49.0) = 49.0.
+	if !almost(st.minRttMs, 49.0) {
+		t.Errorf("minRttMs=%.3f want 49.0 (min across sockets)", st.minRttMs)
+	}
+	// per-socket E: 55.0-50.0=5.0 and 51.0-49.0=2.0; the package's
+	// no-interpolation percentile picks element[int(0.5*1)=0] of {2,5} = 2.
+	if !almost(st.queueDelayMs, 2.0) {
+		t.Errorf("queueDelayMs=%.3f want 2.0 (median of per-socket srtt-minrtt)", st.queueDelayMs)
+	}
+	// The pre-existing aggregates must be unchanged by the additions.
+	if st.socks != 2 || st.acked != 12_000_000 || !almost(st.rttMs, 53.0) {
+		t.Errorf("legacy aggregates changed: %+v", st)
+	}
+}
+
+// A socket line with no minrtt: contributes neither a floor nor a queue-delay
+// sample (defensive parse, same policy as the absent retrans: field).
+func TestParseSSTargetMissingMinRtt(t *testing.T) {
+	out := "ESTAB 0 0 10.0.0.2:1 10.0.0.3:443\n" +
+		"     cubic rtt:80.0/5.0 segs_out:10 bytes_acked:1000\n"
+	st := parseSSTarget(out)
+	if st.socks != 1 {
+		t.Fatalf("socks=%d want 1", st.socks)
+	}
+	if st.minRttMs != 0 || st.queueDelayMs != 0 {
+		t.Errorf("minRttMs=%.3f queueDelayMs=%.3f want 0/0 with minrtt absent", st.minRttMs, st.queueDelayMs)
+	}
+}
+
+// isBadLink is the shared link-weather criterion (RTT > 3x the unloaded floor),
+// used by both the optimizer's credit gate and the shaper's logging.
+func TestIsBadLink(t *testing.T) {
+	cases := []struct {
+		rtt, minRtt float64
+		want        bool
+	}{
+		{165, 160, false},
+		{480, 160, false}, // exactly 3x -> ratio-1 == 2.0, not > 2.0
+		{481, 160, true},
+		{1180, 160, true},
+		{500, 0, false}, // no floor yet -> never flag
+		{0, 160, false}, // no measurement -> never flag
+	}
+	for _, c := range cases {
+		if got := isBadLink(c.rtt, c.minRtt); got != c.want {
+			t.Errorf("isBadLink(%.0f, %.0f)=%v want %v", c.rtt, c.minRtt, got, c.want)
+		}
+	}
+}

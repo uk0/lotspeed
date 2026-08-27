@@ -229,3 +229,126 @@ func TestJitterRingSkipBadLinkContract(t *testing.T) {
 		t.Fatalf("weather-poisoned ring MAD=%v not greater than clean MAD=%v — skip guard would be a no-op", poisonedMAD, cleanMAD)
 	}
 }
+
+// C2: the four shaper keys parse, and shaperOK reports the COMPLETE set. The line
+// below is the sample line plus the shaper block, as the shaper-capable module
+// emits it.
+func TestParseNeoqMLShaperKeys(t *testing.T) {
+	line := sampleNeoqLine + " rate_kbps=95000 backlog=131072 shaper_sent=8388608 shaper_defer=17"
+	s, ok := parseNeoqML(line)
+	if !ok {
+		t.Fatal("parseNeoqML ok=false")
+	}
+	if !s.shaperOK {
+		t.Fatal("shaperOK=false with all four shaper keys present")
+	}
+	checks := []struct {
+		name string
+		got  uint64
+		want uint64
+	}{
+		{"rate_kbps", s.rateKbps, 95000},
+		{"backlog", s.backlog, 131072},
+		{"shaper_sent", s.shaperSent, 8388608},
+		{"shaper_defer", s.shaperDefer, 17},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s=%d want %d", c.name, c.got, c.want)
+		}
+	}
+	// The pre-existing fields must be untouched by the additions.
+	if s.qlen != 12 || s.t3Bytes != 7340032 || s.t0PeakDelayUs != 4200 {
+		t.Errorf("shaper keys disturbed the legacy fields: %+v", s)
+	}
+}
+
+// C2 backward compat: today's kernel emits NONE of the shaper keys. The line must
+// still parse (ok=true, legacy fields intact) and shaperOK must be false so the
+// whole fast loop stays disabled — behavior falls back to today's exactly.
+func TestParseNeoqMLShaperAbsentIsCompatible(t *testing.T) {
+	s, ok := parseNeoqML(sampleNeoqLine)
+	if !ok {
+		t.Fatal("legacy line stopped parsing after the shaper keys were added")
+	}
+	if s.shaperOK {
+		t.Error("shaperOK=true on a line with no shaper keys")
+	}
+	if s.qlen != 12 || s.bulkFlows != 1 {
+		t.Errorf("legacy parse changed: %+v", s)
+	}
+}
+
+// C2 forward compat: a PARTIAL shaper key set (a half-upgraded module, or a future
+// rename) must report shaperOK=false. A control law that can compute util but not
+// deficit is more dangerous than one that is simply off.
+func TestParseNeoqMLPartialShaperKeysDisableTheLoop(t *testing.T) {
+	partials := []string{
+		sampleNeoqLine + " rate_kbps=95000",
+		sampleNeoqLine + " rate_kbps=95000 backlog=131072",
+		sampleNeoqLine + " rate_kbps=95000 backlog=131072 shaper_sent=8388608",
+		sampleNeoqLine + " backlog=0 shaper_sent=0 shaper_defer=0",
+	}
+	for i, in := range partials {
+		s, ok := parseNeoqML(in)
+		if !ok {
+			t.Fatalf("partial %d: ok=false", i)
+		}
+		if s.shaperOK {
+			t.Errorf("partial %d: shaperOK=true with an incomplete key set", i)
+		}
+	}
+}
+
+// An all-zero shaper block (shaping present but off) is a valid, complete reading:
+// shaperOK must be true so the controller takes over rather than staying disabled.
+func TestParseNeoqMLShaperZerosAreValid(t *testing.T) {
+	s, ok := parseNeoqML(sampleNeoqLine + " rate_kbps=0 backlog=0 shaper_sent=0 shaper_defer=0")
+	if !ok || !s.shaperOK {
+		t.Errorf("zeroed shaper block: ok=%v shaperOK=%v want true/true", ok, s.shaperOK)
+	}
+}
+
+// Change (C3): score() gains two variance penalties. With an EMPTY goodput ring and
+// NO shaper both must be exact no-ops — the backward-compat guarantee for every box
+// that doesn't run --shaper.
+func TestScoreVarianceTermsNoOpByDefault(t *testing.T) {
+	base := metrics{bwMbps: 100, rttMs: 250, lossPct: 0.02}
+	legacy := newOptimizerForTest(0).score(base)
+
+	o := newOptimizerForTest(0)
+	o.bwRing = []float64{100, 120, 80} // len 3 < jitterMinSamples -> no penalty
+	if got := o.score(base); !almost(got, legacy) {
+		t.Errorf("short goodput ring leaked a penalty: %.6f vs %.6f", got, legacy)
+	}
+	// nil shaper -> rateCV reports not-ok -> no penalty.
+	if o.sh != nil {
+		t.Fatal("test optimizer unexpectedly has a shaper")
+	}
+}
+
+// With a full ring the goodput-variance penalty is exactly
+// goodputVarDelta*clamp(MAD/median, 0, 1), and the R-CV penalty is
+// rateCVDelta*clamp(CV, 0, 1).
+func TestScoreVarianceTerms(t *testing.T) {
+	base := metrics{bwMbps: 100, rttMs: 250, lossPct: 0.02}
+	ring := []float64{100, 104, 96, 102, 98, 103, 97, 101}
+
+	legacy := newOptimizerForTest(0).score(base)
+	o := newOptimizerForTest(0)
+	o.bwRing = append([]float64(nil), ring...)
+	want := legacy - goodputVarDelta*clampF(medianAbsDev(ring)/percentile(ring, 0.5), 0, 1)
+	if got := o.score(base); !almost(got, want) {
+		t.Errorf("goodput-variance penalty: score=%.6f want %.6f", got, want)
+	}
+
+	// Add a shaper whose R ring swings 50/150 -> CV 0.5.
+	sh := &shaper{rRing: []float64{50e6, 150e6, 50e6, 150e6}}
+	o2 := newOptimizerForTest(0)
+	o2.bwRing = append([]float64(nil), ring...)
+	o2.sh = sh
+	want2 := want - rateCVDelta*0.5
+	if got := o2.score(base); !almost(got, want2) {
+		t.Errorf("R-CV penalty: score=%.6f want %.6f", got, want2)
+	}
+}

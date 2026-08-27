@@ -120,9 +120,12 @@ Usage:
   lotspeedctl monitor [sec]          live refresh of CC + NeoQ stats (default 2s)
   lotspeedctl daemon [--interval N] [--iface eth0]
                                      collect loss -> auto-tune anti-loss params
-  lotspeedctl optimize --iface eth0 [--interval N] [--gamma G]
+  lotspeedctl optimize --iface eth0 [--interval N] [--gamma G] [--shaper] [--shaper-max-mbps M]
                                      adaptive search: EXPLORE peak bw -> OPTIMIZE score
                                      (--gamma weights NeoQ Express-delay penalty; 0=off, default 0.3)
+                                     (--shaper enables the 2s shaper-rate feedback loop:
+                                      measurement-driven probe-and-hold on /proc/net/neoq_rate.
+                                      R_max defaults to the NIC line rate; --shaper-max-mbps overrides.)
   lotspeedctl prio [list|add P..|del P..|clear|auto]
                                      manage NeoQ priority ports (auto = detect game/web)
   lotspeedctl boost [N]              get/set NeoQ downstream rwnd boost (percent, 100=off)

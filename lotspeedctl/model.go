@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -41,8 +42,64 @@ type sample struct {
 	JitterMs float64 `json:"jitter_ms,omitempty"`
 }
 
+// shaperCacheEntry 是一条 (对端|RTT 档) 的容量缓存。Kbps 存的是 C_hat (物理量:
+// 这条路能跑多快), 不是 R (当前 headroom 策略下的投影) —— 换了 headroom 策略,
+// 缓存仍然有效。TS 用来判过期 (shaperCacheMaxAge)。
+type shaperCacheEntry struct {
+	Kbps float64 `json:"kbps"`
+	TS   int64   `json:"ts"`
+}
+
 type model struct {
 	Samples []sample `json:"samples"`
+	// ShaperCache 让 shaper 冷启动能跳过一次完整的 SEEK 上探 (键: "<ip>|<band>",
+	// 见 shaper.cacheKey)。omitempty 保证老 model.json 原样可读、也不会因为没跑过
+	// shaper 就多写一个空字段。
+	ShaperCache map[string]shaperCacheEntry `json:"shaper_cache,omitempty"`
+}
+
+// modelMu 串行化 model.json 的 load->mutate->save。shaper 快环 (2s, 写
+// ShaperCache) 和 optimizer 慢环 (写 Samples) 是两个 goroutine, 而 save() 是整文件
+// 重写 —— 不串行化的话后写的一方会把另一方刚加的内容整块覆盖掉。
+var modelMu sync.Mutex
+
+// updateModel 是唯一安全的"读-改-写 model.json"入口。返回改完后的 model, 方便调用
+// 方读回样本数之类的即时状态而不必再读一次盘。
+func updateModel(mut func(*model)) (*model, error) {
+	modelMu.Lock()
+	defer modelMu.Unlock()
+	m := loadModel()
+	mut(m)
+	return m, m.save()
+}
+
+// modelShaperCacheGet 读一条容量缓存 (kbps)。过期条目当未命中处理: 一周前的路径
+// 容量对今天的洲际链路没有参考价值, 拿它播种还不如从头 SEEK。
+func modelShaperCacheGet(key string) (float64, bool) {
+	modelMu.Lock()
+	defer modelMu.Unlock()
+	m := loadModel()
+	e, ok := m.ShaperCache[key]
+	if !ok || e.Kbps <= 0 {
+		return 0, false
+	}
+	if time.Since(time.Unix(e.TS, 0)) > shaperCacheMaxAge {
+		return 0, false
+	}
+	return e.Kbps, true
+}
+
+// modelShaperCacheSet 回写一条容量缓存。
+func modelShaperCacheSet(key string, kbps float64) {
+	if key == "" || kbps <= 0 {
+		return
+	}
+	_, _ = updateModel(func(m *model) {
+		if m.ShaperCache == nil {
+			m.ShaperCache = map[string]shaperCacheEntry{}
+		}
+		m.ShaperCache[key] = shaperCacheEntry{Kbps: kbps, TS: time.Now().Unix()}
+	})
 }
 
 func modelPath() string {
@@ -223,6 +280,30 @@ func (m *model) record(f linkFeature, p paramSet, score float64, changedParam st
 	return m.save()
 }
 
+// recordSample 是 optimizer 用的持久化入口: 在 modelMu 下完成一次完整的
+// load->append->save, 并回报存完之后的样本总数。以前这里是
+// `loadModel().record(...)` 再 `len(loadModel().Samples)` —— 两次独立读盘, 而且和
+// shaper 快环的缓存回写会互相覆盖 (save 是整文件重写)。
+func recordSample(f linkFeature, p paramSet, score float64, changedParam string, delta float64,
+	expressPeakUs float64, t3Goodput uint64, jitterMs float64) (int, error) {
+	var n int
+	m, err := updateModel(func(m *model) {
+		m.Samples = append(m.Samples, sample{
+			Feature: f, Params: p, Score: score, TS: time.Now().Unix(),
+			ChangedParam: changedParam, Delta: delta,
+			ExpressPeakUs: expressPeakUs, T3GoodputDelta: t3Goodput,
+			JitterMs: jitterMs,
+		})
+		if len(m.Samples) > 500 {
+			m.Samples = m.Samples[len(m.Samples)-500:]
+		}
+	})
+	if m != nil {
+		n = len(m.Samples)
+	}
+	return n, err
+}
+
 // cmdModel — inspect the on-disk model.
 //
 //	lotspeedctl model [show | clear]
@@ -251,6 +332,8 @@ func cmdModel(args []string) error {
 				{"loss_thresh", "", 2, 24, 2, 0},
 				{"hd_rho_max", "", 250, 400, 25, 0},
 				{"neoq_sparse_thresh", neoqSparseProc, 3028, 123448, 24084, 0},
+				{"delay_cap_thresh", "", 30, 80, 10, 0},
+				{shaperHeadroomParam, "", 85, 105, 5, 0},
 				{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 0},
 			}
 			ucb := newUCB(tuns, 0)

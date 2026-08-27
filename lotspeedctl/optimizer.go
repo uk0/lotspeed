@@ -5,8 +5,10 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -69,6 +71,18 @@ type optimizer struct {
 	prevT3Bytes  uint64  // NeoQ: cumulative Bulk bytes at last measure() (for delta)
 	nqPrimed     bool    // NeoQ: prev*T0/T3 counters baselined (skip first-cycle bogus delta)
 	codelRtt     float64 // EWMA RTT (ms) driving NeoQ CoDel target/interval
+
+	// sh is the shaper fast loop (nil when --shaper is off). The slow layer reads it
+	// for the freeze gate (slowLayerReady) and the R-variance score term (rateCV),
+	// and writes it through the shaper_headroom arm (apply). All its accessors are
+	// nil-safe so every use site stays a plain call with no branch.
+	sh *shaper
+
+	// bwRing holds the last jitterRingLen per-cycle goodput samples (Mbps), pushed
+	// on CLEAN cycles only (same hygiene as rttRing). score() penalizes its
+	// MAD/median — 目标是"稳定的高速低延迟", 不是峰值吞吐: 一个平均值漂亮但每拍
+	// 上下翻倍的配置, 交互体验比一个略慢但平稳的配置差得多。
+	bwRing []float64
 
 	// rttRing holds the last jitterRingLen per-cycle RTT samples (ms). Its MAD is
 	// the jitter signal in score(). Only CLEAN cycles push here — bad-link cycles
@@ -143,9 +157,24 @@ const (
 	// Hardcoded (no flag) to stay surgical; the gamma flag precedent exists if a
 	// knob is wanted later.
 	jitterDelta = 0.2
+	// goodputVarDelta weights the goodput-variance penalty:
+	// goodputVarDelta*clamp(MAD(bwRing)/median(bwRing), 0, 1). Same gate as the
+	// jitter term (>=jitterMinSamples samples), so a short ring is a no-op.
+	goodputVarDelta = 0.3
+	// rateCVDelta weights the shaper-rate-variance penalty (CV of the shaper's R
+	// ring). It penalizes the CONTROLLER for oscillating its own actuator: a slow
+	// -layer config that keeps knocking the fast loop out of HOLD is worse than one
+	// that lets it cruise, even at the same mean throughput. Only applies when the
+	// shaper is running. CV is clamped to [0,1] — an unbounded CV (a rate that
+	// swings 10x) would otherwise dominate every other term in the score.
+	rateCVDelta = 0.1
+	// shaperHeadroomParam is the one tunable that does NOT land in a proc file:
+	// it steers the fast loop's headroom in-process (see apply()). Stored as a
+	// percent int because tunable is int-based; 95 => R = 0.95*C_hat.
+	shaperHeadroomParam = "shaper_headroom"
 )
 
-func newOptimizer(iface, target string, interval time.Duration, gamma float64) *optimizer {
+func newOptimizer(iface, target string, interval time.Duration, gamma float64, sh *shaper) *optimizer {
 	o := &optimizer{
 		// beta=1.0 (goodput-accurate): the score measures wire throughput (iface
 		// tx+rx, which includes retransmits). beta*loss discounts that by the
@@ -153,7 +182,7 @@ func newOptimizer(iface, target string, interval time.Duration, gamma float64) *
 		// retransmits beyond their goodput cost: on a lossy intercontinental link
 		// being aggressive (high retr) is the point, and the measured win is huge
 		// (+186% vs bbr; bbr collapses to 2M on loss spikes, aggressive holds 36-87M).
-		iface: iface, target: target, interval: interval, alpha: 0.5, beta: 1.0, gamma: gamma,
+		iface: iface, target: target, interval: interval, alpha: 0.5, beta: 1.0, gamma: gamma, sh: sh,
 		dir: 1, phase: "EXPLORE", bestScore: -1e9,
 		probedTi: -1, frozen: map[string]bool{},
 		tun: []tunable{
@@ -187,6 +216,12 @@ func newOptimizer(iface, target string, interval time.Duration, gamma float64) *
 			// mixedWorkload) — on single-flow/idle traffic it's a no-op and would
 			// otherwise absorb exploration credit (the neoq_boost lesson).
 			{"neoq_sparse_thresh", neoqSparseProc, 3028, 123448, 24084, 3028},
+			// delay_cap_thresh: 延迟门控封顶阈值 (%): srtt > min_rtt*(100+x)% 时把
+			// cwnd 封到 BDP*1.25。30..80 的理由: 低于 30 会被正常 RTT 抖动误触发
+			// (实测这条路 minRtt 159ms / 均值 468ms, 抖动本身就有 2-3x); 高于 80
+			// 在同一条路上几乎等于不封顶。cur=50 = 目前生产上跑的值。
+			// 这是慢层臂而不是快环量: 它是策略阈值, 效应以分钟计, 正好适合 bandit。
+			{"delay_cap_thresh", "", 30, 80, 10, 50},
 			// NOTE: neoq_boost was REMOVED from the tun list (B4) — it is a no-op on
 			// single-flow traffic (it only reshapes the downstream rwnd across
 			// concurrent flows) so probing it (~28% of the old exploration budget)
@@ -194,6 +229,13 @@ func newOptimizer(iface, target string, interval time.Duration, gamma float64) *
 			// neoqBoostProc) is kept; reintroduce this arm here if/when a
 			// multi-flow optimization mode is added.
 		},
+	}
+	// shaper_headroom 只在 --shaper 打开时才进轮转: 快环没跑的时候它连接收方都没有,
+	// 留在列表里只会白白吃掉探索预算 (neoq_boost 的教训)。
+	if sh != nil {
+		// 85..105 的理由: 低于 85 白扔 15% 带宽, 高于 105 等于故意超发。让 bandit
+		// 在这个窄带里找"留多少余量最稳", 但速率本体永远归反馈控制管。
+		o.tun = append(o.tun, tunable{shaperHeadroomParam, "", 85, 105, 5, 95})
 	}
 	// Start every tunable at its AGGRESSIVE default and push it to the kernel.
 	// We deliberately do NOT adopt the live sysctl value: a fresh module load has
@@ -360,10 +402,29 @@ func avgSrttMs() float64 {
 // 0 means ss saw none this cycle (the caller then falls back to iface bytes).
 type ssTargetStat struct {
 	rttMs float64
-	retr  uint64 // sum of lifetime retrans:X/Y (Y = total retransmits)
-	segs  uint64 // sum of lifetime segs_out:N
-	acked uint64 // sum of lifetime bytes_acked:N
-	socks int
+	// minRttMs 是各 socket minrtt 的最小值 —— 全机口径的无负载底线。
+	minRttMs float64
+	// minRttP50Ms 是各 socket minrtt 的中位数, shaper 用它做 regime 分档
+	// (minRtt 漂移 >=2x = 换路了) 和远端排队预算 (0.2*minRtt)。
+	// ★ 为什么不能用上面那个全局 min: ssAll() 扫的是全机 established socket, 而这台
+	// 机器上代理出口 (0.3-13ms) 和加速流 (50-264ms) 同时在跑。全局 min 由"这一拍恰好
+	// 存在哪个本地 socket"决定 —— 一个短命的本地连接出现再消失, 就能让它在 0.3ms 和
+	// 159ms 之间来回跳。shaper 拿它当 regime 判据, 于是每跳一次就是一次假换路:
+	// C_hat 清零 + 强制回 SEEK + 慢层冻结 (实测 20 拍里触发 19 次)。即使本地 socket
+	// 长期都在, band 也会被永久钉成 "lan", 把洲际链路的容量写进 <peer>|lan 缓存键。
+	// 中位数跟 queueDelayMs 用的是同一个"每 socket 各自成立"的口径, 不会被单个
+	// socket 拽走。
+	minRttP50Ms float64
+	// queueDelayMs 是各 socket (srtt - minrtt) 的中位数 = 排队延迟 E。
+	// ★ 为什么是"每 socket 各减各的 minrtt 再取中位数", 而不是 mean(srtt)-min(minrtt):
+	// 这台机器上是混合流量 (代理出口 0.3-13ms 和加速流 50-264ms 同时在跑), 全局的
+	// srtt 均值减全局 minrtt 最小值算出来的是两个不同 regime 的差, 纯垃圾。每条流
+	// 的 minrtt 是它自己那条路的底线, 所以 E_i 各自成立, 中位数才有物理意义。
+	queueDelayMs float64
+	retr         uint64 // sum of lifetime retrans:X/Y (Y = total retransmits)
+	segs         uint64 // sum of lifetime segs_out:N
+	acked        uint64 // sum of lifetime bytes_acked:N
+	socks        int
 }
 
 // ssTarget runs `ss -tin dst <target>` (no -p: we don't need process info and
@@ -391,6 +452,8 @@ func parseSSTarget(out string) ssTargetStat {
 	var st ssTargetStat
 	var rttSum float64
 	var rttN int
+	var queueDelays []float64
+	var minRtts []float64
 	for _, ln := range strings.Split(out, "\n") {
 		// A socket's stats line is the one carrying the rtt field; the address line
 		// (Local/Peer) has none. Use rtt presence to identify a real socket line.
@@ -398,9 +461,22 @@ func parseSSTarget(out string) ssTargetStat {
 			continue
 		}
 		st.socks++
+		srtt := 0.0
 		if v, ok := ssFloatX(ln, "rtt"); ok && v > 0 { // srtt = X of rtt:X/Y
 			rttSum += v
 			rttN++
+			srtt = v
+		}
+		// minrtt: 一个裸浮点 (无 X/Y), ssFloatX 直接给整值。ssField 的整词匹配保证
+		// 它不会跟 rtt: 串味 (反之亦然)。
+		if v, ok := ssFloatX(ln, "minrtt"); ok && v > 0 {
+			if st.minRttMs == 0 || v < st.minRttMs {
+				st.minRttMs = v
+			}
+			minRtts = append(minRtts, v)
+			if srtt >= v {
+				queueDelays = append(queueDelays, srtt-v)
+			}
 		}
 		if v, ok := ssUintY(ln, "retrans"); ok { // lifetime total = Y of retrans:X/Y
 			st.retr += v
@@ -415,7 +491,29 @@ func parseSSTarget(out string) ssTargetStat {
 	if rttN > 0 {
 		st.rttMs = rttSum / float64(rttN)
 	}
+	st.queueDelayMs = percentile(queueDelays, 0.5)
+	st.minRttP50Ms = percentile(minRtts, 0.5)
 	return st
+}
+
+// ssAll 聚合本机全部 ESTABLISHED socket, 复用同一个解析器。
+//
+// shaper 的 deficit 分母是 Δshaper_sent —— 整个网卡出口的字节数, 所以分子那侧的
+// Δbytes_acked 必须覆盖同一批流量, 只能是机器全量而不是某个对端。(minrtt/排队延迟
+// 的 regime 混合问题由 parseSSTarget 里的"每 socket 各减各的 minrtt"解决。)
+func ssAll() ssTargetStat {
+	out, err := exec.Command("ss", "-tin", "state", "established").Output()
+	if err != nil {
+		return ssTargetStat{}
+	}
+	return parseSSTarget(string(out))
+}
+
+// isBadLink 是链路天气门: RTT 超过无负载底线的 3 倍, 说明是路径在抽风而不是我们的
+// 参数在起作用。抽出来成函数是因为 shaper 快环要用同一个判据 (规格明确要求复用),
+// 两处各写一遍迟早会漂移。
+func isBadLink(rttMs, minRttMs float64) bool {
+	return minRttMs > 0 && rttMs > 0 && (rttMs/minRttMs-1) > 2.0
 }
 
 // measureMachine derives bw/rtt/loss machine-wide: iface tx+rx bytes for bw,
@@ -520,7 +618,7 @@ func (o *optimizer) measure() metrics {
 	// falls back to the legacy formula. t0_pkts/t3_bytes are cumulative — diff them
 	// against the previous reading exactly like the iface byte counters above. The
 	// first primed cycle's delta is suppressed (counters could predate this run).
-	if nq, ok := readNeoqML(); ok {
+	if nq, ok := nqReader.read(true); ok {
 		m.nqOK = true
 		m.t0PeakDelayUs = float64(nq.t0PeakDelayUs)
 		m.bulkFlows = nq.bulkFlows
@@ -582,12 +680,28 @@ func (o *optimizer) score(m metrics) float64 {
 		jitterMs := medianAbsDev(o.rttRing)
 		s -= jitterDelta * clampF(jitterMs/m.rttMs, 0, 1)
 	}
+	// Goodput-variance term: 同样的均值下, 每拍上下翻倍的吞吐比平稳的吞吐体验差
+	// 得多, 而 bw/peakBw 这一项对两者是无差别的。用 MAD/median (而不是 stddev/mean)
+	// 是因为这条链路本来就带天气尖峰, MAD 容忍到 50% 离群点。Gated on ring
+	// occupancy 所以空环/短环是彻底的 no-op (向后兼容旧 score)。
+	if len(o.bwRing) >= jitterMinSamples {
+		if med := percentile(o.bwRing, 0.5); med > 0 {
+			s -= goodputVarDelta * clampF(medianAbsDev(o.bwRing)/med, 0, 1)
+		}
+	}
+	// R-variance term: 惩罚控制器自己抖 R。nil shaper / 样本不足 -> ok=false -> no-op。
+	if cv, ok := o.sh.rateCV(); ok {
+		s -= rateCVDelta * clampF(cv, 0, 1)
+	}
 	return s
 }
 
 func (o *optimizer) apply(t *tunable) {
 	v := strconv.Itoa(t.cur)
 	switch {
+	case t.name == shaperHeadroomParam:
+		// 进程内参数, 不落 proc 文件: 直接推给快环 (百分数 -> 小数)。
+		o.sh.setHeadroom(float64(t.cur) / headroomPctScale)
 	case t.path == neoqSparseProc:
 		// Sparse gate expects "<window_us> <thresh_bytes>" (kernel sscanf "%u %u").
 		// Window is held fixed at 100000us; t.cur is the byte threshold.
@@ -605,16 +719,32 @@ func (o *optimizer) apply(t *tunable) {
 // RTT-adaptive AQM. Without this NeoQ runs a flat 5ms target/100ms interval that
 // over-drops on high-RTT links: interval < RTT means CoDel re-drops before a
 // drop's cwnd reduction has propagated back, collapsing throughput.
-// target = RTT/4 (standing queue tolerated), interval = 2*RTT (must exceed 1 RTT).
+// target = max(15ms, RTT/8), interval = 2*RTT (must exceed 1 RTT).
+//
+// ★ 为什么从 clamp(RTT/4,5,60) 改成 clamp(max(15ms, RTT/8),5,60): 以前本机根本不
+// 排队 (瓶颈在远端), CoDel 的 target 只能按"路径 RTT 的比例"猜。shaper 绑定之后本机
+// 队列才是主队列, target 应该按"本机队列预算"定 —— 我愿意在本机容忍多少毫秒的驻留
+// 队列, 这跟对端有多远无关。RTT/8 让高 RTT 路径仍有一点比例项 (468ms -> 58ms),
+// 15ms 地板保证低 RTT 路径不会被一个过小的 target 打成过度丢包。注意 max(15ms,·)
+// 之后 5ms 的下界已经够不着了, 保留 clamp 只是为了写死上下界的形状。
 func applyCodel(rttMs float64) {
-	if rttMs <= 0 {
+	target, interval, ok := codelParams(rttMs)
+	if !ok {
 		return
 	}
-	rttUs := rttMs * 1000
-	target := clampF(rttUs/4, 5000, 60000)
-	interval := clampF(rttUs*2, 100000, 600000)
 	_ = os.WriteFile("/proc/net/neoq_codel",
 		[]byte(fmt.Sprintf("%d %d", int(target), int(interval))), 0o644)
+}
+
+// codelParams is the pure formula half of applyCodel (target/interval in us),
+// split out so the mapping is unit-testable without a writable /proc (mirrors the
+// readNeoqML/parseNeoqML and ssTarget/parseSSTarget splits). ok=false for rttMs<=0.
+func codelParams(rttMs float64) (target, interval float64, ok bool) {
+	if rttMs <= 0 {
+		return 0, 0, false
+	}
+	rttUs := rttMs * 1000
+	return clampF(math.Max(15000, rttUs/8), 5000, 60000), clampF(rttUs*2, 100000, 600000), true
 }
 
 func clampF(v, lo, hi float64) float64 {
@@ -668,7 +798,7 @@ func (o *optimizer) settle(rttMs float64) {
 	// re-baseline above). This read also resets the kernel's reset-on-read Express
 	// peak, so the peak the next measure() sees is the settled window's, not the
 	// config-change transient's. Harmless no-op when the qdisc isn't loaded.
-	if nq, ok := readNeoqML(); ok {
+	if nq, ok := nqReader.read(true); ok {
 		o.prevT0Pkts, o.prevT3Bytes, o.nqPrimed = nq.t0Pkts, nq.t3Bytes, true
 	}
 }
@@ -692,6 +822,8 @@ func cmdOptimize(args []string) error {
 	target := ""
 	algo := "coord"       // "coord" (coordinate ascent) | "ucb" (UCB1 bandit per param)
 	gamma := defaultGamma // Express-delay penalty weight; --gamma 0 disables the term
+	shaperOn := false     // --shaper: 启用 2s 的整形速率快环 (独立于这里的慢环)
+	shaperMaxMbps := 0.0  // --shaper-max-mbps: 覆盖 R_max (默认读网卡线速)
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--interval":
@@ -723,10 +855,19 @@ func cmdOptimize(args []string) error {
 				}
 				i++
 			}
+		case "--shaper":
+			shaperOn = true
+		case "--shaper-max-mbps":
+			if i+1 < len(args) {
+				if v, e := strconv.ParseFloat(args[i+1], 64); e == nil && v > 0 {
+					shaperMaxMbps = v
+				}
+				i++
+			}
 		}
 	}
 	if iface == "" {
-		return fmt.Errorf("usage: optimize --iface <dev> [--interval N] [--target IP] [--algo coord|ucb] [--gamma G]")
+		return fmt.Errorf("usage: optimize --iface <dev> [--interval N] [--target IP] [--algo coord|ucb] [--gamma G] [--shaper] [--shaper-max-mbps M]")
 	}
 	// Always record samples passively from whatever real traffic the kernel
 	// is moving. --target is now purely informational — if set, it's stamped
@@ -762,7 +903,27 @@ func cmdOptimize(args []string) error {
 		return fmt.Errorf("set CC=lotspeed (need root?): %w", err)
 	}
 
-	o := newOptimizer(iface, target, interval, gamma)
+	// 快环 (2s) 和慢环 (5s+settle) 是两个 goroutine: 速率有机制性的逐步反馈, 每个
+	// 动作都能用自己的直接后果检验; sysctl 那些二阶参数只有统计归因, 必须慢慢来。
+	// 两者的隔离由 slowLayerReady() 的闸门保证。
+	var sh *shaper
+	if shaperOn {
+		sh = newShaper(iface, shaperMaxMbps)
+		// 护栏 4 的进程内一半: 被 SIGTERM/SIGINT 打断时也把 rate 归零。systemd 的
+		// ExecStopPost 覆盖服务路径, 这里覆盖手动调试路径 —— 无论哪条路, "控制器
+		// 不在"都必须等于"完全无整形", 而不是"卡在最后一个速率上"。
+		sigc := make(chan os.Signal, 1)
+		signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigc
+			_ = writeNeoqRate(0)
+			os.Exit(0)
+		}()
+		// stop=nil: nil channel 在 select 里永不就绪, 所以只有 ticker 分支会触发。
+		go sh.run(nil)
+	}
+
+	o := newOptimizer(iface, target, interval, gamma, sh)
 	// UCB bandit: pre-load it with all prior samples so a fresh process
 	// inherits learning from previous runs (crucial for systemd auto-restart).
 	// Instantiated in BOTH modes: in coord mode it backs delta-credit (B1) and the
@@ -812,9 +973,9 @@ func cmdOptimize(args []string) error {
 			fmt.Printf("warm-start from model (k=%d samples): %d params applied\n", len(mdl.Samples), applied)
 		}
 	}
-	nq0, nqUp := readNeoqML()
-	fmt.Printf("optimize: iface=%s interval=%v gamma=%.2f neoq_ml=%v phase=EXPLORE (aggressive grab, tx+rx)\n",
-		iface, interval, gamma, nqUp)
+	nq0, nqUp := nqReader.read(true)
+	fmt.Printf("optimize: iface=%s interval=%v gamma=%.2f neoq_ml=%v shaper=%v phase=EXPLORE (aggressive grab, tx+rx)\n",
+		iface, interval, gamma, nqUp, sh.running())
 	o.prevBytes = ifaceBytes(iface)
 	o.prevOut, o.prevRetr = readSnmpTcp()
 	// Per-target mode: prime the target's summed lifetime ss counters alongside
@@ -884,6 +1045,14 @@ func cmdOptimize(args []string) error {
 				o.rttRing = o.rttRing[1:]
 			}
 		}
+		// 同样的卫生标准喂 goodput 环: 只有干净的一拍才进, 否则天气尖峰会把方差
+		// 惩罚项灌爆, 让 score 去惩罚一个不是参数造成的抖动。
+		if !badLink && m.bwMbps > 0 {
+			o.bwRing = append(o.bwRing, m.bwMbps)
+			if len(o.bwRing) > jitterRingLen {
+				o.bwRing = o.bwRing[1:]
+			}
+		}
 
 		// Live feature building: cap samples and use MAD-filtered medians so
 		// occasional outliers don't poison what we persist to the model.
@@ -949,13 +1118,13 @@ func cmdOptimize(args []string) error {
 			// params to avoid on bad-link states (high loss / RTT spike).
 			if feat.BwMbps < 5 {
 				fmt.Printf("    -> sample SKIPPED (no real traffic: bw=%.0fM)\n", feat.BwMbps)
-			} else if err := loadModel().record(feat, windowBest.params, windowBest.score, windowBest.changedParam, windowBest.delta, windowBest.expressPeakUs, windowBest.t3Goodput, windowBest.jitterMs); err == nil {
+			} else if n, err := recordSample(feat, windowBest.params, windowBest.score, windowBest.changedParam, windowBest.delta, windowBest.expressPeakUs, windowBest.t3Goodput, windowBest.jitterMs); err == nil {
 				tag := "good"
 				if windowBest.badLink || windowBest.score < 0 {
 					tag = "BAD-LINK"
 				}
 				fmt.Printf("    -> sample recorded [%s] (model now has %d, score=%.3f, bw=%.0fM loss=%.1f%% changed=%s d=%.3f xpeak=%.0fus t3d=%dB)\n",
-					tag, len(loadModel().Samples), windowBest.score, feat.BwMbps, feat.LossPct*100, windowBest.changedParam, windowBest.delta, windowBest.expressPeakUs, windowBest.t3Goodput)
+					tag, n, windowBest.score, feat.BwMbps, feat.LossPct*100, windowBest.changedParam, windowBest.delta, windowBest.expressPeakUs, windowBest.t3Goodput)
 			}
 			windowCycle = 0
 			windowBest = windowBestT{score: -1e9}
@@ -1012,6 +1181,16 @@ func cmdOptimize(args []string) error {
 			o.pendingSign = 0
 			fmt.Printf("%s OPT BAD-LINK (rtt=%.1f/%.1fx min) — skip credit+decision, hold %s=%d\n",
 				ts, m.rttMs, m.rttMs/o.minRtt, o.tun[o.ti].name, o.tun[o.ti].cur)
+			continue
+		}
+		// 快慢两层隔离: shaper 不在稳定 HOLD 时 (SEEK/PROBE/BACKOFF/OBSERVE/YIELD,
+		// 或刚进 HOLD 还没连续稳 3 拍), 这一拍的 score 变化主要由速率变化造成, 不是
+		// 坐标步进造成的。跟 bad-link 一样整拍跳过 (既不记账也不做接受/回退) ——
+		// 硬着头皮归因只会教会 bandit 错的东西。shaper 关闭 / 内核不支持时恒放行。
+		if !o.sh.slowLayerReady() {
+			o.havePrev = false
+			o.pendingSign = 0
+			fmt.Printf("%s OPT SHAPER-BUSY — slow layer frozen%s\n", ts, o.sh.statusLine())
 			continue
 		}
 		// B1 delta-credit: the score change since the prior config is attributable
@@ -1182,6 +1361,10 @@ func (o *optimizer) nextTi(i int) int {
 			continue
 		}
 		if o.tun[j].neoqOnly() && !o.mixedWorkload {
+			continue
+		}
+		// headroom 臂只有快环真的在跑才有接收方 (内核可能压根不导出 shaper 键)。
+		if o.tun[j].name == shaperHeadroomParam && !o.sh.running() {
 			continue
 		}
 		return j

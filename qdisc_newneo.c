@@ -10,9 +10,20 @@
  *
  * v3.1 Enhancements:
  * - Retransmit packet detection -> Express priority for fast loss recovery
- * - RTT-aware CoDel with dynamic target/interval adjustment
  * - Flow state tracking (NEW/STARTUP/STEADY/RECOVERY/DRAIN)
  * - Loss protection levels for flows in recovery
+ *
+ * 本轮 (整形器) 新增:
+ * - CAKE 式虚拟时钟整形器 (/proc/net/neoq_rate, 默认关闭): 把瓶颈从远端路由器
+ *   "买"回本机。本机上联远快于洲际路径时本机根本不排队, 所有 AQM 全程空转
+ *   (实测 qlen=0 / t3_drops=0 / t3_peak_delay_us=5), 分档/CoDel/重传免疫全部
+ *   拿不到输入; 整形后队列在本机成形, 且丢弃从昂贵的洲际段挪回本机。
+ * - 整形开启时拆分 GSO 超级包: 12Mbps 下一个 64KB 包 = 43ms 路径传输时间, 不拆
+ *   则虚拟时钟粒度/DRR 公平粒度/CoDel 采样粒度全部退化成 43ms。
+ * - Express 防滥用门改用相对阈值 (相对链路常态重传率), 见 neoq_retrans_rel。
+ * - CoDel target/interval 只有一个真相: 全局 /proc/net/neoq_codel。netlink 的
+ *   TCA_NEOQ_TARGET/INTERVAL 直写同一对全局量。RTT 自适应由用户态 lotspeedctl
+ *   从 ss 测得后写入 —— egress-only qdisc 看不到入向 TSecr, 自己算不出 RTT。
  *
  * Copyright (c) 2024-2025 LotSpeed Project
  */
@@ -44,6 +55,12 @@
 #include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+/* skb_gso_segment() 在 6.5 被从 netdevice.h 拆到 net/gso.h (上游 "net: move gso
+ * declarations and functions to their own files")。GSO 拆分薄壳要用它, 6.5 以下
+ * 仍由 net/sch_generic.h -> netdevice.h 间接带入, 故只在 6.5+ 显式包含。 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+#include <net/gso.h>
+#endif
 
 /* Kernel compatibility */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
@@ -86,11 +103,10 @@
 #define NEOQ_TARGET_US          5000
 #define NEOQ_INTERVAL_US        100000
 
-/* RTT-aware CoDel thresholds */
-#define NEOQ_RTT_LOW_US         10000    /* < 10ms: datacenter */
-#define NEOQ_RTT_MED_US         100000   /* < 100ms: normal WAN */
-#define NEOQ_RTT_HIGH_US        300000   /* < 300ms: high delay */
-/* > 300ms: satellite */
+/* 注: 原 NEOQ_RTT_*_US (RTT-aware CoDel 阈值) 已随该特性整体删除。egress-only
+ * qdisc 算不出 RTT (需匹配出向 TSval 与入向 TSecr, 后者只存在于 ingress), 故
+ * flow->srtt_us 恒为 0, 依赖它的分支恒假。RTT 自适应的职责已由用户态承担:
+ * lotspeedctl 从 ss 取 RTT 后写 /proc/net/neoq_codel 全局旋钮 —— 那条路是活的。 */
 
 /* Flow state for tracking */
 #define FLOW_STATE_NEW          0
@@ -129,6 +145,10 @@ enum {
     TCA_NEOQ_HTTP_BOOST,
     TCA_NEOQ_FLOWS,
     TCA_NEOQ_PAD,
+    /* 追加在尾部以保持既有编号不变。仅为 dump 完整性: 整形速率的主控制面是
+     * /proc/net/neoq_rate, 因为 stock tc 不认识 neoq 的私有属性, 根本发不出
+     * 这个 TLV。单位 = bit/s, 与 /proc 的 rate_kbps 同口径 (不引入第二种单位)。 */
+    TCA_NEOQ_RATE64,
     __TCA_NEOQ_MAX
 };
 #define TCA_NEOQ_MAX (__TCA_NEOQ_MAX - 1)
@@ -244,10 +264,8 @@ struct neoq_flow {
     u8                  loss_protect_level; /* LOSS_PROTECT_* */
     u16                 startup_packets;    /* Packets in startup phase */
 
-    /* === NEW: RTT estimation (from TCP timestamps) === */
-    u32                 srtt_us;            /* Smoothed RTT in microseconds */
-    u32                 rtt_min_us;         /* Minimum RTT observed */
-    u64                 last_rtt_update;    /* Last RTT update timestamp */
+    /* 注: 原 srtt_us / rtt_min_us / last_rtt_update 已删除 (见文件头): egress-only
+     * qdisc 拿不到 RTT, 三者恒为 0, 唯一读它们的 CoDel 分支恒假, 属纯死代码。 */
 
     /* === NEW: CAKE 风格稀疏/批量行为门控 ===
      * 在一个滑动窗口内累计 flow 的字节数，窗口到期后衰减/重置。
@@ -342,9 +360,9 @@ struct neoq_tier {
      * 而非全时段峰值。human-readable 的 /proc/net/neoq 仍用 peak_delay (全时段)。 */
     u64                 peak_delay_ml;
 
-    /* CoDel config */
-    u64                 codel_interval;
-    u64                 codel_target;
+    /* 注: 原每档 codel_interval/codel_target 已删除 —— 它们只被赋值、从未被读
+     * (codel_should_drop 一直只读全局 neoq_codel_target_ns/interval_ns), 是
+     * netlink 与 /proc 之外的第三份影子真相, 留着只会误导后来者。 */
 
     u32                 quantum;
 } ____cacheline_aligned_in_smp;
@@ -372,8 +390,9 @@ struct neoq_sched_data {
     u32                 quantum;
     u32                 memory_limit;
     u32                 memory_used;
-    u32                 target;
-    u32                 interval;
+    /* 注: 原 q->target / q->interval 已删除。CoDel 参数的唯一真相是全局
+     * neoq_codel_target_ns / neoq_codel_interval_ns, netlink 与 /proc 都直接
+     * 读写它 —— 消除"netlink 一份、/proc 一份"的双真相。 */
 
     /* Features */
     u8                  ecn:1;
@@ -400,6 +419,27 @@ struct neoq_sched_data {
      * 供 /proc/net/neoq_ml 观察门控的触发量。 */
     u64                 retrans_demoted;
 
+    /* === NEW (B3): 全局 ambient 重传占比, 供 Express 防滥用门算相对阈值 ===
+     * 为什么必须相对: 绝对阈值 (share_max=15%) 在整体重传率 18-20% 的洲际链路上
+     * 永远触发 —— 实测 retrans_seen=6602 / retrans_demoted=5133 = 77.7% 的重传被
+     * 拒绝升 Express。该门本意是防"批量流的重传洪泛挤占交互快车道", 结果把正常的
+     * 丢包恢复也一并拦了。在 18% 丢包的链路上重传 18% 不是滥用, 是生存。
+     * 1 秒滚动窗口; 全部在持 root lock 的 enqueue 路径内累加, 无并发问题。 */
+    u32                 glob_win_pkts;
+    u32                 glob_win_retrans;
+    u64                 glob_win_start;
+    u8                  ambient_share;      /* 上一完整 1s 窗口的全局重传占比 0-100 */
+
+    /* === NEW (B1): CAKE 式虚拟时钟整形器状态 ===
+     * time_next_packet: 下一个包被允许离开 qdisc 的虚拟时刻 (ns, 与 ktime_get_ns
+     * 同一时钟域)。shaper_sent_bytes / shaper_defer_cnt 供 /proc/net/neoq_rate 与
+     * neoq_ml 观测整形器是否真的在起作用 (defer=0 就说明根本没排到队)。 */
+    u64                 time_next_packet;
+    u64                 shaper_sent_bytes;
+    u64                 shaper_defer_cnt;
+
+    /* 整形闸门靠它把 qdisc 重新唤醒。注: 该字段在 v3.1 里就已存在, 但全文件从未被
+     * schedule 过 —— 是预留却没接上的死设施, 从 B1 起真正接上。 */
     struct qdisc_watchdog watchdog;
 };
 
@@ -530,61 +570,14 @@ static __always_inline bool tcp_retransmit_compute(const struct sk_buff *skb,
 }
 
 /* ========================================================================
- * NEW: RTT-Aware CoDel Parameter Adjustment
+ * 注: 原 update_flow_codel_params() (RTT-aware CoDel 动态 target/interval) 已整体
+ * 删除 —— 全文件零调用点, 且它唯一的输入 rtt_us 无从获得。
  *
- * Dynamically adjust CoDel target/interval based on flow RTT:
- * - Low RTT (<10ms):    target=5ms,  interval=100ms  (datacenter)
- * - Med RTT (<100ms):   target=RTT/2, interval=RTT*10 (normal WAN)
- * - High RTT (<300ms):  target=RTT/4, interval=RTT*5  (high delay)
- * - Satellite (>300ms): target=RTT/4, interval=RTT*3  (very high delay)
+ * 为什么是删而不是修: 出向 qdisc 要算 RTT, 得把出向包的 TCP TSval 与入向 ACK 的
+ * TSecr 配对, 而后者只出现在 ingress —— egress-only 的 qdisc 结构上就拿不到。
+ * RTT 自适应的职责已由用户态承担: lotspeedctl 从 ss 读 RTT, 写 /proc/net/neoq_codel
+ * 的全局 target/interval。那条路是活的, 内核这份是死的。
  * ======================================================================== */
-
-static inline void update_flow_codel_params(struct neoq_flow *flow,
-                                            struct neoq_tier *tier,
-                                            u32 rtt_us)
-{
-    u64 target_ns, interval_ns;
-
-    if (rtt_us == 0)
-        return;
-
-    /* Update flow RTT estimate (EWMA with alpha=1/8) */
-    if (flow->srtt_us == 0) {
-        flow->srtt_us = rtt_us;
-        flow->rtt_min_us = rtt_us;
-    } else {
-        flow->srtt_us = flow->srtt_us - (flow->srtt_us >> 3) + (rtt_us >> 3);
-        if (rtt_us < flow->rtt_min_us)
-            flow->rtt_min_us = rtt_us;
-    }
-
-    /* Adjust CoDel parameters based on RTT */
-    if (rtt_us < NEOQ_RTT_LOW_US) {
-        /* Datacenter: aggressive, low target */
-        target_ns = 5 * NSEC_PER_MSEC;
-        interval_ns = 100 * NSEC_PER_MSEC;
-    } else if (rtt_us < NEOQ_RTT_MED_US) {
-        /* Normal WAN: scale with RTT */
-        target_ns = ((u64)rtt_us / 2) * NSEC_PER_USEC;
-        interval_ns = ((u64)rtt_us * 10) * NSEC_PER_USEC;
-    } else if (rtt_us < NEOQ_RTT_HIGH_US) {
-        /* High delay: more conservative */
-        target_ns = ((u64)rtt_us / 4) * NSEC_PER_USEC;
-        interval_ns = ((u64)rtt_us * 5) * NSEC_PER_USEC;
-    } else {
-        /* Satellite: very conservative to avoid unnecessary drops */
-        target_ns = ((u64)rtt_us / 4) * NSEC_PER_USEC;
-        interval_ns = ((u64)rtt_us * 3) * NSEC_PER_USEC;
-    }
-
-    /* Clamp to reasonable bounds */
-    target_ns = clamp_t(u64, target_ns, 1 * NSEC_PER_MSEC, 200 * NSEC_PER_MSEC);
-    interval_ns = clamp_t(u64, interval_ns, 10 * NSEC_PER_MSEC, 2000 * NSEC_PER_MSEC);
-
-    /* Note: Per-flow CoDel params could override tier defaults */
-    /* For now, we use tier-level params, but flow RTT info is stored */
-    flow->last_rtt_update = ktime_get_ns();
-}
 
 /* ========================================================================
  * NEW: Flow State Management
@@ -668,12 +661,12 @@ static inline void update_flow_state(struct neoq_flow *flow, bool is_retrans)
 /* Configurable priority-port bitmap (game/web boost), set via /proc/net/neoq_prio */
 static DECLARE_BITMAP(neoq_prio_portmap, 65536);
 
-/* Outbound-ACK rwnd boost = single-side downstream "window deception", percent (100=off).
- * 默认 100 = 关闭。纯出向 qdisc 看不到对端 SYN-ACK (在收方向), 因此无法得知对端
- * 的窗口缩放因子 (wscale) -> 重写 window 字段在 wscale!=0 时会被错误左移放大,
- * 语义不安全。保留代码路径与 /proc/net/neoq_boost 旋钮供显式 opt-in, 默认不动包。
- * Pairs with lotspeed CC (upstream) to form one bidirectional accel system. */
-static u32 neoq_rwnd_boost = 100;
+/* 注: 原 neoq_rwnd_boost 旋钮 / neoq_boost_rwnd() / /proc/net/neoq_boost 已整体删除。
+ * 真正的死因: 它只改写了线上 TCP 头的 window 字段, 却没有同步本机的 tp->rcv_wnd。
+ * 对端据此多发出来的数据到达本机入向时, 会被 tcp_sequence() 判为 out-of-window 直接
+ * 丢弃 —— 对上传方向是净伤害, 而不只是 no-op。
+ * (原注释把死因写成"egress 拿不到对端 wscale", 那是错的: 乘法对 scale 不变,
+ *  字段 x k 就是有效窗口 x k, 与 wscale 的 shift 无关。留此更正供后人查。) */
 
 /* === NEW: CAKE 风格稀疏门控旋钮 (runtime-tunable via /proc/net/neoq_sparse) ===
  * window_ns: 行为采样窗口 (默认 100ms); thresh_bytes: 窗口内字节阈值, 超过即判为
@@ -689,8 +682,18 @@ static u32 neoq_sparse_thresh_bytes = 2 * NEOQ_QUANTUM;
  * 且该流已被判为批量行为(is_bulk_behave)时, 其重传不再提到 Express, 而是留在按行为决定
  * 的档位(批量流即 Normal/Bulk)。重传仍保留 CoDel 免疫(永不被 CoDel 丢), 只是不再插队。
  * 稀疏/交互流的重传(量本来就小)不受影响, 继续进 Express。
+ * B3 起 share_max 的语义降级为"下限地板": 有效阈值 = max(share_max, ambient*rel/100)。
+ * 链路很干净时 ambient≈0, 地板防止阈值塌到 0 而误杀正常突发。
  * 默认 15(%)。0 = 关闭本门控 = 旧行为(所有重传一律进 Express)。 */
 static u32 neoq_retrans_share_max = 15;
+
+/* === NEW (B3): Express 防滥用门的相对倍数 (百分比, 200 = 常态的 2 倍) ===
+ * 有效阈值 = max(neoq_retrans_share_max, min(100, rel * ambient_share / 100))。
+ * ambient_share 是全链路上一秒的整体重传占比 (见 struct neoq_sched_data)。
+ * green1 实测 ambient≈18-20%, rel=200 -> 有效阈值 36-40%, 只有重传占比达到链路常态
+ * 两倍以上的流才被判为滥用; 预期把 demoted/seen 从 77.7% 压到 <10%。
+ * 写侧钳到 <=10000, 保证 rel * ambient(<=100) 不会在 u32 里溢出。 */
+static u32 neoq_retrans_rel = 200;
 
 /* Global CoDel target/interval (ns), runtime-tunable via /proc/net/neoq_codel.
  * Default 5ms/100ms suits LAN; raise target for high-RTT intercontinental links
@@ -698,44 +701,125 @@ static u32 neoq_retrans_share_max = 15;
 static u64 neoq_codel_target_ns = (u64)NEOQ_TARGET_US * 1000;
 static u64 neoq_codel_interval_ns = (u64)NEOQ_INTERVAL_US * 1000;
 
-/* Enlarge advertised receive window on outbound TCP ACKs so the peer sender
- * (bounded by min(cwnd, rwnd)) ramps faster when it is rwnd-limited.
- * Safe: skips zero-window (flow control), ensures skb writable, updates csum
- * incrementally (same primitive as netfilter NAT). */
-static void neoq_boost_rwnd(struct sk_buff *skb)
-{
-    struct iphdr *iph;
-    struct tcphdr *th;
-    u32 boost = READ_ONCE(neoq_rwnd_boost);
-    unsigned int off;
-    u16 old_win, new_win;
+/* ========================================================================
+ * NEW (B1): CAKE 式虚拟时钟整形器旋钮 (runtime-tunable via /proc/net/neoq_rate)
+ *
+ * 为什么要在本机整形: 本机上联 (日本机房) 远快于洲际路径, 队列和瓶颈全都在远端
+ * 路由器上 (实测 ~300ms 常驻队列在远端), 本机 qdisc 根本不排队 -> qlen 恒为 0,
+ * CoDel/分档/重传免疫全部空转。整形器把瓶颈"买"回本机 (CAKE/SQM 思路): 队列在本机
+ * 成形, AQM 才有输入; 同时把丢弃从昂贵的洲际段挪到本机, 丢一个包不再浪费一整程
+ * RTT 的传输。
+ *
+ * 为什么是虚拟时钟而不是 token bucket:
+ *   TBF 的桶会在空闲期积攒 token, 恢复发送时线速倾泻一个 burst。为容纳 64KB 的
+ *   GSO 包, 桶至少得 64KB —— 在 12Mbps 下就是 43ms 的线速突发, 与"控延迟"这个
+ *   目标直接冲突。虚拟时钟逐包平滑推进, 无桶、无倾泻; 空闲期的额度由 burst_ns
+ *   地板钳死 (见 neoq_dequeue), 只用来吸收 hrtimer 的迟到抖动。
+ *
+ * 为什么把 (mult, shift) 打包进单个 u64 而不用 psched_ratecfg_precompute():
+ *   psched_ratecfg 是多字段结构, /proc 高频写 vs dequeue 热路径读会撕裂 (读到新
+ *   mult 配旧 shift = 速率算错几个数量级), 除非上锁。打包进一个 u64 后一次
+ *   READ_ONCE 取整, 免锁且天然无撕裂。
+ * ======================================================================== */
 
-    if (boost <= 100 || skb->protocol != htons(ETH_P_IP))
+/* 0 = 关闭整形 = 透明直通。默认 0 (fail-open: 没配就跟改动前逐字一样)。单位 bit/s。 */
+static u64 neoq_rate_bps;
+/* 打包的 (mult << 8) | shift, 写侧预计算。0 = 关闭 (dequeue 闸门只看这一个量)。 */
+static u64 neoq_rate_cfg;
+/* 允许虚拟时钟落后 now 的上限, 只吸收 hrtimer 迟到抖动, 不是 TBF 的桶。 */
+static u64 neoq_burst_ns = 4 * NSEC_PER_MSEC;
+
+/* === F5: burst 的上钳 ===
+ * 原来错在: /proc 写进来的 burst_us 是 sscanf 的 %u, 直接 *NSEC_PER_USEC 落盘, 毫无
+ * 上界。echo "12000 4294967295" 就得到 4295 秒的 burst, dequeue 里 floor = now-burst
+ * 把 time_next_packet 永久拽到 71 分钟前 -> 闸门 now < time_next_packet 永远不成立,
+ * 整形器实际被关掉, 而读回来的 rate_kbps 仍是用户设的值 —— 最难查的那类静默失效。
+ * 1 秒已远超任何 hrtimer 迟到抖动 (burst 的唯一用途), 够用且不会把它变成 TBF 的桶。 */
+#define NEOQ_BURST_US_MAX       1000000U
+
+/* === F1: 整形开启时队列上界必须随速率派生, 不能固定在 q->limit ===
+ * 原来错在: 拆 GSO 会静默打掉 TCP Small Queues。skb_segment() 只在
+ * head_skb->destructor == sock_wfree 时才把 socket 所有权转给尾段, 而 TCP 出向包的
+ * destructor 是 tcp_wfree (__tcp_transmit_skb 设的), 不匹配; __copy_skb_header() 也
+ * 明确不复制 old->sk。于是拆出来的每一段都是 sk=NULL / destructor=NULL, 而拆分末尾的
+ * consume_skb(skb) 在**入队时刻**就调用 tcp_wfree() 把整个 64KB 的 sk_wmem_alloc 还了
+ * 回去 -> tcp_small_queue_check 从此永不触发。
+ * (mainline sch_tbf/sch_cake 拆 GSO 时行为完全相同 —— 这是 qdisc 层拆包的固有代价,
+ *  不是写错。错的是 NeoQ 把 limit 固定在 10240 段、没有随 rate 缩放。)
+ * 后果: TSQ 原本用 sk_wmem_alloc > max(2*truesize,...) 把单个 socket 在 qdisc 里的
+ * 驻留量卡在 ~132KB ≈ 88ms; 拆分后唯一的上界退化成 q->limit=10240 段 ≈ 14.8MB,
+ * 在 12Mbps 下 = 9.9 秒常驻队列 (memory_limit 32MB 要到 ~14200 段才拦, 先撞不上)。
+ * 那正是整形器要消灭的东西, 只是从洲际段搬到了本机。
+ * 修法: 上界的单位改成"时间", 由速率换算成段数。
+ * 12Mbps/100ms -> 100 段; 100Mbps -> 833 段; 1Gbps -> 8333 段 (仍在 q->limit 之下)。 */
+#define NEOQ_QUEUE_MS_DEFAULT   100U
+#define NEOQ_QUEUE_MS_MAX       10000U  /* 上钳: 防 rate_bytes*queue_ms 溢出成天文数字 */
+#define NEOQ_QUEUE_MSS          1500U   /* 换算段数用的名义段长 (拆分后每段 ~1 MSS) */
+/* 下钳 64 段: 只在 rate < 64*MSS*1000/queue_ms ≈ 7.7Mbps(@100ms) 时才真正生效, 而那个
+ * 速率区间必然低于 neoq_split_gso_thresh(300Mbps), GSO 一定被拆成"每 skb 记 1 段",
+ * 64 段足够让队列跑起来; 即便分段失败回退整包, 64KB 超级包最多 45 段也仍在 64 之内。 */
+#define NEOQ_QUEUE_MIN_PKTS     64U
+
+/* 队列的时间目标 (ms), 可经 /proc/net/neoq_rate 第三个字段调。 */
+static u32 neoq_queue_ms = NEOQ_QUEUE_MS_DEFAULT;
+/* 由 rate 与 neoq_queue_ms 派生的段数上界。0 = 整形关闭 -> enqueue 退回 q->limit,
+ * 逐字保持改动前行为 (与 neoq_rate_cfg 的 fail-open 语义一致)。 */
+static u32 neoq_limit_pkts;
+
+/* 整形开启且速率低于该阈值 (bit/s) 时才拆 GSO 超级包; 高于它不拆 (拆分本身的
+ * 代价在高速下超过收益, 且高速下一个 64KB 包的传输时间已经可以忽略)。 */
+static u32 neoq_split_gso_thresh = 300000000U;   /* 300 Mbps */
+
+/* 写侧预计算: len_ns = plen * NSEC_PER_SEC / rate_Bps 变成一次乘法 + 一次右移。
+ * 溢出验算: rate_Bps>=1 => mult_init = 2^20 * 1e9 / rate_Bps < 2^50, 最多右移 18 次
+ * 即可 <= U32_MAX, 故 shift 落在 [2,20], 绝不会减到负数。
+ * 读侧 len_ns = ((u64)plen * (u32)(cfg>>8)) >> (u8)cfg:
+ *   常规 GSO plen <= 2^16, mult <= 2^32 -> 乘积 <= 2^48; 即便 BIG TCP 把 skb->len
+ *   顶到 512KB (2^19) 也只有 2^51, 距 u64 溢出还差 13 位。mult<<8 <= 2^40 不溢出。
+ * 精度下界: 结果按 ns 取整, 故 rate 很高时小包会算成 0 ns (1Gbps 下 64B = 0.512ns)。
+ *   这是 ns 时钟的分辨率地板, 不是定点表示的问题; 本整形器的目标区间 (~12Mbps)
+ *   下 64B = 42666ns, 精确。
+ * kbps 为单位: u32 可覆盖到 4.3Tbps, 用户态高频写一个整数即可。 */
+static void neoq_rate_set(u32 kbps)
+{
+    u64 bps, rate_bytes, mult, lim;
+    u32 shift;
+
+    if (!kbps) {
+        /* 先清 cfg 再清 bps: dequeue 闸门只看 cfg, 保证"关闭"这一步是原子的
+         * fail-open, 不会出现 cfg 还在、bps 已归零的中间态。 */
+        WRITE_ONCE(neoq_rate_cfg, 0);
+        WRITE_ONCE(neoq_rate_bps, 0);
+        /* F1: 最后清限额 —— 清它是放宽方向 (退回 q->limit), 中间态无害。 */
+        WRITE_ONCE(neoq_limit_pkts, 0);
         return;
-    /* Skip GSO/TSO super-packets: writing into them breaks segmentation/csum.
-     * Outbound ACKs are tiny and never GSO'd, so we lose nothing in practice. */
-    if (skb_is_gso(skb))
-        return;
-    iph = ip_hdr(skb);
-    if (!iph || iph->protocol != IPPROTO_TCP)
-        return;
-    off = iph->ihl << 2;
-    if (!pskb_may_pull(skb, off + sizeof(struct tcphdr)))
-        return;
-    if (skb_ensure_writable(skb, off + sizeof(struct tcphdr)))
-        return;
-    iph = ip_hdr(skb);
-    th = (struct tcphdr *)((u8 *)iph + off);
-    if (!th->ack)
-        return;
-    old_win = ntohs(th->window);
-    if (old_win == 0)            /* zero-window = flow control, never touch */
-        return;
-    new_win = (u16)min_t(u32, (u32)old_win * boost / 100, 65535U);
-    if (new_win == old_win)
-        return;
-    inet_proto_csum_replace2(&th->check, skb, htons(old_win), htons(new_win), false);
-    th->window = htons(new_win);
+    }
+
+    bps = (u64)kbps * 1000;
+    rate_bytes = bps >> 3;
+    if (!rate_bytes)                /* < 8 bps: 钳到 1 B/s, 防除零 */
+        rate_bytes = 1;
+
+    shift = 20;
+    mult = div64_u64((u64)NSEC_PER_SEC << 20, rate_bytes);
+    while (mult > U32_MAX) {
+        mult >>= 1;
+        shift--;
+    }
+
+    /* F1: 由速率派生段数上界。溢出验算: rate_bytes <= U32_MAX*1000/8 < 2^39,
+     * neoq_queue_ms <= 10000 < 2^14 -> 被除数 < 2^53, u64 内无溢出; 商 < 2^53/1.5e6
+     * < 2^33 仍可能超 u32, 故先 clamp 到 U32_MAX 再截。rate_bytes >= 1 保证不除零,
+     * 下钳 NEOQ_QUEUE_MIN_PKTS 保证结果不为 0 (否则 enqueue 会把它当成"整形关闭")。
+     * 先写 limit_pkts 再写 cfg: 开启整形的一瞬限额已经到位, 不会有"整形已生效
+     * 但队列上界还是 10240"的窗口。 */
+    lim = div64_u64(rate_bytes * READ_ONCE(neoq_queue_ms),
+                    1000ULL * NEOQ_QUEUE_MSS);
+    WRITE_ONCE(neoq_limit_pkts,
+               (u32)clamp_t(u64, lim, NEOQ_QUEUE_MIN_PKTS, (u64)U32_MAX));
+
+    WRITE_ONCE(neoq_rate_bps, bps);
+    WRITE_ONCE(neoq_rate_cfg, (mult << 8) | shift);
 }
 
 /* === NEW: CAKE 风格每流稀疏门控 (FIX2: 只读计算版) ===
@@ -877,8 +961,18 @@ static __always_inline u8 classify_packet_enhanced(struct neoq_sched_data *q,
              * is_retrans 仍为真 -> cb 免疫标记照置, 重传永不被 CoDel 丢, 只是不插队。 */
             if (is_retrans) {
                 u32 share_max = READ_ONCE(neoq_retrans_share_max);
+                /* B3: 绝对阈值 -> 相对阈值。
+                 * 有效阈值 = max(地板 share_max, 链路常态 ambient_share x rel/100)。
+                 * 绝对阈值在整体重传率 18-20% 的链路上永远触发 (实测 77.7% 的重传
+                 * 被拒 Express), 把正常的丢包恢复也一并拦了。相对化之后, 只有重传
+                 * 占比显著高于链路常态的流才算滥用。ambient_share 上限 100, rel 写侧
+                 * 钳到 <=10000, 故 rel*ambient/100 <= 10000, min 再压回 100, 不溢出。 */
+                u32 thresh = max_t(u32, share_max,
+                                   min_t(u32, 100,
+                                         READ_ONCE(neoq_retrans_rel) *
+                                         q->ambient_share / 100));
                 bool gate = share_max && !sparse &&
-                            flow && flow->prev_retrans_share > share_max;
+                            flow && flow->prev_retrans_share > thresh;
 
                 if (gate)
                     res->retrans_demoted_hint = true;   /* 由调用方累计 retrans_demoted */
@@ -975,15 +1069,25 @@ static __always_inline void neoq_commit_classify(struct neoq_flow *flow,
  * ======================================================================== */
 
 /* 全局 5-tuple 哈希: 表已上移到 q->flows/tags, 一个连接只占一个槽。
- * P6: 增加 IPv6 分支, 哈希 v6 地址+端口, 否则所有 v6 流塌缩到同一桶。 */
+ * P6: 增加 IPv6 分支, 哈希 v6 地址+端口, 否则所有 v6 流塌缩到同一桶。
+ *
+ * === NEW (B4): 8 路集合饱和时的冲突守卫 ===
+ * 旧行为是走 "Collision - use original" 分支并把 q->tags[slot] 抢过来。危害:
+ * victim flow 的包还在那个槽的 FIFO 里, 于是两个不同的 5-tuple 共享同一个
+ * neoq_flow -> highest_seq 被两条流交错前移 -> 假重传风暴。而假重传还自带
+ * CoDel 免疫 + Express 插队, 危害被放大; sparse 窗口也被互相污染。
+ * 新行为: 冲突时置 *collided=true 且**不写 tags**(不抢 tag、不共享状态)。包物理上
+ * 仍进该槽的 FIFO (总得有地方排队), 但由调用方按"无状态包"处理。way_collide 计数照旧。 */
 static u32 flow_hash(struct neoq_sched_data *q, const struct sk_buff *skb,
-                     u32 perturbation)
+                     u32 perturbation, bool *collided)
 {
     const struct iphdr *iph;
     u32 hash, reduced;
     u32 saddr = 0, daddr = 0;
     u16 sport = 0, dport = 0;
     u8 proto = 0;
+
+    *collided = false;
 
     if (skb->protocol == htons(ETH_P_IP)) {
         iph = ip_hdr(skb);
@@ -1056,9 +1160,12 @@ static u32 flow_hash(struct neoq_sched_data *q, const struct sk_buff *skb,
             }
         }
 
-        /* Collision - use original */
+        /* Collision - 集合已饱和: 借槽排队但不抢 tag, 见函数头 B4 说明。
+         * 直接 return 以绕过下方 found: 处的 q->tags 写入 —— 一旦写了 tag, victim
+         * 的后续包就会被判成"另一条流", 状态污染即刻发生。 */
         q->way_collide++;
-        reduced = outer + inner;
+        *collided = true;
+        return outer + inner;
 found:
         q->tags[reduced] = hash;
     }
@@ -1085,23 +1192,9 @@ static bool codel_should_drop(struct neoq_flow *flow, struct neoq_tier *tier,
 
     flow->ecn_marked = 0;
 
-    /* Adjust target based on flow RTT if available */
-    if (flow->srtt_us > 0) {
-        /* RTT-aware target: scale with flow RTT */
-        if (flow->srtt_us < NEOQ_RTT_LOW_US) {
-            effective_target = 5 * NSEC_PER_MSEC;
-        } else if (flow->srtt_us < NEOQ_RTT_MED_US) {
-            effective_target = ((u64)flow->srtt_us / 2) * NSEC_PER_USEC;
-        } else if (flow->srtt_us < NEOQ_RTT_HIGH_US) {
-            effective_target = ((u64)flow->srtt_us / 4) * NSEC_PER_USEC;
-        } else {
-            /* High delay: very conservative */
-            effective_target = ((u64)flow->srtt_us / 4) * NSEC_PER_USEC;
-        }
-        /* Clamp to reasonable bounds */
-        effective_target = clamp_t(u64, effective_target,
-                                   1 * NSEC_PER_MSEC, 200 * NSEC_PER_MSEC);
-    }
+    /* 注: 此处原有一段按 flow->srtt_us 缩放 effective_target 的 "RTT-aware" 逻辑,
+     * 已随 srtt_us 字段一并删除 —— srtt_us 永远是 0, 该分支恒假。高 RTT 链路要放宽
+     * target, 请写 /proc/net/neoq_codel (用户态 lotspeedctl 已在做)。 */
 
     /* Flow protection: increase target for protected flows */
     switch (flow->loss_protect_level) {
@@ -1134,13 +1227,16 @@ static bool codel_should_drop(struct neoq_flow *flow, struct neoq_tier *tier,
     }
 
     if (due && flow->dropping) {
-        /* For highly protected flows, prefer ECN over drop */
-        if (flow->loss_protect_level == LOSS_PROTECT_HIGH) {
-            /* Signal congestion via return, but caller should try ECN first */
-            flow->ecn_marked = 1;
-            return false;  /* Don't drop, try ECN */
-        }
-
+        /* F3: 状态机必须无条件推进 —— 原来错在 LOSS_PROTECT_HIGH 直接 return false
+         * 且不动 count/drop_next。调用方是 `if (!codel_should_drop(...) || !flow->head)
+         * break;`, 返回 false 就直接交付, 下面的 ECN 分支根本不可达: 注释承诺的
+         * "caller should try ECN first" 从未实现, flow->ecn_marked 是死写。更糟的是
+         * drop_next 停在过去 -> 该流永远 due 却永远不丢不标, drop token 被无限期挂起,
+         * 完全逃出 AQM。本链路 ambient 重传 18-20%, 而 update_flow_state 在
+         * retrans/total > 5% 时就置 HIGH -> 约 1/5 的出队瞬间 CoDel 被旁路。改动前
+         * qlen 恒为 0、CoDel 从不运行, 这无所谓; 整形器把队列买回本机之后, CoDel 是
+         * 唯一的队列控制手段, 不能有洞。
+         * 因此: 先照常推进 count/drop_next (与非保护流逐字一致), 再决定动作。 */
         flow->count++;
         if (!flow->count)
             flow->count--;
@@ -1148,6 +1244,18 @@ static bool codel_should_drop(struct neoq_flow *flow, struct neoq_tier *tier,
         flow->drop_next = codel_control_law(flow->drop_next,
                                              READ_ONCE(neoq_codel_interval_ns),
                                              flow->rec_inv_sqrt);
+
+        /* HIGH 由"完全免疫"降级为"只标不丢": 只有 CE 真的打上去了才免于丢弃。
+         * Not-ECT (本链路常态) 打标失败时必须 return true 落回正常丢弃逻辑, 否则又
+         * 变回"既不标也不丢"的老洞。这里自己打标而不是交给调用方的 ECN 分支, 原因有
+         * 二: 那个分支受 q->ecn 开关约束 (q->ecn=0 时会变成"标了还丢"), 且
+         * INET_ECN_set_ce 对已 CE 的包同样返回 1, 会把 tier->ecn_marked 记两次。 */
+        if (flow->loss_protect_level == LOSS_PROTECT_HIGH &&
+            INET_ECN_set_ce(skb)) {
+            tier->ecn_marked++;
+            flow->ecn_marked = 1;
+            return false;
+        }
         return true;
     }
 
@@ -1292,36 +1400,40 @@ static u32 neoq_evict_from_tier(struct Qdisc *sch, u8 tier_idx,
  * Enqueue - Enhanced with Retransmit Priority & Flow State
  * ======================================================================== */
 
-static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
-                        struct sk_buff **to_free)
+/* 单个 skb 的入队主体。B2 起 neoq_enqueue 变成只做 GSO 拆分的薄壳, 拆出来的每一段
+ * 都完整走一遍本函数 (classify -> 限额检查 -> commit), 因此 compute-then-commit 的
+ * 语义对每段独立成立, 不会被拆分打乱。 */
+static int neoq_enqueue_one(struct sk_buff *skb, struct Qdisc *sch,
+                            struct sk_buff **to_free)
 {
     struct neoq_sched_data *q = qdisc_priv(sch);
     struct neoq_tier *tier;
     struct neoq_flow *flow;
     struct neoq_classify_result res = {0};   /* FIX2: classify 把待写状态收进此处 */
-    u32 idx, len, gso;
+    u32 idx, len, gso, limit_eff;
     u8 tier_idx;
     bool is_retrans = false;
     bool new_flow;
+    bool collided;
     u64 now;
 
     len = qdisc_pkt_len(skb);
     gso = neoq_gso_segs(skb);
-
-    /* Downstream window deception: enlarge advertised rwnd on outbound ACKs */
-    neoq_boost_rwnd(skb);
 
     /* === 单次分类 (P2): 解析头部一次 -> flow_hash 一次 -> 拿到 flow -> 分类一次 ===
      * enqueue_time 在分类前写入, 供 sparse 门控读取同一时钟。 */
     now = ktime_get_ns();
     get_neoq_cb(skb)->enqueue_time = now;
 
-    idx = flow_hash(q, skb, q->perturbation);
+    idx = flow_hash(q, skb, q->perturbation, &collided);
     flow = &q->flows[idx];
 
     /* 全新槽位: 先把每流检测状态清零 *再* 分类, 使 retrans/sparse 看到干净状态。
-     * 此时尚未挂链 (tier 未知); 若随后被拒纳, 槽位仍为 FLOW_NONE 的干净零态。 */
-    new_flow = (flow->set == FLOW_NONE);
+     * 此时尚未挂链 (tier 未知); 若随后被拒纳, 槽位仍为 FLOW_NONE 的干净零态。
+     * B4: 冲突包借的是别人的槽, 绝不能触发"新流初始化"(那会把 victim 的状态清光)。
+     * 事实上 collided 只在 8 路全非空时才为真, flow->set 必然 != FLOW_NONE, 这里
+     * 显式带上 !collided 只是把这个不变式写进代码。 */
+    new_flow = !collided && (flow->set == FLOW_NONE);
     if (new_flow) {
         /* 与原 FLOW_NONE 初始化集合一致 (仅顺序提前), 外加新增的 sparse 门控字段。 */
         flow->flow_state = FLOW_STATE_NEW;
@@ -1330,8 +1442,6 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
         flow->retrans_count = 0;
         flow->total_packets = 0;
         flow->startup_packets = 0;
-        flow->srtt_us = 0;
-        flow->rtt_min_us = 0;
         flow->bytes_window = 0;
         flow->window_start = 0;
         flow->is_bulk_behave = 0;
@@ -1340,13 +1450,34 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
         flow->prev_retrans_share = 0;
     }
 
-    /* FIX2: classify 只读计算 (不改 flow), 结果存 res; 接受入队后才 commit。 */
-    tier_idx = classify_packet_enhanced(q, skb, flow, now, &res);
+    if (unlikely(collided)) {
+        /* === B4: 冲突包按"无状态包"处理 ===
+         * 不读也不写 victim 的 flow 状态, 因此不做 classify —— classify 的两个输出
+         * (tier 与 is_retrans) 对冲突包都必须丢弃, 再解析一遍头部是纯浪费。res 保持
+         * 全零 -> is_retrans=false, 下方的 commit / update_flow_state 也一并跳过。
+         *
+         * 关键 (原规格易漏): 必须沿用 victim 当前的档位。若让冲突包自行分类出一个
+         * 档位, 下方 "flow->tier != tier_idx -> neoq_flow_migrate" 会把 victim 的
+         * 整条 backlog 拖去另一个档位 —— 比它本要避免的假重传问题更糟。这里
+         * tier_idx == flow->tier, 迁移分支自然不成立。 */
+        tier_idx = flow->tier;
+    } else {
+        /* FIX2: classify 只读计算 (不改 flow), 结果存 res; 接受入队后才 commit。 */
+        tier_idx = classify_packet_enhanced(q, skb, flow, now, &res);
+    }
     is_retrans = res.is_retrans;
     tier = &q->tiers[tier_idx];
 
+    /* === F1: 整形开启时用速率派生的队列上界, 而不是固定的 q->limit ===
+     * 拆 GSO 打掉了 TCP Small Queues (详见 neoq_limit_pkts 处的推导), 本机队列的唯一
+     * 上界就只剩这一处; 10240 段在 12Mbps 下是 9.9 秒。q->limit 仍是硬顶 (用户显式
+     * 配置的上界不能被派生值突破), 整形关闭时 limit_pkts=0 -> 逐字退回原行为。 */
+    limit_eff = READ_ONCE(neoq_limit_pkts);
+    if (!limit_eff || limit_eff > q->limit)
+        limit_eff = q->limit;
+
     /* === 限额检查 (P3/P7: 以段计数; 溢出时对 Express/High 驱逐低优先级队列) === */
-    if (unlikely(sch->q.qlen + gso > q->limit ||
+    if (unlikely(sch->q.qlen + gso > limit_eff ||
                  q->memory_used + skb->truesize > q->memory_limit)) {
         if (tier_idx == NEOQ_TIER_EXPRESS || tier_idx == NEOQ_TIER_HIGH) {
             /* 从最低优先级的非空档位 (Bulk 优先) 驱逐, 直到能容纳到来的包。
@@ -1355,19 +1486,19 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
             int vt;
 
             for (vt = NEOQ_MAX_TIERS - 1; vt > (int)tier_idx; vt--) {
-                while (sch->q.qlen + gso > q->limit ||
+                while (sch->q.qlen + gso > limit_eff ||
                        q->memory_used + skb->truesize > q->memory_limit) {
                     /* skip=flow: 绝不驱逐到来包自身的 flow (它即将上迁并入队),
                      * 否则 new_flow/flow->set 失效, 迁移会双重扣减计数。 */
                     if (!neoq_evict_from_tier(sch, vt, flow))
                         break;          /* 该档已无可驱逐对象, 换更高档位 */
                 }
-                if (sch->q.qlen + gso <= q->limit &&
+                if (sch->q.qlen + gso <= limit_eff &&
                     q->memory_used + skb->truesize <= q->memory_limit)
                     break;
             }
             /* 仍放不下 (无更低优先级流量可驱逐) -> 只能丢弃到来的包 */
-            if (sch->q.qlen + gso > q->limit ||
+            if (sch->q.qlen + gso > limit_eff ||
                 q->memory_used + skb->truesize > q->memory_limit) {
                 qdisc_qstats_drop(sch);
                 __qdisc_drop(skb, to_free);
@@ -1385,8 +1516,32 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
      * FIX2: commit 必须早于 update_flow_state —— 后者读 retrans_count/total_packets 算
      * loss_rate, 而旧实现里 retrans_count++ 发生在 classify(即 update_flow_state 之前),
      * 故此处先 commit (落 retrans_count 等) 再 update_flow_state, 保持原顺序语义不变。 */
-    neoq_commit_classify(flow, &res);
-    update_flow_state(flow, is_retrans);
+    if (likely(!collided)) {
+        neoq_commit_classify(flow, &res);
+        update_flow_state(flow, is_retrans);
+
+        /* === B3: 全局 ambient 重传占比 (1 秒滚动窗口) ===
+         * 分母口径必须与 flow->prev_retrans_share 一致, 否则两者不可比:
+         * 后者只统计 >=128B 的包 (classify 对 <128B 直接 return Express, 从不做
+         * retrans 判定), 若把纯 ACK 也计进分母, ambient 会被系统性稀释 -> 相对阈值
+         * 偏低 -> 门又开始误杀。冲突包没有 flow 状态 (is_retrans 恒 false), 同样排除。
+         * 全在持 root lock 的 enqueue 路径内, 无并发问题。 */
+        if (len >= 128) {
+            if (!q->glob_win_start)
+                q->glob_win_start = now;
+            q->glob_win_pkts++;
+            if (is_retrans)
+                q->glob_win_retrans++;
+            if (now - q->glob_win_start >= NSEC_PER_SEC) {
+                q->ambient_share = q->glob_win_pkts ?
+                    (u8)min_t(u32, 100,
+                              q->glob_win_retrans * 100 / q->glob_win_pkts) : 0;
+                q->glob_win_pkts = 0;
+                q->glob_win_retrans = 0;
+                q->glob_win_start = now;
+            }
+        }
+    }
 
     /* retrans 免疫标记随 skb 旅行到 dequeue (CoDel 丢弃判定处)。
      * 仅对真正入队的包置位/计数 (溢出丢弃路径已提前 return)。 */
@@ -1432,6 +1587,75 @@ static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     tier->bytes += len;
 
     return NET_XMIT_SUCCESS;
+}
+
+/* ========================================================================
+ * NEW (B2): GSO 拆分薄壳
+ *
+ * 为什么整形开启时必须拆: 12Mbps 下一个 64KB 的 GSO 超级包 = 43ms 路径传输时间。
+ * 不拆则虚拟时钟的推进粒度是 43ms、DRR 的公平粒度是 43ms、Express 最坏排队 +43ms、
+ * CoDel 按"血块"采样 —— 整形器和 AQM 同时失去分辨率。
+ * 副作用收益: tcp_retransmit_compute 只看 GSO 头部, 一个 44 段的超级包在
+ * window_pkts 里只计 1; 拆分后重传检测 / 稀疏门 / 近窗占比统计全部变准。
+ *
+ * 记账 (仿 sch_cake): 上游(父 qdisc)把这次入队记成 1 个包 len 字节, 而我们实际持有
+ * numsegs 个包共 slen 字节, 故 qdisc_tree_reduce_backlog(sch, 1-numsegs, len-slen)
+ * 报告差量 (通常为负 = 让父 qdisc 加回来)。NeoQ 自身的 sch->q.qlen 一直按"段"计数,
+ * 拆分前后都是 numsegs (neoq_gso_segs 对单段 skb 返回 1), 内部记账不受影响。
+ * 中途被限额丢掉的段不计入 numsegs/slen —— 差量报的必须是"实际持有"。
+ * ======================================================================== */
+
+static int neoq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+                        struct sk_buff **to_free)
+{
+    struct sk_buff *segs, *nskb;
+    netdev_features_t features;
+    unsigned int slen = 0, numsegs = 0;
+    u64 rate = READ_ONCE(neoq_rate_bps);
+    u32 len;
+
+    /* 整形关闭 (rate=0) 时逐字维持改动前行为: 不拆, 直通。 */
+    if (!rate || !skb_is_gso(skb) ||
+        rate >= (u64)READ_ONCE(neoq_split_gso_thresh))
+        return neoq_enqueue_one(skb, sch, to_free);
+
+    features = netif_skb_features(skb);
+    segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+    /* 清掉 NETIF_F_GSO_MASK 是为了强制"完全分段"(顺带禁掉 GSO_PARTIAL), 这样每个
+     * 段的 gso_segs=0 -> neoq_gso_segs() 返回 1, 段计数与拆分前的总段数一致。 */
+    if (IS_ERR_OR_NULL(segs))
+        return neoq_enqueue_one(skb, sch, to_free);  /* 分段失败 -> 回退整包路径 */
+
+    len = qdisc_pkt_len(skb);       /* 必须在 consume_skb 之前取 */
+
+    skb_list_walk_safe(segs, segs, nskb) {
+        /* seglen 必须在 neoq_enqueue_one 之前取: 调用返回后这个 skb 已经归 qdisc
+         * 队列或 to_free 链表所有, 不再该被本函数读写。 */
+        unsigned int seglen = segs->len;
+
+        skb_mark_not_on_list(segs);
+        qdisc_skb_cb(segs)->pkt_len = seglen;
+        if (neoq_enqueue_one(segs, sch, to_free) == NET_XMIT_SUCCESS) {
+            slen += seglen;
+            numsegs++;
+        }
+    }
+
+    /* F2: numsegs==0 (所有段都被限额丢掉) 时绝不能上报差量。原来错在无条件调用:
+     * 那一路退化成 qdisc_tree_reduce_backlog(sch, 1, len), 把父 qdisc 的 q.qlen -= 1、
+     * qstats.backlog -= len —— 但本函数这一路返回 NET_XMIT_DROP, 父 qdisc (HTB/prio 等)
+     * 在子 enqueue 返回非 SUCCESS 时 **从来没有加过** 这个包 (直接 return, 不做
+     * qlen++/backlog+=len)。于是每丢一个整包, 父及其所有祖先的 q.qlen(unsigned) 与
+     * qstats.backlog(__u32) 各减 1/len, 向下回绕成 ~4e9; HTB 随即认为该 class 永久有
+     * backlog, qlen_notify 再也不触发。sch_tbf.c:tbf_segment 的 if (nb > 1) 正是为此。
+     * 当前 lotspeed 只挂 root (root 的 qdisc_tree_reduce_backlog 第一轮就 break, 是
+     * 空操作), 所以今天看不出来 —— 任何人把 neoq 挂到 HTB 之下就立刻暴露。 */
+    if (numsegs)
+        qdisc_tree_reduce_backlog(sch, 1 - numsegs, len - slen);
+    consume_skb(skb);
+    /* 全部段都被限额丢掉时如实返回 DROP, 让套接字拿到正确的背压信号 (每段自己
+     * 已经计过 qdisc_qstats_drop 并挂进 to_free, 不存在重复释放)。 */
+    return numsegs ? NET_XMIT_SUCCESS : NET_XMIT_DROP;
 }
 
 /* ========================================================================
@@ -1509,7 +1733,7 @@ static struct sk_buff *neoq_dequeue(struct Qdisc *sch)
     struct neoq_flow *flow;
     struct list_head *head;
     struct sk_buff *skb;
-    u64 now, delay;
+    u64 now, delay, cfg;
     u32 plen, gso;
     int t;
 
@@ -1518,6 +1742,21 @@ begin:
         return NULL;
 
     now = ktime_get_ns();
+
+    /* === B1: 虚拟时钟整形闸门 ===
+     * 这是本函数里唯一"有 backlog 却返回 NULL"的路径, 因此必须挂 watchdog, 否则
+     * qdisc 会停摆到下一次 enqueue 才被唤醒。其余 NULL 出口 (begin: 的 !qlen 与
+     * neoq_pick_tier 返回 -1) 都等价于队列为空, 不需要定时器。
+     * 用直接的 u64 比较 (参照 sch_cake 的写法), 不引入不确定是否存在的 helper。
+     * cfg 在此无条件取一次, 出队记账处复用同一份快照 —— 避免闸门与推进用到不同
+     * 的速率配置。 */
+    cfg = READ_ONCE(neoq_rate_cfg);
+    if (cfg && now < q->time_next_packet) {
+        q->shaper_defer_cnt++;
+        qdisc_qstats_overlimit(sch);    /* 与 tbf/cake 同口径, tc -s qdisc 可见 */
+        qdisc_watchdog_schedule_ns(&q->watchdog, q->time_next_packet);
+        return NULL;
+    }
 
     /* WRR 选档 (替代纯严格优先级) */
     t = neoq_pick_tier(q);
@@ -1626,6 +1865,25 @@ retry:
     plen = qdisc_pkt_len(skb);
     flow->deficit -= plen;
     tier->tier_deficit -= plen;     /* WRR: 按服务字节扣减档位赤字 */
+
+    /* === B1: 推进虚拟时钟 ===
+     * 只对真正交付的包推进 —— 上面 CoDel 循环里被丢的包不占路径预算, 这正是"把丢弃
+     * 从洲际段挪到本机"的收益本体 (丢一个包立刻腾出它那份发送时间给下一个包)。
+     * floor 钳制是关键: 它杜绝空闲期积攒 credit (那正是 TBF 的桶会做、而我们要避免
+     * 的事)。burst_ns 只用来吸收 hrtimer 的迟到抖动, 不是一个"桶"。
+     * floor 用 now>burst 保护: ktime_get_ns() 在刚启动时可能小于 burst_ns, 无保护的
+     * 减法会下溢成天文数字, 把 time_next_packet 顶到未来 -> qdisc 永久停摆。 */
+    if (cfg) {
+        u64 burst = READ_ONCE(neoq_burst_ns);
+        u64 floor = now > burst ? now - burst : 0;
+        u64 len_ns = ((u64)plen * (u32)(cfg >> 8)) >> (u8)cfg;
+
+        if (q->time_next_packet < floor)
+            q->time_next_packet = floor;
+        q->time_next_packet += len_ns;
+        q->shaper_sent_bytes += plen;
+    }
+
     qdisc_bstats_update(sch, skb);
     q->total_packets++;
     q->total_bytes += plen;
@@ -1711,11 +1969,13 @@ static int neoq_init(struct Qdisc *sch, struct nlattr *opt,
     q->limit = NEOQ_LIMIT_DEFAULT;
     q->quantum = NEOQ_QUANTUM;
     q->memory_limit = NEOQ_MEMORY_LIMIT;
-    q->target = NEOQ_TARGET_US;
-    q->interval = NEOQ_INTERVAL_US;
     q->ecn = 1;
     q->http_boost = 1;  /* Enable by default */
     q->flows_cnt = 0;
+    q->time_next_packet = 0;    /* B1: 虚拟时钟从"现在就可以发"起步 */
+
+    /* 注: CoDel 的 target/interval 不在这里初始化 —— 它们是模块级全局量, 已在定义处
+     * 带默认值。若在 init 里重写, 新建第二个 qdisc 实例会把用户态调好的值冲掉。 */
 
     get_random_bytes(&q->perturbation, sizeof(q->perturbation));
 
@@ -1747,8 +2007,6 @@ static int neoq_init(struct Qdisc *sch, struct nlattr *opt,
         INIT_LIST_HEAD(&tier->old_flows);
         tier->quantum = q->quantum;
         tier->tier_deficit = 0;
-        tier->codel_interval = (u64)q->interval * NSEC_PER_USEC;
-        tier->codel_target = (u64)q->target * NSEC_PER_USEC;
         tier->base_delay = ~0ULL;
     }
 
@@ -1793,6 +2051,20 @@ static void neoq_reset(struct Qdisc *sch)
     q->retrans_seen = 0;        /* retrans 免疫计数随复位归零 */
     q->retrans_protected = 0;
     q->retrans_demoted = 0;     /* FIX1: Express 防滥用计数随复位归零 */
+
+    /* B3: ambient 采样窗口随复位归零, 否则复位后第一个包会立刻以一个极小样本
+     * 滚动窗口, 算出一个无意义的 ambient_share。 */
+    q->glob_win_pkts = 0;
+    q->glob_win_retrans = 0;
+    q->glob_win_start = 0;
+    q->ambient_share = 0;
+
+    /* B1: 队列已清空, 虚拟时钟必须归零 —— 否则重新激活后第一个包会被一个陈旧的
+     * time_next_packet 无谓地挡住。同时取消可能在飞的整形定时器 (同 sch_tbf)。 */
+    qdisc_watchdog_cancel(&q->watchdog);
+    q->time_next_packet = 0;
+    q->shaper_sent_bytes = 0;
+    q->shaper_defer_cnt = 0;
 }
 
 static void neoq_destroy(struct Qdisc *sch)
@@ -1832,6 +2104,7 @@ static const struct nla_policy neoq_policy[TCA_NEOQ_MAX + 1] = {
     [TCA_NEOQ_ECN]       = { .type = NLA_U32 },
     [TCA_NEOQ_HTTP_BOOST]= { .type = NLA_U32 },
     [TCA_NEOQ_FLOWS]     = { .type = NLA_U32 },
+    [TCA_NEOQ_RATE64]    = { .type = NLA_U64 },
 };
 
 static int neoq_change(struct Qdisc *sch, struct nlattr *opt,
@@ -1859,20 +2132,36 @@ static int neoq_change(struct Qdisc *sch, struct nlattr *opt,
     if (tb[TCA_NEOQ_QUANTUM])
         q->quantum = clamp_t(u32, nla_get_u32(tb[TCA_NEOQ_QUANTUM]),
                              NEOQ_QUANTUM_MIN, NEOQ_QUANTUM_MAX);
+    /* B5: target/interval 直写全局 —— netlink 与 /proc/net/neoq_codel 从此是同一份
+     * 真相, 不再各存一份互不同步的副本。单位仍是微秒 (保持既有 netlink ABI)。 */
     if (tb[TCA_NEOQ_TARGET])
-        q->target = max_t(u32, nla_get_u32(tb[TCA_NEOQ_TARGET]), 1);
+        WRITE_ONCE(neoq_codel_target_ns,
+                   (u64)max_t(u32, nla_get_u32(tb[TCA_NEOQ_TARGET]), 1) * NSEC_PER_USEC);
     if (tb[TCA_NEOQ_INTERVAL])
-        q->interval = max_t(u32, nla_get_u32(tb[TCA_NEOQ_INTERVAL]), 1);
+        WRITE_ONCE(neoq_codel_interval_ns,
+                   (u64)max_t(u32, nla_get_u32(tb[TCA_NEOQ_INTERVAL]), 1) * NSEC_PER_USEC);
+    /* 整形速率: 主控制面是 /proc/net/neoq_rate, 这里只为 netlink 侧的对称性。
+     * 属性单位 bit/s, 转成 kbps 交给同一个预计算函数, 不产生第二条计算路径。 */
+    if (tb[TCA_NEOQ_RATE64]) {
+        u64 rate64 = nla_get_u64(tb[TCA_NEOQ_RATE64]);
+        u64 kbps = div64_u64(rate64, 1000);
+
+        /* F4: 原来错在直接取整 —— 任何 0 < rate64 < 1000 都被 div64_u64 抹成 0, 而
+         * neoq_rate_set(0) 的语义是"关闭整形 = 线速直通"。用户要 500bps, 拿到的是
+         * 完全不限速: fail-open 的方向反了 (整形器的 fail-open 只允许发生在"没人配
+         * 置"时, 不允许发生在"配了一个很小的值"时)。非零速率一律至少 1kbps;
+         * rate64==0 仍保留"关闭"语义, 与 /proc 的 rate_kbps=0 和 neoq_dump 一致。 */
+        if (rate64 && !kbps)
+            kbps = 1;
+        neoq_rate_set((u32)min_t(u64, kbps, (u64)U32_MAX));
+    }
     if (tb[TCA_NEOQ_ECN])
         q->ecn = !!nla_get_u32(tb[TCA_NEOQ_ECN]);
     if (tb[TCA_NEOQ_HTTP_BOOST])
         q->http_boost = !!nla_get_u32(tb[TCA_NEOQ_HTTP_BOOST]);
 
-    for (i = 0; i < NEOQ_MAX_TIERS; i++) {
+    for (i = 0; i < NEOQ_MAX_TIERS; i++)
         q->tiers[i].quantum = q->quantum;
-        q->tiers[i].codel_interval = (u64)q->interval * NSEC_PER_USEC;
-        q->tiers[i].codel_target = (u64)q->target * NSEC_PER_USEC;
-    }
 
     sch_tree_unlock(sch);
     return 0;
@@ -1890,11 +2179,16 @@ static int neoq_dump(struct Qdisc *sch, struct sk_buff *skb)
     if (nla_put_u32(skb, TCA_NEOQ_LIMIT, q->limit) ||
         nla_put_u32(skb, TCA_NEOQ_MEMORY, q->memory_limit) ||
         nla_put_u32(skb, TCA_NEOQ_QUANTUM, q->quantum) ||
-        nla_put_u32(skb, TCA_NEOQ_TARGET, q->target) ||
-        nla_put_u32(skb, TCA_NEOQ_INTERVAL, q->interval) ||
+        /* B5: 从全局量反向换算回微秒上报, 不再有本地副本可与之不一致。 */
+        nla_put_u32(skb, TCA_NEOQ_TARGET,
+                    (u32)(READ_ONCE(neoq_codel_target_ns) / NSEC_PER_USEC)) ||
+        nla_put_u32(skb, TCA_NEOQ_INTERVAL,
+                    (u32)(READ_ONCE(neoq_codel_interval_ns) / NSEC_PER_USEC)) ||
         nla_put_u32(skb, TCA_NEOQ_ECN, q->ecn) ||
         nla_put_u32(skb, TCA_NEOQ_HTTP_BOOST, q->http_boost) ||
-        nla_put_u32(skb, TCA_NEOQ_FLOWS, q->flows_cnt))
+        nla_put_u32(skb, TCA_NEOQ_FLOWS, q->flows_cnt) ||
+        nla_put_u64_64bit(skb, TCA_NEOQ_RATE64, READ_ONCE(neoq_rate_bps),
+                          TCA_NEOQ_PAD))
         goto nla_put_failure;
 
     return nla_nest_end(skb, opts);
@@ -2013,8 +2307,8 @@ static int neoq_stats_show(struct seq_file *m, void *v)
     seq_printf(m, " Active Flows:    %u / %u\n", q->flows_cnt, NEOQ_QUEUES);
     seq_printf(m, " HTTP Boost:      %s\n", q->http_boost ? "ON" : "OFF");
     seq_printf(m, " ECN:             %s\n", q->ecn ? "ON" : "OFF");
-    seq_printf(m, " Target Delay:    %u us\n", q->target);
-    seq_printf(m, " Interval:        %u us\n", q->interval);
+    seq_printf(m, " Target Delay:    %llu us\n", READ_ONCE(neoq_codel_target_ns) / 1000);
+    seq_printf(m, " Interval:        %llu us\n", READ_ONCE(neoq_codel_interval_ns) / 1000);
     seq_puts(m, "-----------------------------------------------\n");
     seq_puts(m, " Tier       Packets       Bytes    Drops  Marks  Flows  Backlog\n");
     seq_puts(m, "-----------------------------------------------\n");
@@ -2126,43 +2420,7 @@ static const struct proc_ops neoq_prio_proc_ops = {
 
 static struct proc_dir_entry *neoq_prio_entry;
 
-/* === /proc/net/neoq_boost: downstream rwnd boost factor (percent, 100=off) === */
-static int neoq_boost_show(struct seq_file *m, void *v)
-{
-    seq_printf(m, "%u\n", READ_ONCE(neoq_rwnd_boost));
-    return 0;
-}
-static int neoq_boost_open(struct inode *inode, struct file *file)
-{
-    return single_open(file, neoq_boost_show, NULL);
-}
-static ssize_t neoq_boost_write(struct file *file, const char __user *ubuf,
-                                size_t len, loff_t *ppos)
-{
-    char buf[16];
-    u32 v;
-    size_t n = min(len, sizeof(buf) - 1);
-
-    if (copy_from_user(buf, ubuf, n))
-        return -EFAULT;
-    buf[n] = '\0';
-    if (kstrtouint(strim(buf), 10, &v) == 0) {
-        if (v < 100)
-            v = 100;
-        if (v > 1000)
-            v = 1000;
-        WRITE_ONCE(neoq_rwnd_boost, v);
-    }
-    return len;
-}
-static const struct proc_ops neoq_boost_proc_ops = {
-    .proc_open    = neoq_boost_open,
-    .proc_read    = seq_read,
-    .proc_lseek   = seq_lseek,
-    .proc_release = single_release,
-    .proc_write   = neoq_boost_write,
-};
-static struct proc_dir_entry *neoq_boost_entry;
+/* 注: /proc/net/neoq_boost 已随 neoq_boost_rwnd() 一并删除 (死因见该函数原址注释)。 */
 
 /* === /proc/net/neoq_codel: CoDel target/interval in microseconds === */
 static int neoq_codel_show(struct seq_file *m, void *v)
@@ -2241,11 +2499,24 @@ static const struct proc_ops neoq_sparse_proc_ops = {
 };
 static struct proc_dir_entry *neoq_sparse_entry;
 
-/* === /proc/net/neoq_retrans: FIX1 Express 防滥用阈值 (重传占比百分比, 0=关闭) === */
+/* === /proc/net/neoq_retrans: Express 防滥用门 (地板 + 相对倍数) ===
+ * B3: 有效阈值 = max(share_max, min(100, rel_factor * ambient_share / 100))。
+ * share_max 是地板 (0 = 关闭整个门), rel_factor 是相对链路常态重传率的倍数(%)。 */
 static int neoq_retrans_show(struct seq_file *m, void *v)
 {
-    seq_printf(m, "share_max=%u\nusage: echo \"<percent>\" > /proc/net/neoq_retrans  (0 disables gate, default 15)\n",
-               READ_ONCE(neoq_retrans_share_max));
+    struct Qdisc *sch;
+    u32 ambient = 0;
+
+    spin_lock_bh(&neoq_lock);
+    sch = neoq_active_qdisc;
+    if (sch)
+        ambient = ((struct neoq_sched_data *)qdisc_priv(sch))->ambient_share;
+    spin_unlock_bh(&neoq_lock);
+
+    seq_printf(m, "share_max=%u rel_factor=%u ambient_share=%u\n"
+                  "usage: echo \"<share_max> [rel_factor]\" > /proc/net/neoq_retrans  (share_max=0 disables gate; defaults 15 200)\n",
+               READ_ONCE(neoq_retrans_share_max), READ_ONCE(neoq_retrans_rel),
+               ambient);
     return 0;
 }
 static int neoq_retrans_open(struct inode *inode, struct file *file)
@@ -2255,17 +2526,24 @@ static int neoq_retrans_open(struct inode *inode, struct file *file)
 static ssize_t neoq_retrans_write(struct file *file, const char __user *ubuf,
                                   size_t len, loff_t *ppos)
 {
-    char buf[16];
-    u32 v;
+    char buf[64];
+    unsigned int share = 0, rel = 0;
+    int got;
     size_t n = min(len, sizeof(buf) - 1);
 
     if (copy_from_user(buf, ubuf, n))
         return -EFAULT;
     buf[n] = '\0';
-    if (kstrtouint(strim(buf), 10, &v) == 0) {
-        if (v > 100)                    /* 占比上限 100%; 0 合法 = 关闭门控 */
-            v = 100;
-        WRITE_ONCE(neoq_retrans_share_max, v);
+    got = sscanf(buf, "%u %u", &share, &rel);
+    if (got >= 1) {                     /* share=0 合法 = 关闭门控 */
+        if (share > 100)                /* 占比上限 100% */
+            share = 100;
+        WRITE_ONCE(neoq_retrans_share_max, share);
+    }
+    if (got >= 2 && rel) {
+        if (rel > 10000)                /* 钳到 100 倍: 保证 rel*ambient 不溢出 u32 */
+            rel = 10000;
+        WRITE_ONCE(neoq_retrans_rel, rel);
     }
     return len;
 }
@@ -2277,6 +2555,76 @@ static const struct proc_ops neoq_retrans_proc_ops = {
     .proc_write   = neoq_retrans_write,
 };
 static struct proc_dir_entry *neoq_retrans_entry;
+
+/* === /proc/net/neoq_rate: B1 虚拟时钟整形器速率/突发 ===
+ * 写 "<rate_kbps> [burst_us]", rate_kbps=0 关闭整形 (透明直通)。
+ * 用 kbps 做单位: u32 可覆盖到 4.3Tbps, 用户态高频写一个整数即可, 无需浮点。
+ * defer 是"因整形而推迟出队"的次数 —— 它长期为 0 就说明整形根本没排到队 (速率设高了)。 */
+static int neoq_rate_show(struct seq_file *m, void *v)
+{
+    struct Qdisc *sch;
+    u64 sent = 0, defer = 0;
+
+    spin_lock_bh(&neoq_lock);
+    sch = neoq_active_qdisc;
+    if (sch) {
+        struct neoq_sched_data *q = qdisc_priv(sch);
+
+        sent = q->shaper_sent_bytes;
+        defer = q->shaper_defer_cnt;
+    }
+    spin_unlock_bh(&neoq_lock);
+
+    /* burst_us / limit_pkts 都读的是内核实际生效值 (已钳制过), 这样 F5 的钳制和 F1
+     * 的派生上界都能被 cat 出来看见, 不会出现"写进去的值和跑着的值不一样"的静默失效。 */
+    seq_printf(m, "rate_kbps=%u burst_us=%llu queue_ms=%u limit_pkts=%u sent_bytes=%llu defer=%llu\n"
+                  "usage: echo \"<rate_kbps> [burst_us] [queue_ms]\" > /proc/net/neoq_rate  (0 disables shaping)\n",
+               (u32)div64_u64(READ_ONCE(neoq_rate_bps), 1000),
+               READ_ONCE(neoq_burst_ns) / 1000,
+               READ_ONCE(neoq_queue_ms), READ_ONCE(neoq_limit_pkts),
+               sent, defer);
+    return 0;
+}
+static int neoq_rate_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, neoq_rate_show, NULL);
+}
+static ssize_t neoq_rate_write(struct file *file, const char __user *ubuf,
+                               size_t len, loff_t *ppos)
+{
+    char buf[64];
+    unsigned int kbps = 0, burst_us = 0, queue_ms = 0;
+    int got;
+    size_t n = min(len, sizeof(buf) - 1);
+
+    if (copy_from_user(buf, ubuf, n))
+        return -EFAULT;
+    buf[n] = '\0';
+    got = sscanf(buf, "%u %u %u", &kbps, &burst_us, &queue_ms);
+    if (got < 1)
+        return len;
+    /* 先设 burst / queue_ms 再设速率: 速率一旦生效 dequeue 就会用到 burst_ns, 而
+     * queue_ms 是 neoq_rate_set 里派生段数上界的输入, 必须先就位。
+     * F5: burst 上钳到 NEOQ_BURST_US_MAX —— 原来 %u 直接落盘, 4294967295 会把 burst
+     * 变成 4295 秒, 整形闸门静默失效 (推导见 NEOQ_BURST_US_MAX 处)。 */
+    if (got >= 2 && burst_us)
+        WRITE_ONCE(neoq_burst_ns,
+                   (u64)min_t(unsigned int, burst_us, NEOQ_BURST_US_MAX) *
+                   NSEC_PER_USEC);
+    if (got >= 3 && queue_ms)
+        WRITE_ONCE(neoq_queue_ms,
+                   clamp_t(unsigned int, queue_ms, 1U, NEOQ_QUEUE_MS_MAX));
+    neoq_rate_set(kbps);                /* kbps=0 = 关闭 */
+    return len;
+}
+static const struct proc_ops neoq_rate_proc_ops = {
+    .proc_open    = neoq_rate_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+    .proc_write   = neoq_rate_write,
+};
+static struct proc_dir_entry *neoq_rate_entry;
 
 /* === /proc/net/neoq_ml: 机器可读单行 key=value, 供 Go tuner 每隔数秒解析 ===
  * 与 neoq_stats_show 共用 neoq_lock。键名短且稳定 (即 CLI 的 API), 切勿随意改名。
@@ -2300,7 +2648,8 @@ static int neoq_ml_show(struct seq_file *m, void *v)
             "t1_pkts=0 t1_bytes=0 t1_drops=0 t1_marks=0 t1_avg_delay_us=0 t1_peak_delay_us=0 "
             "t2_pkts=0 t2_bytes=0 t2_drops=0 t2_marks=0 t2_avg_delay_us=0 t2_peak_delay_us=0 "
             "t3_pkts=0 t3_bytes=0 t3_drops=0 t3_marks=0 t3_avg_delay_us=0 t3_peak_delay_us=0 "
-            "retrans_seen=0 retrans_protected=0 retrans_demoted=0\n");
+            "retrans_seen=0 retrans_protected=0 retrans_demoted=0 "
+            "rate_kbps=0 backlog=0 shaper_sent=0 shaper_defer=0\n");
         return 0;
     }
 
@@ -2328,8 +2677,14 @@ static int neoq_ml_show(struct seq_file *m, void *v)
         tier->peak_delay_ml = 0;        /* read-on-reset: 清掉已上报的近期峰值 */
     }
 
-    seq_printf(m, " retrans_seen=%llu retrans_protected=%llu retrans_demoted=%llu\n",
-               q->retrans_seen, q->retrans_protected, q->retrans_demoted);
+    /* 新键追加在行尾: Go 侧解析器对未知键忽略, 老版本 tuner 前向兼容。
+     * backlog 用 sch->qstats.backlog (字节), 与 qlen(段数) 互补 —— 整形开启后
+     * 队列在本机成形, 这两个量才是判断"整形是否真的生效"的直接证据。 */
+    seq_printf(m, " retrans_seen=%llu retrans_protected=%llu retrans_demoted=%llu"
+                  " rate_kbps=%u backlog=%u shaper_sent=%llu shaper_defer=%llu\n",
+               q->retrans_seen, q->retrans_protected, q->retrans_demoted,
+               (u32)div64_u64(READ_ONCE(neoq_rate_bps), 1000),
+               sch->qstats.backlog, q->shaper_sent_bytes, q->shaper_defer_cnt);
 
     spin_unlock_bh(&neoq_lock);
     return 0;
@@ -2391,9 +2746,9 @@ static int __init neoq_module_init(void)
     if (neoq_prio_entry)
         pr_info("NeoQ: Priority ports config at /proc/net/neoq_prio\n");
 
-    neoq_boost_entry = proc_create("neoq_boost", 0644, init_net.proc_net, &neoq_boost_proc_ops);
-    if (neoq_boost_entry)
-        pr_info("NeoQ: Downstream rwnd boost at /proc/net/neoq_boost\n");
+    neoq_rate_entry = proc_create("neoq_rate", 0644, init_net.proc_net, &neoq_rate_proc_ops);
+    if (neoq_rate_entry)
+        pr_info("NeoQ: Virtual-clock shaper at /proc/net/neoq_rate\n");
 
     neoq_codel_entry = proc_create("neoq_codel", 0644, init_net.proc_net, &neoq_codel_proc_ops);
     if (neoq_codel_entry)
@@ -2420,8 +2775,8 @@ static void __exit neoq_module_exit(void)
         proc_remove(neoq_proc_entry);
     if (neoq_prio_entry)
         proc_remove(neoq_prio_entry);
-    if (neoq_boost_entry)
-        proc_remove(neoq_boost_entry);
+    if (neoq_rate_entry)
+        proc_remove(neoq_rate_entry);
     if (neoq_codel_entry)
         proc_remove(neoq_codel_entry);
     if (neoq_sparse_entry)

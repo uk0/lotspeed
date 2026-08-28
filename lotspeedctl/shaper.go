@@ -132,6 +132,13 @@ const (
 	// yield 不涨代价, YIELD<->SEEK 之间可以无限对撞。
 	watchdogRecoverMax = 24
 
+	// band 切换的确认拍数。pickBand 原本每拍无状态重选, 而 RTT 档边界 (如 far/
+	// intercontinental 的 250ms) 上的 minRtt 抖动会让选择每两拍翻一次: 实测
+	// minRtt 在 251-255ms 之间摆, 一条 socks=1 的 far 档反复夺走控制信号, 并在
+	// util=0.13 时靠它的 E 触发了 SEEK->HOLD 的 latch。候选档必须连续赢下这么多拍
+	// 才真正接管, 期间继续用旧档 (旧档还活着的话)。
+	bandConfirmCycles = 3
+
 	// regime 切换的确认拍数。一次 regime 切换的代价是 C_hat 清零 + 强制回 SEEK +
 	// 慢层冻结, 换路又是低频事件, 不能被单拍噪声触发 (原来就是单拍立即触发)。
 	regimeConfirmCycles = 3
@@ -150,6 +157,11 @@ const (
 
 	// 慢层 headroom 臂是以百分数存的整数 (tunable 是 int 的), 换算回小数用。
 	headroomPctScale = 100.0
+
+	// ackedSentSanityRatio: 确认字节 / 本网卡发出字节 的物理上界。acked 是净荷、
+	// sent 是线路字节, 正常方向恒是 acked < sent; 反过来超这个比例只可能是采样口径
+	// 错 (混进别的网卡, 或 socket churn 把 lifetime 值当成了增量), 不可能是噪声。
+	ackedSentSanityRatio = 1.5
 )
 
 // shaperSample 是一拍的全部原始观测。step() 只吃这个结构 —— 所有 I/O 都在
@@ -227,8 +239,11 @@ type shaper struct {
 	regimeMinRtt float64
 	peer         string
 	band         string
-	// pickedBand 是上一拍自动选中的 RTT 档 (仅用于日志去重, 不参与控制律)。
+	// pickedBand 是当前在用的 RTT 档; bandHiN 是候选档连续胜出的拍数 (迟滞)。
 	pickedBand string
+	bandHiN    int
+	// rc 判定一个 socket 的流量是否真的经过被整形的网卡 (见 routecache.go)。
+	rc *routeCache
 
 	// holdStable 是慢层闸门用的"连续稳定拍数": PROBE/trim/BACKOFF 都会把它清零,
 	// 因为那几拍速率在动, 慢层这时候步进就归因不了。
@@ -264,7 +279,7 @@ type shaper struct {
 //  3. 完全无流量 -> HOLD at R_max, 等 util 信号 (在 OBSERVE 结束时分流)
 func newShaper(iface, target string, rateMaxMbps float64) *shaper {
 	s := &shaper{
-		target: target,
+		target:        target,
 		iface:         iface,
 		state:         stShaperObserve,
 		headroom:      0.95,
@@ -277,6 +292,9 @@ func newShaper(iface, target string, rateMaxMbps float64) *shaper {
 		cacheStore:  modelShaperCacheSet,
 		lastTick:    time.Now(),
 	}
+	// 路由判定缓存: 控制信号只能来自真正经过 iface 的 socket, 否则 deficit 的
+	// 分子 (shaper_sent, 只含本网卡) 和分母 (acked) 是两批不相干的流量。
+	s.rc = newRouteCache(iface, s.logf)
 	s.rateMax = rateMaxMbps * 1e6
 	if s.rateMax <= 0 {
 		bps, known := ifaceLineRateBps(iface)
@@ -348,12 +366,22 @@ func (s *shaper) sampleStat() ssTargetStat {
 	if s.target != "" {
 		return ssTarget(s.target) // 显式指定一条链路时不做自动选档
 	}
-	st, band := pickBand(ssBands(ssMaxSocks))
-	if band != "" && band != s.pickedBand {
-		s.logf("band -> %s (minRtt=%.0fms E=%.0fms socks=%d) — 控制信号改取此档",
-			band, st.minRttP50Ms, st.queueDelayMs, st.socks)
-		s.pickedBand = band
+	bands := ssBands(s.rc, ssMaxSocks)
+	st, band := pickBand(bands)
+	if band == "" || band == s.pickedBand {
+		s.bandHiN = 0
+		return st
 	}
+	// 候选档与在用档不同: 先攒确认拍数, 期间继续用旧档 —— 只要旧档还有 socket。
+	// 旧档整个消失时立即切换 (没有可继续的选择, 攒拍数只会让控制器盲一段)。
+	s.bandHiN++
+	if old, ok := bands[s.pickedBand]; ok && old.socks > 0 && s.bandHiN < bandConfirmCycles {
+		return old
+	}
+	s.logf("band -> %s (minRtt=%.0fms E=%.0fms socks=%d) — 控制信号改取此档",
+		band, st.minRttP50Ms, st.queueDelayMs, st.socks)
+	s.pickedBand = band
+	s.bandHiN = 0
 	return st
 }
 
@@ -520,6 +548,17 @@ func (s *shaper) step(sm shaperSample) {
 	s.util = 0
 	if s.rate > 0 {
 		s.util = sentBits / (s.rate * dt)
+	}
+
+	// canary: 确认过的字节不可能显著多于本网卡发出的字节。超了就说明采样口径漏了
+	// —— acked 侧混进了不经本网卡的流量。实测踩过一次: 95% 的 acked 来自 docker
+	// bridge, 让控制器在 util=0.02 时锁存了 19.1 Mbps 的假容量。
+	// latchCHat 的可信度门只防 goodput 偏**低** (记账缺口), 这里补的是偏**高**的另一半。
+	// 1.5 的余量: acked 是净荷、sent 是线路字节, 正常方向是 acked < sent, 反过来超
+	// 50% 只可能是口径错, 不可能是测量噪声。
+	if sentBits > 0 && ackedBits > ackedSentSanityRatio*sentBits {
+		s.logf("acked (%.1f Mb) 远超本网卡 sent (%.1f Mb) — 采样口径漏了, "+
+			"检查 %s 的路由过滤", ackedBits/1e6, sentBits/1e6, s.iface)
 	}
 
 	// deficit = (Δsent_净荷 - Δacked)/Δsent_净荷, 3 拍 EMA。
@@ -1113,6 +1152,21 @@ func (s *shaper) tick() {
 			// deficit 用它扣头开销, 分子分母来自不同拍就没意义了。
 			if st.segs >= s.prevSegs {
 				sm.segsOut = st.segs - s.prevSegs
+			}
+			// ★ churn 的**上升**方向也要挡。下面那个 else 分支只处理求和下降 (socket
+			// 关闭), 但反方向同样会炸: 一条新 socket 进入采样集合时, 带进来的是它的
+			// **lifetime** bytes_acked, 会被整个计进本拍差分。实测一条跑了 95 秒的流
+			// 被首次纳入时, 单拍 acked 冲到 1253.6 Mb 而同拍本网卡只发了 103.8 Mb ——
+			// 12 倍。这一拍的 goodput/deficit 全是垃圾: goodput 虚高会让 latchCHat 锁存
+			// 假容量 (它的可信度门只防偏低), deficit 变负被 clamp 成 0 又让 BACKOFF
+			// 进不去。
+			//
+			// 判据复用 canary 的物理上界: 确认的字节不可能显著多于本网卡发出的字节。
+			// 越界就当本拍没有 link 信号, 只重新基线 —— 与下降方向的处理对称。
+			if sentB := float64(sm.sentBytes); sentB > 0 &&
+				float64(sm.ackedBytes) > ackedSentSanityRatio*sentB {
+				sm.haveLink = false
+				sm.ackedBytes, sm.segsOut = 0, 0
 			}
 		} else if sm.haveLink {
 			sm.haveLink = false

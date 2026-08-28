@@ -451,6 +451,9 @@ func ssTarget(target string) ssTargetStat {
 // ssRow 是一个 socket 的原始读数。拆出来是为了让"解析"和"聚合"分开: 同一次
 // ss 输出要被按 RTT 档分组后各自聚合 (见 ssBands), 一次解析多次聚合。
 type ssRow struct {
+	// dst 是对端 "addr:port", 用于判定这条 socket 的流量是否真的经过被整形的网卡
+	// (见 routecache.go)。ss 的地址行与统计行成对出现, 解析时由前者带给后者。
+	dst    string
 	minRtt float64
 	srtt   float64
 	retr   uint64
@@ -465,16 +468,29 @@ const ssMaxSocks = 1024
 
 func parseSSRows(out string, maxRows int) []ssRow {
 	var rows []ssRow
+	pendingDst := ""
 	for _, ln := range strings.Split(out, "\n") {
 		// A socket's stats line is the one carrying the rtt field; the address line
 		// (Local/Peer) has none. Use rtt presence to identify a real socket line.
 		if _, ok := ssField(ln, "rtt"); !ok {
+			// 地址行。`ss -tn state established` 在 state 已由过滤条件给定时**不打印
+			// State 列**, 所以布局是 [0]=Recv-Q [1]=Send-Q [2]=Local [3]=Peer ——
+			// 与 autoDetectPeer 取 f[3] 是同一个布局 (已在 green1 上核对过字段位置)。
+			// 表头行也会落到这里, 但它的 f[3]="Address:Port" 不含 "." 或 "[", 被下面
+			// 的形状检查挡掉; 即便漏过去, 紧随其后的真地址行也会把它覆盖。
+			if f := strings.Fields(ln); len(f) >= 4 &&
+				strings.Contains(f[3], ":") &&
+				(strings.Contains(f[3], ".") || strings.HasPrefix(f[3], "[")) {
+				pendingDst = f[3]
+			}
 			continue
 		}
 		if maxRows > 0 && len(rows) >= maxRows {
 			break
 		}
 		var r ssRow
+		r.dst = pendingDst
+		pendingDst = ""
 		if v, ok := ssFloatX(ln, "rtt"); ok && v > 0 { // srtt = X of rtt:X/Y
 			r.srtt = v
 		}
@@ -545,7 +561,7 @@ func parseSSTarget(out string) ssTargetStat {
 //
 // 注意不能按地址段分类: 实测有 127.0.0.1 的 socket minrtt 是 234ms —— 那是 xray
 // 的本地 socket 承载着洲际隧道流量。只有实测 RTT 能说明一个 socket 走的是哪条路。
-func ssBands(maxSocks int) map[string]ssTargetStat {
+func ssBands(rc *routeCache, maxSocks int) map[string]ssTargetStat {
 	out, err := exec.Command("ss", "-tin", "state", "established").Output()
 	if err != nil {
 		return nil
@@ -554,6 +570,12 @@ func ssBands(maxSocks int) map[string]ssTargetStat {
 	for _, r := range parseSSRows(string(out), maxSocks) {
 		if r.minRtt <= 0 {
 			continue // 没有 minrtt 就无法归档, 计入任何一档都是污染
+		}
+		// 只留真正经过被整形网卡的 socket。deficit 的分子 (shaper_sent) 只含这些
+		// 字节, 分母混进别的网卡就是拿两批不相干的流量做差 —— 实测那会让 95% 的
+		// acked 来自 docker bridge, 并已造成过一次错误的 C_hat 锁存。
+		if rc != nil && !rc.via(r.dst) {
+			continue
 		}
 		b := rttBand(r.minRtt)
 		byBand[b] = append(byBand[b], r)

@@ -1,5 +1,38 @@
 # Changelog
 
+## 2026-08-28 参数搜索退役 + 安装/管理面重做 {#2026-08-28-mechanism}
+
+### 为什么退掉 bandit
+
+优化器在一个 12 臂空间里搜 `loss_thresh`,实测 SNR 约 1/34 —— 要分辨相邻臂需要每臂约 4600 个样本,而 green1 一天只产出约 106 个学习拍。它不可能收敛,那些臂搜的是噪声。人工 A/B 已经定下来的几个参数(`startup_gain` / `hd_rho_max` / `fast_alpha` / `delay_cap_thresh` / `neoq_sparse_thresh` / `shaper_headroom`)冻结为常数,写入点收敛到 `applyFrozenConstants` 一处。`--legacy-bandit` 逐字恢复旧表。
+
+`loss_thresh` 拆成两件各自能做对的事:
+
+- **闭环只测量与报告**。`lossThreshFor(ambient, rtt)` 是冷启动与运行时共用的唯一实现;ambient 首选 qdisc 的 `ambient_share`(1s 滚动窗,只计 ≥128B 的包),退化时用 ss/snmp 差分。全部状态只在活跃拍推进。
+- **`lotspeedctl abtest` 负责裁决**。交替配对 A/B + 精确符号检验,是本工具里唯一能对参数下因果判断的路径。
+
+闭环默认**不写** sysctl。`ambient_share` 就是重传占比,而 `loss_thresh` 正是决定 CC 遇到丢包退不退避的旋钮:抬高它 → 少退避 → 重传占比上升 → 公式据此要求更高的值。回归量与误差项相关,参数在观测数据上不可识别。实测棘轮:真实 ambient 8%(正确答案 12)时,自致系数只要 ≥0.2pp/单位就会越过正确答案,≥0.5pp 直接钉死在上限。打破它需要外生变异,那正是 `abtest` 的交替提供的。`--auto-loss-thresh` 供不适用此推理的链路使用。
+
+### 安装与管理面
+
+- `install.sh` 1692 → 644 行。停止发 `rmmod -f`,改成六步卸载:切 CC → `tc` 摘 qdisc → 停服务 → 等 refcount → rmmod → 校验。失败时打印真实 refcount 与持有者提示,而不是强拆。
+- 管理脚本从 942 行内联堆砌降成 100 行的 `lotspeedctl` 薄别名。
+- systemd unit 改成模板 `lotspeedctl@%i.service`。旧 unit 把网卡写死成 `eth0`,而目标机器叫 `ens3` —— 后果不是启动失败,是 `Restart=always` 下每 3 秒重启一次、加速从未生效。
+- 新增 `dkms.conf`、`INSTALL.md`。
+
+### 本轮修掉的接线缺陷
+
+- `measure()` 从未把 `ambient_share` 搬进 metrics,闭环一直跑在 ss/snmp 兜底上,日志却打印 `src=ambient_share`。
+- `abtest` 在 `main.go` 的 dispatch 里没有 case —— 809 行实现加 17 个单测全绿,因为测试直接调 `cmdABTest`,绕过了 dispatch。`wiring_test.go` 现在断言每个 `cmdXxx` 都有调用点。
+- `applyFrozenConstants` 无条件把 `loss_thresh` 播成 4,等于每次启动都断言链路干净;配合 `Restart=always`,任何一次崩溃都把 18% ambient 的链路打回 bbr 等效行为。改为读运行值。
+- `preset intercontinental` 写 30、`tuneForLoss` 写 50,都高于本仓库自己测出重传风暴的阈值。
+
+### 部署验证 (green1, 6.19.3, ens3)
+
+一次 134 秒窗口完成换装。`lotspeed` `A211B185` → `DA4CA374`,`sch_neoq` `566CB0B1` → `946CCDF0`。refcount 归零耗时 99s(容器 netns 与 socket-activated `ssh.socket` 是主要持有者)。换装后 nginx HTTP 200 / 1.2ms,3 个容器正常,`lotspeedctl@ens3` `NRestarts=0`,无内核告警。`ambient_share=20` 与此前实测的 18-20% 一致。回滚点 `/opt/lotspeed-p0`(`E2A637C8`)保留。
+
+117 个用例通过。
+
 ## adaptive-accel (2026-06)
 
 行为化调度 + 学习闭环分支。全部特性在真实洲际链路（美东 colo → 国内，RTT 13↔264ms 漂移、丢包 2-10%）上完成 A/B 验证，对照为同内核 BBR v3。

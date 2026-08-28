@@ -108,6 +108,30 @@ func (rc *routeCache) via(dst string) bool {
 	return ent.dev == rc.iface
 }
 
+// devOf 返回 dst 的出接口名 (走缓存)。诊断用 —— 它只打标不判定, 与 via() 的
+// fail-open 语义分开: via() 查不到时返回 true (include), devOf 查不到时返回
+// "unknown", 让分析端自己决定怎么处理。
+func (rc *routeCache) devOf(dst string) string {
+	ip := hostOf(dst)
+	if ip == "" {
+		return "unknown"
+	}
+	rc.mu.Lock()
+	ent, ok := rc.m[ip]
+	fresh := ok && time.Since(ent.at) < routeCacheTTL
+	rc.mu.Unlock()
+	if !fresh {
+		ent = routeEnt{dev: rc.lookup(ip), at: time.Now()}
+		rc.mu.Lock()
+		rc.m[ip] = ent
+		rc.mu.Unlock()
+	}
+	if ent.dev == "" {
+		return "unknown"
+	}
+	return ent.dev
+}
+
 // routeDev 问内核: 去 ip 的包从哪张网卡出去。
 // `ip route get 1.2.3.4` -> "1.2.3.4 via 10.0.0.1 dev ens3 src ... uid 0"
 func routeDev(ip string) string {

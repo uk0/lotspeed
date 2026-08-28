@@ -91,6 +91,8 @@ func main() {
 		err = cmdTune(os.Args[2:])
 	case "hist-clear":
 		err = cmdHistClear(os.Args[2:])
+	case "bandmap":
+		err = cmdBandmap(os.Args[2:])
 	case "model":
 		err = cmdModel(os.Args[2:])
 	case "help", "-h", "--help":
@@ -132,6 +134,9 @@ Usage:
   lotspeedctl probe <ip> [port]      measure RTT/BW/loss (MAD-filtered, multi-sample)
   lotspeedctl tune <ip> [port]       probe -> model.predict -> apply sysctls + hist_clear
   lotspeedctl hist-clear             flush poisoned per-IP hist cache
+  lotspeedctl bandmap --iface eth0 [--out F] [--period N]
+                                     P0 取证: 每 N 秒把全量 socket (含 lo/docker) 连
+                                     同出接口/RTT档/累计计数写成 JSONL, 只读不改行为
   lotspeedctl model [show|clear]     inspect KNN sample store (~/.lotspeedctl/model.json)
 `)
 }

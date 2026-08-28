@@ -550,6 +550,17 @@ func parseSSTarget(out string) ssTargetStat {
 	return aggregateRows(parseSSRows(out, 0))
 }
 
+// ssRowsAll 返回全机 established socket 的原始行, **不做任何过滤**。只给诊断用
+// (bandmap): 控制信号必须过滤, 但取证不能 —— lo 和 docker bridge 的行正是判断
+// "内层隧道 socket 能否代表外层路径"所需要的证据。
+func ssRowsAll(maxSocks int) []ssRow {
+	out, err := exec.Command("ss", "-tin", "state", "established").Output()
+	if err != nil {
+		return nil
+	}
+	return parseSSRows(string(out), maxSocks)
+}
+
 // ssBands 把全机 established socket 按 RTT 档分组, 每组各自聚合。
 //
 // 为什么必须分组再聚合, 而不是在全机总体上取某个统计量: 这台机器同一时刻并存

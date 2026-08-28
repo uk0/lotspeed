@@ -14,6 +14,7 @@ func knnSample(rttMs, score float64, lossThresh int) sample {
 		Feature: linkFeature{RttMs: rttMs, BwMbps: 100},
 		Params:  paramSet{"startup_gain": 400, "loss_thresh": lossThresh, "hd_rho_max": 400},
 		Score:   score,
+		TS:      modelEpochTS, // 本纪元的样本, 才会被 predict 的纪元门放行
 	}
 }
 

@@ -42,6 +42,25 @@ type sample struct {
 	JitterMs float64 `json:"jitter_ms,omitempty"`
 }
 
+// modelEpochTS 是"可信样本"的起始时刻 (Unix 秒 = 2026-08-28T09:00:00Z)。早于它的
+// 样本一律不参与 KNN 平均 (predict) 和 UCB 回放 (loadFromSamples)。
+//
+// ★ 为什么需要它: 在这个时刻之前, score() 的参照系会在没有流量的拍里被一路衰减到
+// 近零 (见 optimizer.go 的 advanceRefs), 流量一恢复 peakBw 就被 ratchet 拉平到当前
+// bw, 于是 bw/peakBw 恰好 = 1.0 —— model.json 里那批 1.0 / 0.99 / 0.94 的"高分"就是
+// 这么来的。修掉根因不会让存量样本消失, 它们会继续喂 KNN 的参数平均和 UCB 的臂均值。
+//
+// ★ 为什么不用 `model clear`: 那是 os.Remove(modelPath()), 会连 ShaperCache 一起炸
+// 掉 —— shaper 学到的三条链路容量是跨重启复用的真实成果, 与这个 bug 无关。按时间戳
+// 过滤是非破坏的: 旧样本留在文件里, `model show` 的原始清单照常列出它们供分析
+// (那条命令底部的 UCB 回放会跟着一起过滤, 这正是想要的 —— 它反映的就是优化器当下
+// 真正在用的学习状态)。
+//
+// ★ 取值取在修复落地的时刻而不是当天零点: 这个常量只能早于部署、不能晚于部署,
+// 否则会把修复后录的好样本一并丢掉、模型空转到时钟追上为止。代价是部署前几分钟的
+// 坏样本可能残留, 它们会随 500 条 FIFO 自然淘汰。
+const modelEpochTS int64 = 1787907600
+
 // shaperCacheEntry 是一条 (对端|RTT 档) 的容量缓存。Kbps 存的是 C_hat (物理量:
 // 这条路能跑多快), 不是 R (当前 headroom 策略下的投影) —— 换了 headroom 策略,
 // 缓存仍然有效。TS 用来判过期 (shaperCacheMaxAge)。
@@ -161,6 +180,10 @@ func (m *model) predict(f linkFeature) paramSet {
 	// UCB history; they're excluded from the planner average only.
 	rs := make([]ranked, 0, len(m.Samples))
 	for _, s := range m.Samples {
+		// 参照系腐蚀纪元之前录的分数不可比 (见 modelEpochTS), 不进 KNN 平均。
+		if s.TS < modelEpochTS {
+			continue
+		}
 		if s.Score <= 0 {
 			continue
 		}
@@ -337,8 +360,12 @@ func cmdModel(args []string) error {
 				{"neoq_boost", "/proc/net/neoq_boost", 100, 400, 25, 0},
 			}
 			ucb := newUCB(tuns, 0)
-			ucb.loadFromSamples(m.Samples)
-			fmt.Println("UCB best arm per parameter (replayed from all samples):")
+			replayed := ucb.loadFromSamples(m.Samples)
+			// 标题必须说清回放了多少条: loadFromSamples 会跳过 pre-epoch 样本, 而
+			// "replayed from all samples" 的旧标题会让一片空臂看起来像 bandit 坏了,
+			// 实际只是存量样本全在纪元前。
+			fmt.Printf("UCB best arm per parameter (replayed %d/%d samples, %d pre-epoch):\n",
+				replayed, len(m.Samples), len(m.Samples)-replayed)
 			for _, line := range ucb.debug() {
 				fmt.Printf("  %s\n", line)
 			}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -281,5 +282,198 @@ func TestIsBadLink(t *testing.T) {
 		if got := isBadLink(c.rtt, c.minRtt); got != c.want {
 			t.Errorf("isBadLink(%.0f, %.0f)=%v want %v", c.rtt, c.minRtt, got, c.want)
 		}
+	}
+}
+
+// ① 参照系 (peakBw/minRtt) 不得在没有流量的拍里腐蚀。
+//
+// 复现的就是生产上那条日志: score() 的参照系推进原来在主循环里排在 idle 门之前,
+// 于是空转的拍也照样把 peakBw 乘 0.995。green1 一天 3218 个 idle 拍, 0.995^3218 ≈
+// 1e-7 —— peakBw 被衰减到近零, 流量一恢复 ratchet 就把它拉平到当前 bw, bw/peakBw
+// 恰好 = 1.0, 一个 bw=8M 的拍拿到满分并被记进 model.json / 锁进 bestScore。
+//
+// 序列: 活跃 bw=30 x10 -> idle x500 -> 活跃 bw=8 x5。
+func TestRefsFrozenAcrossIdleGap(t *testing.T) {
+	o := &optimizer{alpha: 0.5, beta: 1.0}
+
+	act := metrics{bwMbps: 30, rttMs: 100}
+	for i := 0; i < 10; i++ {
+		if _, active := o.observe(act); !active {
+			t.Fatalf("cycle %d: bw=30M 必须判为活跃拍", i)
+		}
+	}
+	peakAfterActive, minRttAfterActive := o.peakBw, o.minRtt
+	if peakAfterActive <= 28 || peakAfterActive > 30 {
+		t.Fatalf("活跃期后 peakBw=%.3f, 期望 ~30 (只被 ratchet 后的常规衰减磨掉一点)", peakAfterActive)
+	}
+	// 这个序列必须真的能复现旧 bug, 否则测试是空的: 旧行为下 500 个 idle 拍把
+	// peakBw 衰减到 30*0.995^500 ≈ 2.45, 低于随后的 bw=8 —— ratchet 会把它拉平到
+	// 8, score 恰好 = 1.0。
+	if decayed := peakAfterActive * math.Pow(0.995, 500); decayed >= 8 {
+		t.Fatalf("序列失效: 按旧行为衰减 500 拍后 peakBw 仍有 %.3f >= 8M, 复现不了伪满分", decayed)
+	}
+
+	idle := metrics{bwMbps: 0.4, rttMs: 30} // < idleBwFloorMbps
+	for i := 0; i < 500; i++ {
+		sc, active := o.observe(idle)
+		if active {
+			t.Fatalf("idle cycle %d: bw=0.4M 不该判为活跃拍", i)
+		}
+		if sc > 0.5 {
+			t.Fatalf("idle cycle %d: score=%.3f —— 空转的拍不该拿高分", i, sc)
+		}
+	}
+	// 冻结语义: 参照系一位都不许动 (陈旧但诚实), 而不是被衰减/被 idle 的低 RTT
+	// 拉低。minRtt 尤其重要 —— idle 时 rtt=30ms 是"没排队"而不是"路变短了"。
+	if o.peakBw != peakAfterActive {
+		t.Errorf("500 拍 idle 把 peakBw 从 %.6f 改成了 %.6f (参照系在 idle 中腐蚀)", peakAfterActive, o.peakBw)
+	}
+	if o.minRtt != minRttAfterActive {
+		t.Errorf("500 拍 idle 把 minRtt 从 %.6f 改成了 %.6f", minRttAfterActive, o.minRtt)
+	}
+
+	// 恢复流量, 但只有 8M: 分数必须诚实地反映 8/30 这个比例, 而不是伪满分。
+	back := metrics{bwMbps: 8, rttMs: 100}
+	sc, active := o.observe(back)
+	if !active {
+		t.Fatal("bw=8M 必须判为活跃拍")
+	}
+	want := 8.0 / (peakAfterActive * 0.995) // 这一拍照常衰减一次, 无延迟/丢包惩罚
+	if !almost(sc, want) {
+		t.Errorf("恢复后首拍 score=%.6f want %.6f (= 8 / 冻结的 peakBw)", sc, want)
+	}
+	if sc > 0.5 {
+		t.Errorf("恢复后首拍 score=%.3f —— 伪满分回来了 (期望 ~%.3f)", sc, want)
+	}
+	// 最关键的一条, 直接盯住机制本身: bw/peakBw 不得因为参照系被拉平到当前 bw 而
+	// 逼近 1.0 —— 生产日志里那行 "EXPLORE bw=0 ... score=1.000" 就是这个比值。
+	// (单看最终 score 会被同样腐蚀的 minRtt 带来的延迟惩罚掩盖掉。)
+	if ratio := back.bwMbps / o.peakBw; ratio > 0.5 {
+		t.Errorf("bw/peakBw=%.3f —— 参照系被拉平到当前 bw 了, 这就是伪满分的来源", ratio)
+	}
+	for i := 0; i < 4; i++ {
+		o.observe(back)
+	}
+	if o.peakBw < 25 {
+		t.Errorf("peakBw=%.3f —— 被拉平到 8M 这个时代了, ratchet 只该对真的新峰上调", o.peakBw)
+	}
+}
+
+// ② EXPLORE 的计时和相位判定同样只认活跃拍: 否则 idle 中重启服务, 空转 3 拍就转
+// OPTIMIZE, 并把那一拍的伪满分锁成 bestScore (之后所有真实分数都比不过它)。
+func TestExploreStepIgnoresIdleBeats(t *testing.T) {
+	o := &optimizer{alpha: 0.5, beta: 1.0, phase: "EXPLORE", bestScore: -1e9}
+
+	idle := metrics{bwMbps: 0.4, rttMs: 30}
+	for i := 0; i < 20; i++ {
+		sc, active := o.observe(idle)
+		if o.exploreStep(idle, sc, active) {
+			t.Fatalf("第 %d 个 idle 拍转进了 OPTIMIZE (bestScore=%.3f)", i, o.bestScore)
+		}
+	}
+	if o.exploreT != 0 {
+		t.Errorf("exploreT=%d —— idle 拍不该计时", o.exploreT)
+	}
+	if o.phase != "EXPLORE" {
+		t.Errorf("phase=%s —— 20 个 idle 拍之后仍应停在 EXPLORE", o.phase)
+	}
+	if o.bestScore != -1e9 {
+		t.Errorf("bestScore=%.6f —— 被 idle 拍写进去了", o.bestScore)
+	}
+
+	// 真流量来了: 计时照常, 第 3 拍达标转 OPTIMIZE, bestScore 取的是那一拍的真分数。
+	act := metrics{bwMbps: 30, rttMs: 100}
+	moved, movedAt, movedScore := false, 0, 0.0
+	for i := 1; i <= 3; i++ {
+		sc, active := o.observe(act)
+		if o.exploreStep(act, sc, active) {
+			moved, movedAt, movedScore = true, i, sc
+			break
+		}
+	}
+	if !moved || movedAt != 3 {
+		t.Fatalf("活跃拍未在第 3 拍转 OPTIMIZE (moved=%v at=%d phase=%s exploreT=%d)", moved, movedAt, o.phase, o.exploreT)
+	}
+	if o.phase != "OPTIMIZE" || o.exploreT != 3 {
+		t.Errorf("phase=%s exploreT=%d want OPTIMIZE/3", o.phase, o.exploreT)
+	}
+	if !almost(o.bestScore, movedScore) {
+		t.Errorf("bestScore=%.6f want %.6f (转相位那一拍的分数)", o.bestScore, movedScore)
+	}
+}
+
+// ③ idle 拍必须像 badLink / SHAPER-BUSY 那两条 continue 一样丢掉挂起的探测, 否则
+// 探测落下后隔了一段 idle 断档, 下一个活跃拍的 delta = smScore(现在) - prevScore
+// (断档之前), 一个横跨两个 regime 的差值会被记到那个参数头上。
+func TestIdleHoldDropsOutstandingProbe(t *testing.T) {
+	o := &optimizer{alpha: 0.5, beta: 1.0}
+	o.probedTi, o.probedVal, o.prevScore, o.havePrev, o.pendingSign = 1, 300, 0.92, true, 1
+
+	if !o.idleHold(false) {
+		t.Fatal("idle 拍必须 hold 住这一拍")
+	}
+	if o.havePrev {
+		t.Error("idle 分支没有丢掉挂起的探测 (havePrev 仍为 true) —— 下一个活跃拍会跨断档记账")
+	}
+	if o.pendingSign != 0 {
+		t.Errorf("pendingSign=%d —— 断档前的那一票必须作废", o.pendingSign)
+	}
+
+	// 反向: 活跃拍必须原样放行, 一位都不许清 —— 否则每拍都重新取基线,
+	// delta-credit 永远拿不到信号。
+	o.havePrev, o.pendingSign = true, -1
+	if o.idleHold(true) {
+		t.Fatal("活跃拍不该被 hold")
+	}
+	if !o.havePrev || o.pendingSign != -1 {
+		t.Errorf("活跃拍被误清了探测记账: havePrev=%v pendingSign=%d", o.havePrev, o.pendingSign)
+	}
+}
+
+// EXPLORE 必须有墙钟兜底: 只认活跃拍的话, 一台从不跑到 idleBwFloorMbps 的机器会
+// 永远停在 EXPLORE —— 保持一次性激进基线、从不调参, 且日志上看不出异常。
+// green1 正是这种机器(6.5 小时里只有 7.6% 的拍有实质流量)。
+func TestExploreWallClockEscapesIdleOnlyLink(t *testing.T) {
+	o := &optimizer{phase: "EXPLORE", alpha: 0.5, beta: 1.0}
+	idle := metrics{bwMbps: 0.3, rttMs: 180, lossPct: 0}
+	for i := 0; i < exploreWallMax-1; i++ {
+		sc, active := o.observe(idle)
+		if o.exploreStep(idle, sc, active) {
+			t.Fatalf("第 %d 拍就转出了 EXPLORE, 墙钟上限是 %d", i+1, exploreWallMax)
+		}
+		if o.phase != "EXPLORE" {
+			t.Fatalf("第 %d 拍相位已变成 %s", i+1, o.phase)
+		}
+	}
+	sc, active := o.observe(idle)
+	if !o.exploreStep(idle, sc, active) {
+		t.Fatalf("第 %d 拍(墙钟上限)仍未转出 EXPLORE — idle 链路会被永久困住", exploreWallMax)
+	}
+	if o.phase != "OPTIMIZE" {
+		t.Errorf("phase=%s want OPTIMIZE", o.phase)
+	}
+	// 关键: 墙钟转出时不得用 idle 拍的伪分数锁 bestScore —— 那正是要防的事。
+	if o.bestScore != 0 {
+		t.Errorf("bestScore=%.3f want 0 — 墙钟转出不该采信 idle 拍的分数", o.bestScore)
+	}
+}
+
+// 有真实流量时仍按原路径快速转出(3-6 拍), 墙钟不该延后它。
+func TestExploreStillExitsFastWithTraffic(t *testing.T) {
+	o := &optimizer{phase: "EXPLORE", alpha: 0.5, beta: 1.0}
+	m := metrics{bwMbps: 40, rttMs: 180, lossPct: 0}
+	n := 0
+	for i := 0; i < 10; i++ {
+		n++
+		sc, active := o.observe(m)
+		if o.exploreStep(m, sc, active) {
+			break
+		}
+	}
+	if n > 6 {
+		t.Errorf("有流量时用了 %d 拍才转出, 应 <=6", n)
+	}
+	if o.phase != "OPTIMIZE" || o.bestScore == 0 {
+		t.Errorf("phase=%s bestScore=%.3f — 有流量转出时应采信该拍分数", o.phase, o.bestScore)
 	}
 }

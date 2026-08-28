@@ -164,8 +164,16 @@ func (s *ucbSelector) bestArm(name string) (int, bool) {
 //   - Legacy samples predate those fields (ChangedParam==""): fall back to the
 //     old behavior — credit every param in the set with the sample's absolute
 //     Score. They stay loadable; their credit is just coarser.
-func (s *ucbSelector) loadFromSamples(samples []sample) {
+//
+// 返回实际回放的条数 (纪元过滤之后它可能远小于 len(samples))。
+func (s *ucbSelector) loadFromSamples(samples []sample) int {
+	n := 0
 	for _, smp := range samples {
+		// 参照系腐蚀纪元之前录的分数/delta 不可比 (见 modelEpochTS), 不回放。
+		if smp.TS < modelEpochTS {
+			continue
+		}
+		n++
 		if smp.ChangedParam != "" {
 			if v, ok := smp.Params[smp.ChangedParam]; ok {
 				s.update(smp.ChangedParam, v, smp.Delta)
@@ -176,6 +184,7 @@ func (s *ucbSelector) loadFromSamples(samples []sample) {
 			s.update(name, v, smp.Score)
 		}
 	}
+	return n
 }
 
 // effectSize returns (max arm mean - min arm mean, total raw pulls) over the

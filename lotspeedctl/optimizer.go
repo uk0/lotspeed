@@ -52,6 +52,8 @@ type optimizer struct {
 	bestScore   float64
 	phase       string
 	exploreT    int
+	// exploreWall 是 EXPLORE 的墙钟计数 (含 idle 拍), 与只数活跃拍的 exploreT 分开。
+	exploreWall int
 	prevBytes   uint64
 	prevOut     uint64
 	prevRetr    uint64
@@ -168,6 +170,23 @@ const (
 	// shaper is running. CV is clamped to [0,1] — an unbounded CV (a rate that
 	// swings 10x) would otherwise dominate every other term in the score.
 	rateCVDelta = 0.1
+	// idleBwFloorMbps 是"这一拍有没有真流量"的判据 (Mbps)。三处必须共用同一个阈值:
+	// 主循环的 idle 门 (低于它 score 是纯噪声, hold 住参数不动)、参照系推进
+	// (advanceRefs) 和 EXPLORE 计时。原来只有 idle 门用它, 于是出现了"idle 门认为
+	// 没流量、参照系却照样在腐蚀"的错位 —— 见 advanceRefs 的注释。
+	idleBwFloorMbps = 5.0
+
+	// exploreWallMax: EXPLORE 相位的墙钟上限 (拍)。不管有没有流量, 到点必须转入
+	// OPTIMIZE, 否则无流量的机器永远出不去 (见 exploreStep)。60 拍 @5s = 5 分钟,
+	// 远大于有流量时的正常退出 (3-6 拍), 只在病态情形兜底。
+	exploreWallMax = 60
+	// delayPenaltyCap / lossPenaltyCap 给 score() 的两个惩罚项封顶。两项原来都没有
+	// 上界: 一个 rtt≈3x min 的天气拍单独就能扣掉 1.0 以上, score 因此没有已知下界,
+	// 而 bestKnown / STABILIZE 恰恰是在跨时间比较这些 score。封顶位置取在"再坏也
+	// 区分不出更坏"的地方: 延迟项 2.0 正好是 badLink 的门槛 (rtt/minRtt-1 > 2 的那
+	// 一拍本来就整拍跳过归因), 丢包项 0.3 已远超这条路 ~10% 的常态丢包。
+	delayPenaltyCap = 2.0
+	lossPenaltyCap  = 0.3
 	// shaperHeadroomParam is the one tunable that does NOT land in a proc file:
 	// it steers the fast loop's headroom in-process (see apply()). Stored as a
 	// percent int because tunable is int-based; 95 => R = 0.95*C_hat.
@@ -733,16 +752,22 @@ func (o *optimizer) measure() metrics {
 	return m
 }
 
-// score = bw/peakBw - alpha*max(0, rtt/minRtt-1) - beta*loss
+// advanceRefs 推进 score() 的两个参照系 (peakBw 的 ratchet+衰减、minRtt 的
+// ratchet+上漂)。调用方必须只在"活跃拍"(bwMbps >= idleBwFloorMbps) 调它。
 //
-//	[ - gamma*clamp(t0_peak_delay_us/expressDelayBudgetUs, 0, 2.0) ]
+// ★ 原来错在哪: 这两段长在 score() 里, 而 score() 在主循环中的位置早于 idle 门,
+// 于是完全没有流量的拍也照样把 peakBw 乘 0.995、把 minRtt 乘 1.0005。green1 实测
+// 一天有 3218 个 idle 拍, 0.995^3218 ≈ 1e-7 —— peakBw 被衰减到近零。流量一恢复,
+// `bw > peakBw` 必然成立, peakBw 被 ratchet 拉平到当前 bw, 于是 bw/peakBw 恰好
+// = 1.0: 一个 bw=0.4M 的拍拿到伪满分, 被记进 model.json 污染 KNN/UCB 的样本池,
+// 还会被 EXPLORE 分支锁成 bestScore。生产日志的直接证据:
 //
-// The bracketed Express-delay (experience) term is added ONLY when the NeoQ stats
-// are available (nqOK) AND there was meaningful Express traffic this cycle
-// (t0DeltaPkts > expressActivityFloorPkts). Without those — i.e. on a box with no
-// new qdisc, or an idle Express tier — the score is EXACTLY the legacy formula, so
-// gamma=0 (or stats-off) reproduces the prior behavior bit-for-bit.
-func (o *optimizer) score(m metrics) float64 {
+//	08:49:22 EXPLORE bw=0 rtt=32.9 loss=0.00% score=1.000
+//	08:49:32 -> OPTIMIZE (peakBw=0Mbps minRtt=3.8ms)
+//
+// 冻结才是对的语义: idle 之后第一个活跃拍拿到"上一个活跃时代"的 peakBw —— 陈旧
+// 但诚实, 而 ratchet 对真的新峰照常上调。
+func (o *optimizer) advanceRefs(m metrics) {
 	// C3: decaying reference. peakBw ratchets up on a new peak but decays
 	// slowly otherwise, so a one-time lucky EXPLORE burst doesn't permanently
 	// deflate every later score and make recorded samples incomparable over time.
@@ -756,16 +781,45 @@ func (o *optimizer) score(m metrics) float64 {
 	} else if o.minRtt > 0 {
 		o.minRtt *= 1.0005 // let the RTT floor drift up so the delay penalty isn't pinned on forever
 	}
+}
+
+// observe 是主循环每拍对参照系做的全部动作: 先判"这一拍算不算活跃"(有没有真流量),
+// 只有活跃才推进参照系, 然后打分。返回的 active 同时被 EXPLORE 计时 (exploreStep)
+// 和 idle 门 (idleHold) 复用 —— 这三处必须是同一个判据, 各写各的正是本轮 bug 的成因。
+func (o *optimizer) observe(m metrics) (sc float64, active bool) {
+	active = m.bwMbps >= idleBwFloorMbps
+	if active {
+		o.advanceRefs(m)
+	}
+	return o.score(m), active
+}
+
+// score = bw/peakBw - alpha*clamp(rtt/minRtt-1, 0, delayPenaltyCap) - beta*clamp(loss, 0, lossPenaltyCap)
+//
+//	[ - gamma*clamp(t0_peak_delay_us/expressDelayBudgetUs, 0, 2.0) ]
+//
+// The bracketed Express-delay (experience) term is added ONLY when the NeoQ stats
+// are available (nqOK) AND there was meaningful Express traffic this cycle
+// (t0DeltaPkts > expressActivityFloorPkts). Without those — i.e. on a box with no
+// new qdisc, or an idle Express tier — the score is EXACTLY the legacy formula, so
+// gamma=0 (or stats-off) reproduces the prior behavior bit-for-bit.
+//
+// score() 本身是纯函数: 参照系 (peakBw/minRtt) 由 advanceRefs 单独推进, 且只在活跃
+// 拍推进 —— 见那里的注释。
+func (o *optimizer) score(m metrics) float64 {
 	if o.peakBw <= 0 {
 		return 0
 	}
 	s := m.bwMbps / o.peakBw
+	// 延迟项和丢包项都封顶 (delayPenaltyCap / lossPenaltyCap): 原来两项都无上界,
+	// 单个天气拍就能产出 < -1 的 score, 而 bestKnown/STABILIZE 是跨时间比较 score
+	// 的 —— 一个没有下界的量做不了这种比较。封顶后 s 的下界是确定的。
 	if o.minRtt > 0 && m.rttMs > 0 {
 		if r := m.rttMs/o.minRtt - 1; r > 0 {
-			s -= o.alpha * r
+			s -= o.alpha * clampF(r, 0, delayPenaltyCap)
 		}
 	}
-	s -= o.beta * m.lossPct
+	s -= o.beta * clampF(m.lossPct, 0, lossPenaltyCap)
 	// Experience term: penalize Express (interactive/ACK/retransmit) queuing delay.
 	// Gated on stats availability + real Express activity so it never fires on a box
 	// without the new qdisc or on an idle tier (where a stray peak is just noise).
@@ -796,6 +850,57 @@ func (o *optimizer) score(m metrics) float64 {
 		s -= rateCVDelta * clampF(cv, 0, 1)
 	}
 	return s
+}
+
+// exploreStep 推进 EXPLORE 相位, 返回是否转入了 OPTIMIZE。
+//
+// ★ 原来错在哪: exploreT 每拍无条件 ++, 且转相位的判据 bw >= peakBw*0.95 在 bw 和
+// peakBw 都被 idle 压到近零时恒真 —— idle 中重启一次服务, 空转 3 拍 (15s) 就转
+// OPTIMIZE, 紧接着的 `o.bestScore = sc` 把那一拍的伪满分 (见 advanceRefs) 锁成
+// bestScore。之后所有正常 score 都比不过它, coordinate ascent 会持续判定"变差"而
+// 回退。计时和相位判定因此都只认活跃拍。
+func (o *optimizer) exploreStep(m metrics, sc float64, active bool) bool {
+	// 墙钟兜底必须在活跃门**之前**: 只认活跃拍的话, 一台从不跑到 idleBwFloorMbps
+	// 的机器会**永远停在 EXPLORE** —— 保持那套一次性激进基线、从不调参, 而且日志上
+	// 完全看不出异常。green1 正是这种机器 (6.5 小时里只有 7.6% 的拍有实质流量)。
+	// 旧代码 6 拍必转是靠 idle 拍也计数换来的, 拆掉活跃门时把这个性质一起弄丢了。
+	//
+	// 兜底转出去是安全的: OPTIMIZE 相位在 idle 拍照样被 idle 门挡住, 什么都不做。
+	// 真正要防的只是"用 idle 拍的伪满分锁 bestScore", 所以 bestScore 仅在活跃拍采信。
+	o.exploreWall++
+	if o.exploreWall >= exploreWallMax && o.phase == "EXPLORE" {
+		o.phase = "OPTIMIZE"
+		if active {
+			o.bestScore = sc
+		}
+		return true
+	}
+	if !active {
+		return false
+	}
+	o.exploreT++
+	if (m.bwMbps >= o.peakBw*0.95 && o.exploreT >= 3) || o.exploreT >= 6 {
+		o.phase = "OPTIMIZE"
+		o.bestScore = sc
+		return true
+	}
+	return false
+}
+
+// idleHold 是慢层的 no-traffic guard: 流量太少时 score 是纯噪声, 拿它 steering 只会
+// thrash 参数, 这一拍必须 hold 住。返回 true 表示"这一拍到此为止"。
+//
+// ★ 原来错在哪: 这个门直接 continue, 不像 badLink / SHAPER-BUSY 那两条 continue 那样
+// 丢掉挂起的探测。后果: 探测在第 N 拍落下, 中间 idle 三小时, 流量恢复后
+// delta = smScore(现在) - prevScore(三小时前), 一个横跨两个 regime 的差值被记到那个
+// 参数头上。活跃拍必须原样放行, 否则 delta-credit 永远拿不到基线。
+func (o *optimizer) idleHold(active bool) bool {
+	if active {
+		return false
+	}
+	o.havePrev = false
+	o.pendingSign = 0
+	return true
 }
 
 func (o *optimizer) apply(t *tunable) {
@@ -1033,8 +1138,11 @@ func cmdOptimize(args []string) error {
 	// is unused in coord mode (we only read arm means/effect-size, never suggest()).
 	ucb := newUCB(o.tun, math.Sqrt(2))
 	prior := loadModel()
-	ucb.loadFromSamples(prior.Samples)
-	fmt.Printf("UCB initialized from %d prior samples\n", len(prior.Samples))
+	// replayed < len(Samples) 时差额是被纪元门隔离掉的存量伪高分样本 (见
+	// modelEpochTS) —— 报总数会骗人, 所以两个数都打出来。
+	replayed := ucb.loadFromSamples(prior.Samples)
+	fmt.Printf("UCB initialized from %d/%d prior samples (%d quarantined as pre-epoch)\n",
+		replayed, len(prior.Samples), len(prior.Samples)-replayed)
 	// EXPLORE: aggressive grab to discover peak (up+down) throughput.
 	// Aggressive intercontinental baseline (non-tunable knobs set once): remove the
 	// cwnd ceiling, max out high-delay Hybla compensation, shrink safety margins,
@@ -1072,7 +1180,17 @@ func cmdOptimize(args []string) error {
 					applied++
 				}
 			}
-			fmt.Printf("warm-start from model (k=%d samples): %d params applied\n", len(mdl.Samples), applied)
+			// 报**纪元后可用**的样本数, 不是文件里的总数。predict 会跳过
+			// pre-epoch 样本 (见 modelEpochTS), 报总数会让运维以为那些样本参与了
+			// 决策 —— 实际参与的可能是 0 条, 参数全来自 heuristicPlan 冷启动。
+			usable := 0
+			for _, sm := range mdl.Samples {
+				if sm.TS >= modelEpochTS {
+					usable++
+				}
+			}
+			fmt.Printf("warm-start from model (k=%d/%d samples usable, %d pre-epoch): %d params applied\n",
+				usable, len(mdl.Samples), len(mdl.Samples)-usable, applied)
 		}
 	}
 	nq0, nqUp := nqReader.read(true)
@@ -1098,7 +1216,10 @@ func cmdOptimize(args []string) error {
 	for {
 		time.Sleep(interval)
 		m := o.measure()
-		sc := o.score(m)
+		// 参照系推进、EXPLORE 计时 (exploreStep)、idle 门 (idleHold) 三件事共用
+		// observe 判出来的这一个 active —— idle 拍照样推进参照系正是 peakBw 被衰减
+		// 到近零、进而制造伪满分的根因 (见 advanceRefs)。
+		sc, active := o.observe(m)
 		ts := time.Now().Format("15:04:05")
 
 		// Anti-noise gate for NeoQ-only params: a genuinely mixed workload needs
@@ -1118,10 +1239,7 @@ func cmdOptimize(args []string) error {
 		}
 
 		if o.phase == "EXPLORE" {
-			o.exploreT++
-			if (m.bwMbps >= o.peakBw*0.95 && o.exploreT >= 3) || o.exploreT >= 6 {
-				o.phase = "OPTIMIZE"
-				o.bestScore = sc
+			if o.exploreStep(m, sc, active) {
 				fmt.Printf("%s -> OPTIMIZE (peakBw=%.0fMbps minRtt=%.1fms)\n", ts, o.peakBw, o.minRtt)
 			}
 			fmt.Printf("%s EXPLORE bw=%.0f rtt=%.1f loss=%.2f%% score=%.3f\n", ts, m.bwMbps, m.rttMs, m.lossPct*100, sc)
@@ -1149,7 +1267,11 @@ func cmdOptimize(args []string) error {
 		}
 		// 同样的卫生标准喂 goodput 环: 只有干净的一拍才进, 否则天气尖峰会把方差
 		// 惩罚项灌爆, 让 score 去惩罚一个不是参数造成的抖动。
-		if !badLink && m.bwMbps > 0 {
+		// 活跃门必须与 advanceRefs/idle 门同一判据 (idleBwFloorMbps): 原来用的是
+		// m.bwMbps > 0, 于是 idle 拍的近零吞吐照样进环, 把 MAD/median 灌成"idle 与
+		// 活跃混排"的分布 —— goodput 方差惩罚项于是惩罚的是"这台机器有没有流量",
+		// 而不是"这组参数稳不稳"。与参照系腐蚀是同一族的口径污染。
+		if !badLink && m.bwMbps >= idleBwFloorMbps {
 			o.bwRing = append(o.bwRing, m.bwMbps)
 			if len(o.bwRing) > jitterRingLen {
 				o.bwRing = o.bwRing[1:]
@@ -1231,6 +1353,13 @@ func cmdOptimize(args []string) error {
 			windowCycle = 0
 			windowBest = windowBestT{score: -1e9}
 		}
+		// no-traffic guard (idleHold: hold 住参数并丢掉挂起的探测)。它必须排在 ucb
+		// 分支之前 —— 原来排在之后, 于是 --algo ucb 下 idle 拍照样 suggest+apply
+		// 步参数 (生产跑的是 coord, 所以没炸)。
+		if o.idleHold(active) {
+			fmt.Printf("%s OPT idle (bw=%.0fM<%.0f, no signal) — holding params\n", ts, m.bwMbps, idleBwFloorMbps)
+			continue
+		}
 		// UCB mode: each cycle pick a fresh value per parameter (rotate which
 		// param we update so coordinated effects stay observable). Credit the
 		// arm we last steered with the delta vs the prior config (B1+B3), and
@@ -1252,12 +1381,6 @@ func cmdOptimize(args []string) error {
 			continue
 		}
 		// OPTIMIZE: coordinate ascent with delta-credited revert-on-regression.
-		// No-traffic guard: with little/no real traffic the score is pure noise,
-		// so steering on it only thrashes params. Hold and wait for traffic.
-		if m.bwMbps < 5 {
-			fmt.Printf("%s OPT idle (bw=%.0fM<5, no signal) — holding params\n", ts, m.bwMbps)
-			continue
-		}
 		// SMOOTH (抚平): EWMA the control signal so one noisy cycle (RTT/bw blip
 		// on a jittery link) can't trigger a param change. Decisions use smScore.
 		if o.smScore == 0 {

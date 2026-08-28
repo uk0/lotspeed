@@ -64,7 +64,8 @@ func TestLoadFromSamplesDeltaCreditOnlyChangedParam(t *testing.T) {
 	u := newUCB(tuns, 0)
 	u.loadFromSamples([]sample{{
 		Params:       paramSet{"startup_gain": 300, "loss_thresh": 4},
-		Score:        0.9, // must be IGNORED for credit when ChangedParam is set
+		Score:        0.9,          // must be IGNORED for credit when ChangedParam is set
+		TS:           modelEpochTS, // 本纪元的样本, 才会被回放的纪元门放行
 		ChangedParam: "loss_thresh",
 		Delta:        rewardScale * 0.5, // -> conditioned reward 1.0
 	}})
@@ -99,6 +100,7 @@ func TestLoadFromSamplesLegacyFallback(t *testing.T) {
 	u.loadFromSamples([]sample{{
 		Params: paramSet{"startup_gain": 300, "loss_thresh": 4},
 		Score:  0.2,
+		TS:     modelEpochTS, // 本纪元的样本, 才会被回放的纪元门放行
 		// ChangedParam == "" -> legacy path
 	}})
 	if _, p1 := u.effectSize("startup_gain"); p1 != 1 {

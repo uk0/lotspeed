@@ -2649,7 +2649,7 @@ static int neoq_ml_show(struct seq_file *m, void *v)
             "t2_pkts=0 t2_bytes=0 t2_drops=0 t2_marks=0 t2_avg_delay_us=0 t2_peak_delay_us=0 "
             "t3_pkts=0 t3_bytes=0 t3_drops=0 t3_marks=0 t3_avg_delay_us=0 t3_peak_delay_us=0 "
             "retrans_seen=0 retrans_protected=0 retrans_demoted=0 "
-            "rate_kbps=0 backlog=0 shaper_sent=0 shaper_defer=0\n");
+            "rate_kbps=0 backlog=0 shaper_sent=0 shaper_defer=0 ambient_share=0\n");
         return 0;
     }
 
@@ -2679,12 +2679,18 @@ static int neoq_ml_show(struct seq_file *m, void *v)
 
     /* 新键追加在行尾: Go 侧解析器对未知键忽略, 老版本 tuner 前向兼容。
      * backlog 用 sch->qstats.backlog (字节), 与 qlen(段数) 互补 —— 整形开启后
-     * 队列在本机成形, 这两个量才是判断"整形是否真的生效"的直接证据。 */
+     * 队列在本机成形, 这两个量才是判断"整形是否真的生效"的直接证据。
+     * ambient_share: 上一完整 1s 窗口的全链路重传占比 (0-100)。此前只在人可读的
+     * /proc/net/neoq_retrans 里露出, 机器可读口这边没有, 用户态只能用 ss 差分自己
+     * 估环境丢包 —— 口径更脏 (不是滚动窗、含纯 ACK、含哈希冲突包)。qdisc 侧这份是
+     * 现成的干净锚点, 直接导出即可。 */
     seq_printf(m, " retrans_seen=%llu retrans_protected=%llu retrans_demoted=%llu"
-                  " rate_kbps=%u backlog=%u shaper_sent=%llu shaper_defer=%llu\n",
+                  " rate_kbps=%u backlog=%u shaper_sent=%llu shaper_defer=%llu"
+                  " ambient_share=%u\n",
                q->retrans_seen, q->retrans_protected, q->retrans_demoted,
                (u32)div64_u64(READ_ONCE(neoq_rate_bps), 1000),
-               sch->qstats.backlog, q->shaper_sent_bytes, q->shaper_defer_cnt);
+               sch->qstats.backlog, q->shaper_sent_bytes, q->shaper_defer_cnt,
+               q->ambient_share);
 
     spin_unlock_bh(&neoq_lock);
     return 0;

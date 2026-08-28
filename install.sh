@@ -499,7 +499,11 @@ case "${1:-}" in
         # 但 /etc/sysctl.d/99-lotspeed.conf 和 /etc/modules-load.d/lotspeed.conf 还在
         # —— 下次重启机器会把自己装回去, 而 enable 着的 unit 找不到 lotspeedctl,
         # Restart=always 变成 3 秒一次的重启循环, 且已无任何工具可清理。
-        local frc=0
+        # 不能用 local: 这里是顶层 case 分支, 不在函数内。bash 会报
+        # "local: can only be used in a function" 并让 frc 保持未定义, 于是下面的
+        # [ "$frc" = 0 ] 恒假 —— 两个 rmmod 都成功时也会走失败路径, 既不 finish
+        # 也不删二进制, 操作者看到的是"卸载失败"而实际已经卸干净了。
+        frc=0
         try_rmmod sch_neoq || frc=1
         try_rmmod lotspeed || frc=1
         if [ "$frc" = 0 ]; then purge_files; finish; exit 0; fi

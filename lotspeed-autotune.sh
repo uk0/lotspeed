@@ -767,8 +767,20 @@ detect_network_type() {
 }
 
 # ============================================================================
-# 参数预设 - 完整版 (对应 lotspeed.c 所有参数)
+# 参数预设 (对应 lotspeed.c 实际生效的参数)
 # ============================================================================
+#
+# 每个 preset 里原本还有一组 "RACK-TLP" 写入 (rack_enable / rack_reord_thresh /
+# rack_min_rtt_div / tlp_enable / tlp_timeout_div / tlp_max_probes), 以及零星的
+# full_loss_cnt 和 bw_probe_base_us / bw_probe_rand_us。这些 sysctl 在 lotspeed.c
+# 里只被注册、从来没有被任何代码路径读取过 —— 写它们对拥塞控制没有任何影响, 但会让
+# 读预设的人以为这里在调 RACK/TLP。模块侧已经把这批 sysctl 删掉, 对应的写入在这里
+# 一并剃除。
+#
+# 注意这不是"多写一次无害": set_param 在 /proc 文件不存在时返回 1, 而脚本顶部有
+# set -e —— 走 `preset` / `aggressive` / `ultra` 这三条 CLI 路径时 set -e 仍然生效,
+# 第一个失败的 set_param 会直接中止脚本, 留下一个只应用了一半的预设。(daemon 的
+# run_loop 和 run_once 各自做了 set +e, 所以只有 CLI 路径会踩到。)
 
 apply_preset() {
     local preset="$1"
@@ -798,14 +810,6 @@ apply_preset() {
             set_param "probe_rtt_cwnd_pct" 70
             set_param "inflight_headroom" 10
 
-            # RACK-TLP: 数据中心启用快速丢包检测
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 2      # 更敏感的乱序阈值
-            set_param "rack_min_rtt_div" 4
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 2
-            set_param "tlp_max_probes" 3
-
             # Hybla: 数据中心不需要高延迟补偿
             set_param "hybla_gain_exp" 100       # 线性 (禁用)
             set_param "hybla_rtt_floor" 50000    # 50ms 阈值
@@ -830,14 +834,6 @@ apply_preset() {
 
             set_param "fast_path" 1
             set_param "pacing_margin" 2
-
-            # RACK-TLP: 局域网启用
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 3
-            set_param "rack_min_rtt_div" 6
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 2
-            set_param "tlp_max_probes" 2
 
             # Hybla: 局域网不需要
             set_param "hybla_gain_exp" 100
@@ -875,17 +871,6 @@ apply_preset() {
             set_param "fast_path" 0
             set_param "probe_rtt_cwnd_pct" 80
             set_param "probe_rtt_duration" 300
-
-            set_param "bw_probe_base_us" 5000000   # 5秒探测间隔
-            set_param "bw_probe_rand_us" 2000000
-
-            # RACK-TLP: 卫星链路需要更保守的设置
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 8      # 更大的乱序容忍
-            set_param "rack_min_rtt_div" 16      # 更大的 RTT 窗口
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 3        # 更长的 TLP 超时
-            set_param "tlp_max_probes" 1         # 减少探测
 
             # Hybla: 卫星链路使用最激进的补偿
             set_param "hybla_gain_exp" 200       # rho^2.0 二次补偿
@@ -925,14 +910,6 @@ apply_preset() {
             set_param "fast_path" 1
             set_param "probe_rtt_cwnd_pct" 60
 
-            # RACK-TLP: 高延迟调整
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 6
-            set_param "rack_min_rtt_div" 10
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 2
-            set_param "tlp_max_probes" 2
-
             # Hybla: 高延迟使用推荐的 rho^1.5 补偿
             set_param "hybla_gain_exp" 150       # rho^1.5 推荐
             set_param "hybla_rtt_floor" 15000    # 15ms 阈值
@@ -962,16 +939,7 @@ apply_preset() {
             set_param "fast_recovery" 1
             set_param "recovery_boost" 10
             set_param "loss_thresh" 1
-            set_param "full_loss_cnt" 3
             set_param "inflight_headroom" 25
-
-            # RACK-TLP: 丢包环境非常重要
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 2      # 敏感检测
-            set_param "rack_min_rtt_div" 4
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 2
-            set_param "tlp_max_probes" 3         # 更多探测
 
             # Hybla: 丢包环境不启用高延迟补偿
             set_param "hybla_gain_exp" 100
@@ -1001,14 +969,6 @@ apply_preset() {
             set_param "loss_thresh" 2
             set_param "inflight_headroom" 20
 
-            # RACK-TLP: 中度丢包启用
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 3
-            set_param "rack_min_rtt_div" 6
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 2
-            set_param "tlp_max_probes" 2
-
             # Hybla: 不启用
             set_param "hybla_gain_exp" 100
             set_param "hybla_rtt_floor" 40000
@@ -1035,14 +995,6 @@ apply_preset() {
             set_param "ack_agg_enable" 1
             set_param "extra_acked_max_us" 200000
 
-            # RACK-TLP: 高抖动需要更大容忍度
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 6      # 更大的乱序容忍
-            set_param "rack_min_rtt_div" 8
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 3        # 更长超时
-            set_param "tlp_max_probes" 1
-
             # Hybla: 抖动网络可能需要轻度补偿
             set_param "hybla_gain_exp" 120       # 轻度补偿
             set_param "hybla_rtt_floor" 25000
@@ -1067,14 +1019,6 @@ apply_preset() {
             set_param "pacing_margin" 5
             set_param "inflight_headroom" 20
 
-            # RACK-TLP: 拥塞网络启用
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 4
-            set_param "rack_min_rtt_div" 8
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 2
-            set_param "tlp_max_probes" 2
-
             # Hybla: 不启用
             set_param "hybla_gain_exp" 100
             set_param "hybla_rtt_floor" 30000
@@ -1093,14 +1037,6 @@ apply_preset() {
             set_param "ecn_alpha_gain" 12
 
             set_param "pacing_margin" 3
-
-            # RACK-TLP: 轻度拥塞启用
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 4
-            set_param "rack_min_rtt_div" 8
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 2
-            set_param "tlp_max_probes" 2
 
             # Hybla: 不启用
             set_param "hybla_gain_exp" 100
@@ -1147,16 +1083,7 @@ apply_preset() {
             set_param "fast_recovery" 1
             set_param "recovery_boost" 40      # 40% 恢复增益
             set_param "loss_thresh" 5          # 5% 丢包才收缩
-            set_param "full_loss_cnt" 10       # 更高容忍
             set_param "inflight_headroom" 25   # 25% 余量
-
-            # RACK-TLP: 超敏感检测
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 2    # 非常敏感
-            set_param "rack_min_rtt_div" 4     # 快速检测
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 2
-            set_param "tlp_max_probes" 4       # 更多探测
 
             # Hybla: 中等补偿
             set_param "hybla_gain_exp" 150
@@ -1207,16 +1134,7 @@ apply_preset() {
             set_param "fast_recovery" 1
             set_param "recovery_boost" 60      # 60% 恢复增益
             set_param "loss_thresh" 10         # 10% 丢包才收缩
-            set_param "full_loss_cnt" 20
             set_param "inflight_headroom" 40   # 40% 余量
-
-            # RACK-TLP: 最大化探测
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 1    # 最敏感
-            set_param "rack_min_rtt_div" 2
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 1
-            set_param "tlp_max_probes" 6
 
             # Hybla: 最大补偿
             set_param "hybla_gain_exp" 200     # rho^2.0
@@ -1225,10 +1143,6 @@ apply_preset() {
             set_param "fast_path" 0            # 禁用快速路径，全程监控
             set_param "pacing_margin" 10       # 大余量
             set_param "burst_mode" 1
-
-            # 带宽探测: 更频繁
-            set_param "bw_probe_base_us" 1000000   # 1秒
-            set_param "bw_probe_rand_us" 500000
             ;;
 
         loss_recovery)
@@ -1250,16 +1164,7 @@ apply_preset() {
             set_param "fast_recovery" 1
             set_param "recovery_boost" 30
             set_param "loss_thresh" 3
-            set_param "full_loss_cnt" 8
             set_param "inflight_headroom" 20
-
-            # RACK-TLP: 敏感
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 2
-            set_param "rack_min_rtt_div" 4
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 2
-            set_param "tlp_max_probes" 3
 
             # Hybla: 中等
             set_param "hybla_gain_exp" 140
@@ -1318,16 +1223,7 @@ apply_preset() {
             set_param "fast_path" 1
 
             set_param "loss_thresh" 2
-            set_param "full_loss_cnt" 6
             set_param "inflight_headroom" 15
-
-            # RACK-TLP: 默认启用
-            set_param "rack_enable" 1
-            set_param "rack_reord_thresh" 4
-            set_param "rack_min_rtt_div" 8
-            set_param "tlp_enable" 1
-            set_param "tlp_timeout_div" 2
-            set_param "tlp_max_probes" 2
 
             # Hybla: 默认使用推荐的 rho^1.5
             set_param "hybla_gain_exp" 150
@@ -1421,10 +1317,6 @@ fine_tune() {
         # 增加 inflight 余量
         set_param "inflight_headroom" 30
 
-        # 增强 RACK-TLP
-        set_param "rack_reord_thresh" 2
-        set_param "tlp_max_probes" 4
-
         # 勇敢模式增强
         set_param "brave_enable" 1
         set_param "brave_rtt_pct" 50
@@ -1441,16 +1333,14 @@ fine_tune() {
 
         set_param "recovery_boost" 30
         set_param "inflight_headroom" 20
-        set_param "tlp_max_probes" 3
     fi
 
-    # === 7. 超时率高 -> 需要更激进的 TLP ===
-    if [[ ${METRICS[timeout_rate]:-0} -gt 5 ]]; then
-        set_param "tlp_enable" 1
-        set_param "tlp_timeout_div" 1       # 更短超时
-        set_param "tlp_max_probes" 4
-        log ADJUST "High timeout rate (${METRICS[timeout_rate]}/s), enhancing TLP"
-    fi
+    # === 7. (已删除) 超时率高 -> 更激进的 TLP ===
+    # 原来这条规则写 tlp_enable/tlp_timeout_div/tlp_max_probes 三个 sysctl。问题在于
+    # lotspeed.c 里这三个旋钮从未被任何代码路径读取 —— 它们只是被注册成 sysctl 然后
+    # 存进一个没人查的变量, 所以整条规则实际是空转, 日志却打 "enhancing TLP" 误导排查。
+    # sysctl 已在模块侧删除, 这里连同规则一起剃掉; 编号保留以免和日志/文档里的
+    # "规则 8" 对不上。
 
     # === 8. NeoQ 集成: 调整 CoDel 参数 ===
     if [[ -f /proc/net/neoq ]]; then
@@ -1630,9 +1520,6 @@ show_status() {
         "$(get_param brave_enable)" "$(get_param brave_hold_ms)"
     printf "${CYAN}║${NC}   ecn_enable=%-4d ecn_thresh=%-4d ecn_factor=%-4d\n" \
         "$(get_param ecn_enable)" "$(get_param ecn_thresh)" "$(get_param ecn_factor)"
-    printf "${CYAN}║${NC}   rack_enable=%-3d rack_thresh=%-3d tlp_enable=%-3d tlp_div=%-3d\n" \
-        "$(get_param rack_enable)" "$(get_param rack_reord_thresh)" \
-        "$(get_param tlp_enable)" "$(get_param tlp_timeout_div)"
     printf "${CYAN}║${NC}   hybla_exp=%-5d hybla_floor=%-6d\n" \
         "$(get_param hybla_gain_exp)" "$(get_param hybla_rtt_floor)"
 
@@ -1809,7 +1696,6 @@ run_once() {
             echo "    - max_cwnd=30000, beta=819 (80%)"
             echo "    - hd_enable=0, brave_enable=0"
             echo "    - ecn_thresh=20 (sensitive)"
-            echo "    - RACK-TLP: enabled, sensitive detection"
             echo "    - Hybla: disabled (rho^1.0)"
             ;;
         satellite)
@@ -1817,38 +1703,32 @@ run_once() {
             echo "    - max_cwnd=50000, min_cwnd=256"
             echo "    - hd_cwnd_gain=250 (2.5x compensation)"
             echo "    - brave_hold_ms=1000"
-            echo "    - RACK-TLP: enabled with conservative thresholds"
             echo "    - Hybla: rho^2.0 (maximum compensation)"
             ;;
         highdelay)
             echo "    - Optimized for 100-300ms RTT"
             echo "    - max_cwnd=25000, hd_enable=1"
             echo "    - hd_cwnd_gain=180, hd_pacing_gain=150"
-            echo "    - RACK-TLP: enabled with adjusted thresholds"
             echo "    - Hybla: rho^1.5 (recommended compensation)"
             ;;
         lossy*)
             echo "    - Conservative for packet loss"
             echo "    - Lower max_cwnd, higher recovery"
             echo "    - beta=512-614 (50-60%)"
-            echo "    - RACK-TLP: enabled, sensitive detection"
             echo "    - Hybla: disabled"
             ;;
         jittery)
             echo "    - Brave mode for RTT variance"
             echo "    - brave_hold_ms=600, brave_rtt_pct=50"
-            echo "    - RACK-TLP: enabled with tolerant thresholds"
             echo "    - Hybla: light compensation (rho^1.2)"
             ;;
         congested)
             echo "    - ECN-responsive"
             echo "    - ecn_thresh=10, ecn_alpha_gain=8"
-            echo "    - RACK-TLP: enabled"
             echo "    - Hybla: disabled"
             ;;
         *)
             echo "    - Balanced settings"
-            echo "    - RACK-TLP: enabled (default)"
             echo "    - Hybla: rho^1.5 (recommended)"
             ;;
     esac
@@ -1902,7 +1782,6 @@ case "${1:-}" in
         echo "  beta=870 (85% recovery)"
         echo "  recovery_boost=40"
         echo "  brave_hold_ms=800"
-        echo "  tlp_max_probes=4"
         ;;
     ultra|ultra-aggressive|ultra_aggressive)
         # 快速应用超激进预设

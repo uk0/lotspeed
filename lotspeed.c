@@ -45,14 +45,7 @@
 #define LS_PROBE_RTT_WIN_MS     5000
 #define LS_MIN_RTT_WIN_SEC      10
 #define LS_HIST_UPDATE_INTERVAL_SEC 10  /* 长连接周期性回写 hist 的最小间隔 */
-#define LS_BW_PROBE_BASE_US     (2 * USEC_PER_SEC)
-#define LS_BW_PROBE_RAND_US     (1 * USEC_PER_SEC)
 #define LS_BW_PROBE_MAX_ROUNDS  63
-
-/* RACK-TLP 常量 */
-#define LS_RACK_REORD_THRESH    2       /* RACK 乱序阈值 */
-#define LS_RACK_MIN_RTT_DIVISOR 8       /* RACK 最小 RTT 窗口 */
-#define LS_TLP_MAX_PROBE_TIMEOUT 2      /* TLP 最大探测超时 (RTT 倍数) */
 
 /* ============== sysctl 参数结构 ============== */
 
@@ -130,24 +123,9 @@ struct lotspeed_params {
 
 	/* 丢包检测参数 */
 	unsigned int loss_thresh;       /* 丢包率阈值 (百分比) */
-	unsigned int full_loss_cnt;     /* STARTUP 退出的丢包事件数 */
 	unsigned int headroom_loss_gain;/* 丢包正比窗口收紧增益 (0=关; 100=丢包10%时额外10% headroom) */
 	unsigned int delay_cap_thresh;  /* 延迟门控封顶阈值 %: srtt>min_rtt*(100+x)% 时封顶 cwnd 到 BDP*1.25 (0=关) */
 	unsigned int inflight_headroom; /* inflight 安全余量 (百分比) */
-
-	/* 带宽探测参数 */
-	unsigned int bw_probe_max_rounds; /* 最大探测间隔轮次 */
-	unsigned int bw_probe_base_us;  /* 探测基础间隔 (us) */
-	unsigned int bw_probe_rand_us;  /* 探测随机间隔 (us) */
-	unsigned int bw_probe_cwnd_gain;/* 探测时 cwnd 增益 */
-
-	/* RACK-TLP 快速丢包检测参数 */
-	unsigned int rack_enable;       /* 启用 RACK 检测 */
-	unsigned int rack_reord_thresh; /* RACK 乱序阈值 (RTT 分数) */
-	unsigned int rack_min_rtt_div;  /* RACK 最小 RTT 窗口 (除数) */
-	unsigned int tlp_enable;        /* 启用 TLP 探测 */
-	unsigned int tlp_timeout_div;   /* TLP 超时 (RTT 除数) */
-	unsigned int tlp_max_probes;    /* 每轮最大 TLP 探测 */
 
 	/* Hybla 增强参数 */
 	unsigned int hybla_gain_exp;    /* Hybla 增益指数 (100=1.0, 150=1.5, 200=2.0) */
@@ -219,24 +197,9 @@ static struct lotspeed_params ls_params = {
 
 	/* 丢包检测参数 */
 	.loss_thresh        = 2,            /* 2% 丢包率阈值 */
-	.full_loss_cnt      = 6,            /* STARTUP 退出丢包事件数 */
 	.headroom_loss_gain = 100,          /* 丢包正比窗口收紧: 丢包10%→额外10% headroom (BDP floor 保底) */
 	.delay_cap_thresh   = 0,            /* 延迟门控封顶: 默认关 (netem 已验证 6x 缩窗+RTT 落地+吞吐持平; 待 RTT 漂移真机 A/B + 迟滞硬化后再默认开) */
 	.inflight_headroom  = 15,           /* 15% inflight 余量 */
-
-	/* 带宽探测参数 */
-	.bw_probe_max_rounds = 63,          /* 最大探测间隔轮次 */
-	.bw_probe_base_us   = 2000000,      /* 2 秒基础间隔 */
-	.bw_probe_rand_us   = 1000000,      /* 1 秒随机间隔 */
-	.bw_probe_cwnd_gain = 1,            /* 探测 cwnd 增益 */
-
-	/* RACK-TLP 快速丢包检测参数 */
-	.rack_enable        = 1,            /* 启用 RACK */
-	.rack_reord_thresh  = 4,            /* 1/4 RTT 乱序阈值 */
-	.rack_min_rtt_div   = 8,            /* 最小 RTT 窗口 1/8 */
-	.tlp_enable         = 1,            /* 启用 TLP */
-	.tlp_timeout_div    = 2,            /* TLP 超时 = 2 * RTT */
-	.tlp_max_probes     = 2,            /* 每轮最多 2 个 TLP */
 
 	/* Hybla 增强参数 */
 	.hybla_gain_exp     = 150,          /* rho^1.5 (150/100 = 1.5) */
@@ -615,91 +578,8 @@ static struct ctl_table ls_sysctl_table[] = {
 		.extra2         = &ls_delay_cap_thresh_max,
 	},
 	{
-		.procname       = "full_loss_cnt",
-		.data           = &ls_params.full_loss_cnt,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	{
 		.procname       = "inflight_headroom",
 		.data           = &ls_params.inflight_headroom,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	/* 带宽探测参数 */
-	{
-		.procname       = "bw_probe_max_rounds",
-		.data           = &ls_params.bw_probe_max_rounds,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	{
-		.procname       = "bw_probe_base_us",
-		.data           = &ls_params.bw_probe_base_us,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	{
-		.procname       = "bw_probe_rand_us",
-		.data           = &ls_params.bw_probe_rand_us,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	{
-		.procname       = "bw_probe_cwnd_gain",
-		.data           = &ls_params.bw_probe_cwnd_gain,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	/* RACK-TLP 参数 */
-	{
-		.procname       = "rack_enable",
-		.data           = &ls_params.rack_enable,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec_minmax,
-		.extra1         = SYSCTL_ZERO,
-		.extra2         = SYSCTL_ONE,
-	},
-	{
-		.procname       = "rack_reord_thresh",
-		.data           = &ls_params.rack_reord_thresh,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	{
-		.procname       = "rack_min_rtt_div",
-		.data           = &ls_params.rack_min_rtt_div,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	{
-		.procname       = "tlp_enable",
-		.data           = &ls_params.tlp_enable,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec_minmax,
-		.extra1         = SYSCTL_ZERO,
-		.extra2         = SYSCTL_ONE,
-	},
-	{
-		.procname       = "tlp_timeout_div",
-		.data           = &ls_params.tlp_timeout_div,
-		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	{
-		.procname       = "tlp_max_probes",
-		.data           = &ls_params.tlp_max_probes,
 		.maxlen         = sizeof(unsigned int),
 		.mode           = 0644,
 		.proc_handler   = proc_douintvec,
@@ -823,13 +703,11 @@ struct lotspeed {
 	u8      try_fast_path:1;        /* 尝试快速路径 */
 	u8      full_bw_now:1;          /* 当前达到满带宽 */
 	u8      has_seen_rtt:1;         /* 已观测到 RTT */
-	/* 原 rack_detect_loss:1 已删 — 全文件只有声明与清零、零处读取。
-	 * 真实丢包由内核 RACK 经 rs->lost 上报,在 ls_main 消费,该位是死状态。
-	 * 回收出的位用于把 loss_rate_pct 从 5-bit 扩成完整 u8 (见下)。 */
-
-	/* === 标志位 byte 4 - RACK-TLP === */
-	/* 原 tlp_high_seq_set:1 / rack_reord_seen:1 同样只写不读,一并删除。 */
-	u8      tlp_in_progress:1;      /* TLP 探测进行中 */
+	/* 原 rack_detect_loss:1 / tlp_high_seq_set:1 / rack_reord_seen:1 /
+	 * tlp_in_progress:1 均已删 — 它们只有声明与清零,或只被同样
+	 * 死掉的 RACK-TLP 装饰代码消费。真实丢包由内核 RACK 经
+	 * rs->lost 上报,在 ls_main 消费。回收出的位用于把 loss_rate_pct
+	 * 从 5-bit 扩成完整 u8 (见下)。 */
 
 	/* 连续丢包率 EWMA。单位是 1/8 %,不是 1% —— 别改回百分比。
 	 * 旧版是 :5 位域 + 整数除法 EWMA (x*7+spc)/8,存在吸收态:
@@ -842,26 +720,22 @@ struct lotspeed {
 	 * 它要求 EWMA 双向都能精确收敛 —— 别给更新式加四舍五入偏置,那会造成
 	 * 下界卡死在非零值 (详见 ls_update_round_start 里的 ceil/floor 说明)。
 	 * 满量程 255 = 31.875%,与旧版 31% 饱和点基本一致。
-	 * 位置说明: 删掉的 3 个死位让前面的位域组从 4 字节缩到 3 字节,
-	 * 本字段落在偏移 110,偏移 111 仍是 rack_rtt_us 的 4 字节对齐填充,
-	 * 故 sizeof 仍为 128 == ICSK_CA_PRIV_SIZE。 */
+	 * 位置说明: 删掉的死位让前面的位域组从 4 字节缩到 3 字节,
+	 * 本字段落在偏移 110;其后紧跟 startup_ecn_rounds (111),不再
+	 * 需要对齐填充。 */
 	u8      loss_rate_pct;
 
-	/* === RACK-TLP 状态 (8 bytes) === */
-	u32     rack_rtt_us;            /* RACK 使用的 RTT */
-	u32     rack_end_seq;           /* RACK 最高确认序列号 */
-	u16     rack_xmit_ts;           /* RACK 传输时间戳 (相对) */
-	u8      tlp_probes_out;         /* TLP 探测计数 */
 	u8      startup_ecn_rounds;     /* 启动阶段 ECN 轮次 */
 
 	/* hist v2: 长连接周期性回写时间戳 (jiffies32)。
-	 * 实占偏移 124..127 — 正好填入此前为 u64 对齐而产生的尾部 4 字节
-	 * 填充,故 sizeof 仍为 128,不突破 ICSK_CA_PRIV_SIZE。 */
+	 * 删除 RACK-TLP 状态后实占偏移 112..115,其后 116..119 是 u64
+	 * 对齐填充,sizeof 为 120。 */
 	u32     hist_update_stamp;      /* 上次 hist_update 的 tcp_jiffies32 */
 
-	/* 实测 sizeof(struct lotspeed) == 128 == ICSK_CA_PRIV_SIZE (64-bit)。
-	 * 之前的字段末端在偏移 124,尾部 4 字节为对齐填充;hist_update_stamp
-	 * 复用该填充,不增加结构体大小。BUILD_BUG_ON 仍然成立。
+	/* 实测 sizeof(struct lotspeed) == 120 <= ICSK_CA_PRIV_SIZE 128 (64-bit)。
+	 * 字段末端在偏移 115,尾部 4 字节 (116..119) 为 u64 对齐填充。
+	 * 删除 RACK-TLP 死代码后从 128 降到 120; BUILD_BUG_ON 用的是 '>',
+	 * 缩小结构体安全,无需补 padding。
 	 */
 };
 
@@ -1562,7 +1436,6 @@ static void ls_pick_probe_wait(struct sock *sk)
 {
 	struct lotspeed *ls = inet_csk_ca(sk);
 	ls->rounds_since_probe = get_random_u32_below(2);
-	/* probe_wait 现在使用常量 LS_BW_PROBE_BASE_US */
 }
 
 static void ls_enter_probe_rtt(struct sock *sk)
@@ -2279,145 +2152,6 @@ static void ls_reset_lower_bounds(struct sock *sk)
 	ls->inflight_lo = ~0U;
 }
 
-/* ============== RACK-TLP 快速丢包检测 ============== */
-
-/*
- * RACK (Recent ACKnowledgment) 基于时间的丢包检测
- *
- * 核心思想: 如果一个包在发送后经过 min_rtt + reord_window 时间
- * 后仍未被 ACK，而较新的包已经被 ACK，则标记该包为丢失。
- *
- * 相比传统的 3-dupACK，RACK 可以:
- * - 更快检测尾部丢包
- * - 更好处理乱序
- * - 减少 RTO
- */
-
-/* 更新 RACK 状态 */
-static void ls_rack_update(struct sock *sk, const struct rate_sample *rs)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct lotspeed *ls = inet_csk_ca(sk);
-	u32 rtt_us;
-
-	if (!READ_ONCE(ls_params.rack_enable))
-		return;
-
-	/* 使用最新的 RTT 样本更新 RACK RTT */
-	rtt_us = rs->rtt_us > 0 ? rs->rtt_us : ls->min_rtt_us;
-	if (rtt_us > 0 && rtt_us != ~0U) {
-		/* EWMA 平滑: 7/8 * old + 1/8 * new */
-		if (ls->rack_rtt_us == 0)
-			ls->rack_rtt_us = rtt_us;
-		else
-			ls->rack_rtt_us = (ls->rack_rtt_us * 7 + rtt_us) >> 3;
-	}
-
-	/* 更新 RACK 最高确认序列号 */
-	if (after(tp->snd_una, ls->rack_end_seq))
-		ls->rack_end_seq = tp->snd_una;
-}
-
-/*
- * TLP (Tail Loss Probe) 尾部丢包探测
- *
- * 核心思想: 在 RTO 之前发送探测包，触发快速恢复
- * 比等待 RTO 快约 1.5-2 个 RTT
- */
-
-/* 计算 TLP 超时时间 */
-static u32 ls_tlp_timeout(struct sock *sk)
-{
-	struct lotspeed *ls = inet_csk_ca(sk);
-	u32 timeout_div = READ_ONCE(ls_params.tlp_timeout_div);
-	u32 tlp_timeout;
-
-	if (!READ_ONCE(ls_params.tlp_enable))
-		return 0;
-
-	/* TLP 超时 = RTT * timeout_div */
-	if (ls->min_rtt_us != ~0U && ls->min_rtt_us > 0) {
-		tlp_timeout = ls->min_rtt_us * timeout_div;
-	} else {
-		/* 默认 100ms * 2 = 200ms */
-		tlp_timeout = 200000;
-	}
-
-	/* 限制在 10ms - 2s */
-	return clamp_t(u32, tlp_timeout, 10000, 2000000);
-}
-
-/* 检查是否需要 TLP */
-static bool ls_should_tlp(struct sock *sk, const struct rate_sample *rs)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct lotspeed *ls = inet_csk_ca(sk);
-	u32 max_probes = READ_ONCE(ls_params.tlp_max_probes);
-
-	if (!READ_ONCE(ls_params.tlp_enable))
-		return false;
-
-	/* 已达到最大探测数 */
-	if (ls->tlp_probes_out >= max_probes)
-		return false;
-
-	/* 需要有未确认数据 */
-	if (tp->packets_out == 0)
-		return false;
-
-	/* 已经在恢复中，不需要 TLP */
-	if (ls->in_recovery)
-		return false;
-
-	return true;
-}
-
-/* TLP 发送后更新状态 */
-static void ls_tlp_sent(struct sock *sk)
-{
-	struct lotspeed *ls = inet_csk_ca(sk);
-
-	if (!READ_ONCE(ls_params.tlp_enable))
-		return;
-
-	ls->tlp_probes_out++;
-	ls->tlp_in_progress = 1;
-}
-
-/* TLP 收到 ACK 后重置状态 */
-static void ls_tlp_ack_received(struct sock *sk)
-{
-	struct lotspeed *ls = inet_csk_ca(sk);
-
-	if (ls->tlp_in_progress) {
-		ls->tlp_in_progress = 0;
-		/* TLP 成功，快速恢复比 RTO 好 */
-	}
-}
-
-/* 综合 RACK-TLP 处理 */
-static void ls_rack_tlp_main(struct sock *sk, const struct rate_sample *rs)
-{
-	struct lotspeed *ls = inet_csk_ca(sk);
-
-	/* 更新 RACK 状态 (RTT EWMA + 最高确认序号) */
-	ls_rack_update(sk, rs);
-
-	/* 注: 原基于 rs->interval_us 的伪丢包检测已删除 —— interval_us 是交付率
-	 * 采样区间而非包龄,在 ACK 聚合的高 RTT 路径上常态超阈,会每轮误置
-	 * loss_in_round 污染快速路径门控。真实丢包由内核 RACK 经 rs->lost 上报,
-	 * 在 ls_main 中正确消费。 */
-
-	/* TLP ACK 处理 */
-	if (rs->acked_sacked > 0 && ls->tlp_in_progress) {
-		ls_tlp_ack_received(sk);
-	}
-
-	/* 每轮重置 TLP 计数 */
-	if (ls->round_start)
-		ls->tlp_probes_out = 0;
-}
-
 /* ============== PROBE_BW 状态机 ============== */
 
 static bool ls_has_elapsed_in_phase(struct sock *sk, u32 interval_ms)
@@ -2617,9 +2351,6 @@ static void ls_main(struct sock *sk, const struct rate_sample *rs)
 			ls->loss_too_high = 1;
 	}
 
-	/* RACK-TLP 快速丢包检测 (在传统丢包信号之后) */
-	ls_rack_tlp_main(sk, rs);
-
 	/* 更新 bw_latest 和 inflight_latest */
 	if (rs->interval_us > 0 && rs->acked_sacked > 0) {
 		ls->bw_latest = max_t(u32, ls->bw_latest, bw_sample);
@@ -2724,13 +2455,6 @@ static void ls_init(struct sock *sk)
 	/* hist v2: 把周期性回写锚定到连接起点,确保首次写入前有完整 10s 预热
 	 * (否则在长运行主机上 tcp_jiffies32 很大,seed=0 会令首个 ACK 即触发)。 */
 	ls->hist_update_stamp = tcp_jiffies32;
-
-	/* RACK-TLP 初始化 */
-	ls->rack_rtt_us = 0;
-	ls->rack_end_seq = tp->snd_una;
-	ls->rack_xmit_ts = 0;
-	ls->tlp_probes_out = 0;
-	ls->tlp_in_progress = 0;
 
 	/* 检测高延迟路径 */
 	ls_update_high_delay_path(sk);
@@ -2993,5 +2717,5 @@ module_exit(lotspeed_v2_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Hybrid of BBR v3 + FAST TCP + Hybla");
-MODULE_DESCRIPTION("LotSpeed v2.2 - Hybrid CC with RACK-TLP and Enhanced Hybla");
+MODULE_DESCRIPTION("LotSpeed v2.2 - Hybrid CC with Enhanced Hybla");
 MODULE_VERSION(LS_VERSION_STR);

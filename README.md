@@ -18,106 +18,111 @@
 
 
 
-### lotspeed helper
+### 一键部署
 
-> 速度起不来执行： /usr/local/bin/lotspeed-autotune restart
+> 完整部署手册见 **[INSTALL.md](INSTALL.md)** —— 内核要求的编译期理由、DKMS、
+> **对端要求**(只装本机只解决一半)、卸载纪律、从手工部署迁移,都在那里。
+> 这一节只讲最短路径。
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/refs/heads/adaptive-accel/install.sh | sudo bash
 ```
 
-root@dev-kernel:~# lotspeed help
-╔════════════════════════════════════════════════════════════════════╗
-║                 LotSpeed v2.2 + NeoQ v3.1 Commands                 ║
-╟────────────────────────────────────────────────────────────────────╢
-║ Basic Commands                                                     ║
-║ lotspeed                                          Interactive menu ║
-║ lotspeed start                                  Enable LotSpeed CC ║
-║ lotspeed stop                                  Disable LotSpeed CC ║
-║ lotspeed restart                                  Restart LotSpeed ║
-║ lotspeed status                                    Show all status ║
-╟────────────────────────────────────────────────────────────────────╢
-║ NeoQ Qdisc                                                         ║
-║ lotspeed neoq-start [iface]                      Enable NeoQ qdisc ║
-║ lotspeed neoq-stop [iface]                      Disable NeoQ qdisc ║
-║ lotspeed neoq-stats                           Show NeoQ statistics ║
-╟────────────────────────────────────────────────────────────────────╢
-║ Parameter Management                                               ║
-║ lotspeed params                                Show all parameters ║
-║ lotspeed set <k> <v>                          Set single parameter ║
-║ lotspeed preset <name>                         Apply preset config ║
-║ lotspeed save                                  Save current config ║
-║ lotspeed load                                    Load saved config ║
-║ lotspeed edit                                     Edit config file ║
-╟────────────────────────────────────────────────────────────────────╢
-║ Other                                                              ║
-║ lotspeed log                                      Show kernel logs ║
-║ lotspeed monitor                               Live log monitoring ║
-║ lotspeed autotune                         Auto-tune network params ║
-║ lotspeed uninstall                               Remove everything ║
-╟────────────────────────────────────────────────────────────────────╢
-║ Presets: conservative, balanced, aggressive,                       ║
-║          highdelay, datacenter                                     ║
-╚════════════════════════════════════════════════════════════════════╝
+脚本只做引导:依赖检查 → 取源码 → 编译 → 安装 → sysctl → systemd。日常运维全部交给
+`lotspeedctl`。它需要 **kernel 6.6+ 且内核树带 BBRv3 补丁**和内核头文件;网卡默认取
+默认路由的出接口。
 
+```bash
+sudo bash install.sh [options]
 
-root@dev-kernel:~# lotspeed autotune help
-LotSpeed Auto-Tune Daemon v2.1
-
-Commands:
-  (none)    Analyze network and suggest preset
-  status    Show current status and metrics
-  daemon    Start background daemon
-  stop      Stop background daemon
-  restart   Restart daemon
-  aggressive    Apply anti_loss preset immediately
-  ultra         Apply ultra_aggressive preset
-
-Presets (use with '<name>'):
-  normal        Balanced settings (default)
-  anti_loss     Aggressive loss recovery, fast retransmit
-  ultra_aggressive  Maximum throughput, large queues
-  loss_recovery Optimized for active loss conditions
-  datacenter    Ultra-low latency, ECN-focused
-  satellite     Very high delay (300+ ms)
-  highdelay     High delay WAN (100-300ms)
-  lossy         Moderate packet loss (1-5%)
-  lossy_severe  Severe packet loss (>5%)
-  jittery       High RTT variance (mobile/WiFi)
-  congested     High ECN marks
-
-Environment:
-  DEBUG=1   Enable debug output
-
-Files:
-  Log:    /var/log/lotspeed-autotune.log
-  PID:    /var/run/lotspeed-autotune.pid
-  State:  /tmp/lotspeed-autotune.state
-
+  --iface <name>          指定加速网卡 (默认自动检测)
+  --force-kernel          跳过 6.6+ 内核硬门, 仅供测试
+  --with-legacy-autotune  额外装老的 lotspeed-autotune.sh (默认不装, 见下)
+  --full, -f              非交互, 直接完整安装
+  --help, -h              用法
 ```
 
+装完后会有:
 
+| 路径 | 作用 |
+|---|---|
+| `/opt/lotspeed/` | 源码与编译好的 `.ko` |
+| `/usr/local/bin/lotspeedctl` | Go 控制器,**日常运维都用它** |
+| `/usr/local/bin/lotspeed` | 薄包装,只做模块装卸和卸载 |
+| `/etc/systemd/system/lotspeedctl@.service` | 模板单元 |
+| `/etc/sysctl.d/99-lotspeed.conf` | 参数持久化(唯一入口) |
+| `/etc/modules-load.d/lotspeed.conf` | 开机加载模块 |
+| `/etc/lotspeed/env` | 安装时检测到的网卡名 |
+
+启用与验证:
+
+```bash
+sudo systemctl enable --now lotspeedctl@ens3   # 网卡名见 /etc/lotspeed/env
+lotspeedctl status
+```
+
+**接 DKMS(近乎必选)。** 不接的话内核一升级 `.ko` 就不匹配了,重启后 CC 静默回落到
+内建算法,而 `lotspeedctl` 会一直重试。仓库带了 `dkms.conf`,见
+[INSTALL.md §2.1](INSTALL.md)。也要确认模块真的进了 `modules.dep`:
+
+```bash
+modinfo -F srcversion lotspeed          # 应与 cat /sys/module/lotspeed/srcversion 一致
+```
+
+两者不一致,说明 `modprobe` 会去加载另一份旧 `.ko` —— 用 `insmod` 手工装过的机器
+特别容易这样。
+
+### 两个命令入口
+
+`lotspeedctl` 是主入口(Go,117 个测试);`lotspeed` 只保留 `lotspeedctl` 做不到的事 ——
+内核模块装卸和卸载纪律,其余子命令原样转发。
+
+```bash
+lotspeed modload            # modprobe lotspeed + sch_neoq
+lotspeed unload             # 完整卸载序列 (见下), 不用 rmmod -f
+lotspeed uninstall          # 卸载序列 + 删文件
+lotspeed <其他>             # 转发给 lotspeedctl
+```
+
+> **注意**:旧版本的 `lotspeed start/stop/restart/params/save/load/edit/autotune` 已全部移除。
+> 参数持久化统一走 `/etc/sysctl.d/99-lotspeed.conf`,单个参数用 `lotspeedctl get/set`。
+> `lotspeed load` 在旧版是"恢复配置"而不是"加载模块",所以它现在会**大声失败**而不是
+> 静默改变行为 —— 装模块请用 `lotspeed modload`。
+
+### 卸载
+
+CC 模块的引用计数由 **socket 创建时**绑定,改 `sysctl` 不影响存量连接 —— 包括你当前
+这条 SSH。所以卸载分两步是正常的,不是错误:
+
+```bash
+sudo lotspeed uninstall          # 走完 6 步序列; 存量连接仍持引用时会提示
+# 重新登录后
+sudo lotspeed uninstall --finish
+```
+
+六步序列:停控制器 → 关整形(`rate=0` 即内核默认不整形)→ 新 socket 切回 bbr →
+摘掉 neoq qdisc → `rmmod sch_neoq` → `rmmod lotspeed`。为什么 SSH 会把自己 pin 住、
+容器 netns 为什么查不到,见 [INSTALL.md §4.1](INSTALL.md)。
+
+**这里绝不用 `rmmod -f`。** 强卸一个仍被 socket 引用的 CC 模块,那些 socket 的
+`icsk_ca_ops` 立刻指向已释放内存,下一个包就是 use-after-free → panic。卸不掉可以接受,
+panic 不行。卸不掉时脚本会打印真实 refcount 和内核原话,并给出定位持有者的命令
+(已建立连接 / LISTEN socket / 容器 netns 各查一遍)。
+
+### legacy autotune
+
+`lotspeed-autotune.sh` 是早期的 shell 自调优,**默认不再安装**:它与
+`lotspeedctl optimize` 写同一批 `/proc/sys/net/ipv4/lotspeed/*`,两个都跑会互相打架。
+只有明确要用旧行为时才 `--with-legacy-autotune`。
 
 ### branch explanation
 
 * `merge_bl`: lotspeed merge_bl 基于学习历史记录的模式进行加速，并且洲际场景抖动不会降速避让,并且整合了BBRv3的优点。
 
 * `adaptive-accel`: 在 merge_bl 之上的行为化调度 + 学习闭环分支:
-  - **CC**: min_rtt 双窗口修复(过期窗/PROBE_RTT 重新生效, BBRv3 式浅排空), CRUISE headroom 按 loss 压力门控, loss_thresh 丢包率门控(实测最优 lt=2)
+  - **CC**: min_rtt 双窗口修复(过期窗/PROBE_RTT 重新生效, BBRv3 式浅排空), CRUISE headroom 按 loss 压力门控, loss_thresh 丢包率门控(内核默认 2; 高丢包链路应设为 `环境丢包率 + 4`, 见下)
   - **NeoQ**: CAKE 式 sparse/bulk 行为分类(临界点按流速率自适应, 不依赖端口), 全局 5-tuple flow 表, 跨档 WRR 8:4:2:1 防饿死, 满队列从最低档驱逐, **重传包 CoDel 免疫**(丢恢复包在 250ms 链路 = 恢复时间翻倍), `/proc/net/neoq_ml` 机器可读统计
-  - **lotspeedctl**: 每参数 Δ 信用分配(因果归因, 不再拟合链路噪声), 体验感知 score(`--gamma`, Express 排队延迟惩罚), bad-link 周期跳过, apply 后 settle, KNN 同 regime 邻居门控
-
-
-* auto install
-
-
-```bash
-# 1. install lotspeed module and helper script
-curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/refs/heads/adaptive-accel/install.sh | sudo bash
-#   or
-wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/refs/heads/adaptive-accel/install.sh | sudo bash
-
-```
-
-
+  - **lotspeedctl**: 整形速率反馈环(probe-and-hold, 把瓶颈从对端拉回本机), 体验感知 score(`--gamma`, Express 排队延迟惩罚), KNN 同 regime 邻居门控。**参数搜索已于 2026-08 退役** —— 人工 A/B 定下来的参数冻结为常数, `loss_thresh` 由可测量的机制闭环给建议, 因果判断交给 `abtest` 的随机化 A/B(理由见 [CHANGELOG](CHANGELOG.md#2026-08-28-mechanism))
 
 
 * manual compile and load
@@ -237,6 +242,44 @@ sysctl 可调参数 (/proc/sys/net/ipv4/lotspeed/)
 | 历史     | hist_enable    | 1      | 启用历史缓存 (v3 种 bw+pacing) |
 |          | hist_ttl_sec   | 1200   | 缓存 TTL (20分钟)  |
 |          | hist_min_cwnd_bound | 64 | hist 种子 cwnd 兜底下界 |
+| 延迟封顶 | delay_cap_thresh | 0 | srtt > min_rtt*(100+x)% 时把 cwnd 封到 BDP*1.25;**0=关**(见下) |
+|          | headroom_loss_gain | — | CRUISE headroom 随 loss 压力的增益 |
+| 启动     | turbo_startup  | 1      | STARTUP 加速 |
+|          | startup_min_rounds | — | STARTUP 最少轮数 |
+| 高延迟   | hd_rho_max     | 400    | rho 上限**护栏**,防 rho² 过冲引发重传风暴 |
+|          | hd_ref_us      | —      | Hybla 参考 RTT |
+| 恢复     | fast_recovery  | 1      | 快速恢复 |
+|          | recovery_boost | —      | 恢复期窗口提升 |
+| PROBE_RTT| probe_rtt_cwnd_pct | — | PROBE_RTT 排空深度(BBRv3 式浅排空) |
+|          | probe_rtt_duration | — | PROBE_RTT 持续时间 |
+
+> 上表是常用子集。内核实际导出 **50 个**,完整列表:`lotspeedctl get`(或 `ls /proc/sys/net/ipv4/lotspeed/`)。
+
+**高丢包链路怎么设 `loss_thresh`**
+
+`loss_thresh` 的语义是"每轮丢包率低于此值不算拥塞、不退避",所以它恒等于
+**环境丢包率 + 余量**,是一个可直接测量的量,不需要搜索:
+
+```bash
+# 读环境重传占比 (qdisc 侧 1s 滚动窗, 0-100)
+grep -o 'ambient_share=[0-9]*' /proc/net/neoq_ml
+
+# loss_thresh = clamp(ambient + 4, 4, 20)
+lotspeedctl set loss_thresh 20        # 例: ambient 实测 18-20% 的洲际链路
+```
+
+设低了(比如在 20% 丢包的链路上留着默认 2)会让 CC 把常态丢包全当拥塞信号持续退避 ——
+这正是 BBR 在这类链路上崩到 7-9 Mbps 的机制。设高了会引发重传风暴(实测 30 就会)。
+要在两个候选值之间做判断,用 `lotspeedctl abtest`,不要靠观测数据相关性 —— 见下。
+
+**`delay_cap_thresh` 的现状**
+
+它在延迟维度上有过正面验证(netem 下 cwnd 封到 ~2055,生产尾延迟 4309→3799ms,
+健康流 p50 227ms 前后无变化),但后来的人工配对 A/B 两轮都是"开了更差",于是
+`lotspeedctl optimize` 现在把它冻结为 **0(关)**。两组证据可能测的不是同一个指标
+(A/B 的 score 是吞吐加权的),**这个冲突尚未裁决**。在乎尾延迟的话自己跑一次:
+`lotspeedctl abtest --param delay_cap_thresh --values 0,50`。
+
 
   ---
 适用场景
@@ -417,7 +460,10 @@ lotspeedctl enable eth0    # 切 CC=lotspeed + 给 eth0 挂 neoq
 | `probe <ip> [port]` | 测量 RTT/BW/loss(MAD 异常值滤波) |
 | `tune <ip> [port]` | probe → model.predict → 写参数(一键调优) |
 | `daemon --iface X` | 抗丢包闭环 + 自动游戏/网页优先级 |
-| `optimize --iface X --target IP` | 自适应寻优:warm-start → EXPLORE → OPTIMIZE,持续 record sample 训练模型 |
+| `optimize --iface X [--shaper]` | 常驻控制器:整形速率反馈环 + `loss_thresh` 机制闭环 + 样本记录。`--legacy-bandit` 回到旧的参数搜索 |
+| `abtest --param P --values A,B` | **交替配对 A/B + 符号检验**,本工具里唯一能对参数下因果判断的路径 |
+| `bandmap --iface X` | 只读取证:把全量 socket(含 lo/docker)连同出接口/RTT 档/累计计数写成 JSONL |
+| `model [show\|clear]` | 查看/清空 KNN 样本库 |
 | `model [show\|clear]` | 查看/清空 KNN 样本库(`~/.lotspeedctl/model.json`) |
 
 ### 动态调参的工作原理
@@ -445,11 +491,18 @@ lotspeedctl enable eth0    # 切 CC=lotspeed + 给 eth0 挂 neoq
 
 `optimize --iface X --target IP` 是收集训练数据的入口:
 
-- **warm-start**:如果 model 已有 sample,先用 `predict` 作为初始参数(避免每次从默认值摸索)
-- **EXPLORE**:几个周期激进抢带宽,记录 `peakBw`/`minRtt`
-- **OPTIMIZE**:coordinate ascent 逐参数 `±step` 探索;score = `bw/peakBw − α·delay_inflation − β·loss`
-- **window-best record**:每 N 个 OPT 周期,把窗口内最高分的 `(feature, params, score)` 持久化到 `model.json`
-- 长跑越久,model 样本越多,后续 warm-start + tune 越准
+- **EXPLORE**:几个周期激进抢带宽,记录 `peakBw`/`minRtt` 作为 score 的参照系
+- **OPTIMIZE**:score = `bw/peakBw − α·delay_inflation − β·loss`,窗口内最高分的
+  `(feature, params, score)` 持久化到 `model.json`,供 `tune` 的 KNN 使用
+- **参照系只在活跃拍推进**:`bw >= 5 Mbps` 才动 `peakBw`/`minRtt`。空闲拍也衰减的话,
+  一台 96.8% 空闲的机器每天 3218 个空闲拍会把 `peakBw` 衰减到 ~1e-7,流量一回来
+  `bw/peakBw` 恰好落在 1.0 —— 那不是好配置,是分母塌了,而它会毒化 `bestKnown` 和样本池
+
+> **参数搜索已退役(2026-08)。** 默认的**机制模式**里 `optimize` 不再做 coordinate ascent:
+> 在 SNR ≈ 1/34 的信号上分辨相邻臂需要每臂约 4600 个样本,而一台机器一天只产出约 106 个
+> 学习拍,不可能收敛。人工 A/B 定下的参数冻结为常数,`loss_thresh` 由可测量的机制闭环
+> 给**建议**(默认不自动写,因为它的输入 `ambient_share` 正是被它自己影响的量),
+> 因果判断交给 `abtest` 的随机化交替。`--legacy-bandit` 可逐字回到旧行为。
 
 **4. 一键调优**
 
@@ -464,6 +517,26 @@ lotspeedctl optimize --iface eth0 --target <client_ip>
 lotspeedctl tune <client_ip> <port>
 lotspeedctl model show          # 查看学到了什么
 ```
+
+**5. 判断一个参数到底有没有用 —— `abtest`**
+
+观测数据上的相关性不足以判断参数效果:控制器自己在调参,链路自己在漂移,而很多参数
+(最典型的是 `loss_thresh`)会影响它自己的输入。要下因果判断,唯一的办法是**随机化**。
+
+```bash
+lotspeedctl abtest --param loss_thresh --values 20,24 --pairs 3 --iface ens3
+```
+
+它交替跑 A/B/A/B…,每对配成一个样本,对配对差做**精确符号检验**:
+
+- 3 对同向 → 单侧 p=0.125;默认 α=0.125,所以 3 对全同向是能过的最小样本量
+- 优势方向是**事后选**的,所以族一类错误率是 2α=0.25 —— 判定看 p 单侧,强度看 p 双侧
+- 未达显著时明确说"未达显著",不会含糊成"两者没差别"
+- 默认**不写入**,加 `--apply` 才采纳胜者
+- 主指标的胜者若在某个次要口径(延迟、丢包)上被显著判负,会给出护栏警告
+
+判决前无条件恢复原值;Ctrl-C / SIGTERM 也会恢复。**SIGKILL 不会** —— 那会把内核停在
+当时那个臂上,直到下次 `optimize` 重新播种。
 
 ### systemd 常驻
 

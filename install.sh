@@ -205,7 +205,6 @@ download_source() {
     # DKMS 由另一个 agent 提供 (dkms.conf 描述包, dkms-install.sh 提供 install_dkms())。
     # 两个都是可选: 拿不到就退回一次性 make 安装。
     fetch dkms.conf 0 || true
-    fetch dkms-install.sh 0 || true
     [[ $WITH_LEGACY_AUTOTUNE -eq 1 ]] && { fetch lotspeed-autotune.sh 0 || true; }
 
     cat > "$INSTALL_DIR/Makefile" << 'MAKEFILE'
@@ -229,20 +228,68 @@ MAKEFILE
 
 # ================= 编译 + 安装模块 =================
 #
-# ---- DKMS 接口约定 (由另一个 agent 实现, 本脚本只负责调用) ----------------
-#   dkms.conf        包描述, 与源码一起放进 $INSTALL_DIR (仓库根目录已有)
-#   dkms-install.sh  被本脚本 source, 需定义:
-#       install_dkms <src_dir>
-#         入参 $1 = 含 lotspeed.c / qdisc_newneo.c / dkms.conf 的目录
-#         行为   = dkms add/build/install, 让模块在内核升级后自动重建
+# ---- DKMS ------------------------------------------------------------------
+# 之前这里是一段"由另一个 agent 提供 dkms-install.sh"的接口约定, 但那个文件从来
+# 没有存在过。`declare -F install_dkms` 于是恒假, DKMS 分支是死代码, 每一次安装都
+# 静默走下面的一次性 make —— 也就是这段代码本来要消灭的那个失效模式。现在就地实现,
+# 不再依赖第二个文件。
 #         返回   = 0 成功 / 非 0 失败
 #   两者任一缺失, 或 install_dkms 返回非 0, 都回退到一次性 make 安装 ——
 #   回退必须存在: 没有 dkms 的机器上装不上比"内核升级后失效"更糟。
+# install_dkms <src_dir> —— 把模块交给 DKMS 管理, 内核升级后自动重建。
+# 返回非 0 时调用方回退到一次性 make (那条路必须留着: 装不上比"内核升级后失效"更糟)。
+install_dkms() {
+    local src="$1" ver="$VERSION" name="lotspeed"
+    local dst="/usr/src/${name}-${ver}"
+
+    if ! command -v dkms >/dev/null 2>&1; then
+        log_info "安装 dkms..."
+        if   command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y dkms >/dev/null 2>&1
+        elif command -v dnf     >/dev/null 2>&1; then dnf install -y dkms >/dev/null 2>&1
+        elif command -v yum     >/dev/null 2>&1; then yum install -y dkms >/dev/null 2>&1
+        fi
+        command -v dkms >/dev/null 2>&1 || { log_warn "dkms 装不上"; return 1; }
+    fi
+
+    # 同版本残留会让 dkms add 直接失败, 先清干净 (--all: 覆盖所有已建内核)
+    dkms remove -m "$name" -v "$ver" --all >/dev/null 2>&1 || true
+    rm -rf "$dst"; mkdir -p "$dst"
+    # 只铺 DKMS 需要的四个文件。整目录拷会把 .ko/.o/Module.symvers 一起带进
+    # /usr/src, dkms 每次重建都从这个目录复制, 陈旧产物会混进构建目录。
+    local f
+    for f in dkms.conf Makefile lotspeed.c qdisc_newneo.c; do
+        [[ -f "$src/$f" ]] || { log_warn "DKMS 源缺 $f"; return 1; }
+        cp "$src/$f" "$dst/"
+    done
+
+    dkms add     -m "$name" -v "$ver" >/dev/null 2>&1 || true   # 已 add 过不算错
+    dkms build   -m "$name" -v "$ver" || { log_warn "dkms build 失败, 见 /var/lib/dkms/$name/$ver/build/make.log"; return 1; }
+    dkms install -m "$name" -v "$ver" --force || { log_warn "dkms install 失败"; return 1; }
+
+    # DKMS 装到 updates/dkms/, 而 depmod 的搜索顺序里 updates 先于 kernel。若
+    # kernel/net/ 下还留着一份手工装的旧 .ko, 它现在被遮住、看不出问题, 但下次
+    # 内核升级 DKMS 只更新 updates/ 那份, 两份就此分叉 —— 而 `modinfo lotspeed`
+    # 仍然只报一个路径, 排查时极难发现。装完就删掉手工副本, 让 DKMS 是唯一真相。
+    rm -f "/lib/modules/$(uname -r)/kernel/net/ipv4/lotspeed.ko" \
+          "/lib/modules/$(uname -r)/kernel/net/sched/sch_neoq.ko" \
+          "/lib/modules/$(uname -r)/extra/lotspeed.ko" \
+          "/lib/modules/$(uname -r)/extra/sch_neoq.ko"
+    depmod -a
+
+    # 装完就地验一次: modprobe 解析到的必须是 DKMS 那份。不验的话, 一个被旧副本
+    # 遮蔽的安装会一路"成功"到用户重启才暴露。
+    local resolved; resolved=$(modinfo -n lotspeed 2>/dev/null)
+    case "$resolved" in
+        */updates/dkms/*) log_info "DKMS: modprobe -> $resolved" ;;
+        "")               log_warn "装完却解析不到 lotspeed 模块"; return 1 ;;
+        *)                log_warn "modprobe 仍解析到 $resolved (非 DKMS 副本)"; return 1 ;;
+    esac
+    return 0
+}
+
 # --------------------------------------------------------------------------
 build_and_install_modules() {
-    # source 进来才会定义 install_dkms; 没有这一步 declare -F 恒假, DKMS 分支就是死代码
-    [[ -f "$INSTALL_DIR/dkms-install.sh" ]] && . "$INSTALL_DIR/dkms-install.sh"
-    if declare -F install_dkms >/dev/null 2>&1 && [[ -f "$INSTALL_DIR/dkms.conf" ]]; then
+    if [[ -f "$INSTALL_DIR/dkms.conf" ]]; then
         log_info "走 DKMS 安装 (内核升级后自动重建)..."
         if install_dkms "$INSTALL_DIR"; then
             log_success "DKMS 安装完成"; return 0
@@ -467,7 +514,12 @@ purge_files(){
     rm -f "$SYSCTL_FILE" /etc/modules-load.d/lotspeed.conf /etc/lotspeed.conf /usr/local/bin/lotspeed-autotune
     rm -f /var/log/lotspeed-autotune.log /var/log/lotspeed_install.log /var/run/lotspeed-autotune.pid
     rm -rf "$INSTALL_DIR" /etc/lotspeed
+    # DKMS 注册必须先摘: 只删 .ko 的话 /var/lib/dkms 里的记录还在, 下次内核升级
+    # postinst hook 仍会去重建一个已经卸载的包。--all 覆盖所有已建内核。
+    dkms remove -m lotspeed -v 2.2 --all >/dev/null 2>&1 || true
+    rm -rf /usr/src/lotspeed-2.2
     rm -f /lib/modules/*/kernel/net/{ipv4/lotspeed.ko,sched/sch_neoq.ko} /lib/modules/*/extra/{lotspeed,sch_neoq}.ko
+    rm -f /lib/modules/*/updates/dkms/{lotspeed,sch_neoq}.ko
     depmod -a 2>/dev/null || true
     # 重载剩余 sysctl.d。已生效的值要到重启才回到发行版默认, 这无害。
     sysctl --system >/dev/null 2>&1 || true

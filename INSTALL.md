@@ -66,19 +66,46 @@ journalctl -u lotspeedctl@ens3 -f
 下没有这两个 `.ko`, modprobe 静默失败, CC 回落到 bbr/cubic, qdisc 回落到 fq_codel。**
 无人值守安全更新会让这件事在没有任何人操作的深夜发生, 用户看到的只是"加速某天突然没了"。
 
-仓库根目录的 `dkms.conf` 把"每装一个新内核就重编一次"接到内核包 postinst 上:
+仓库根目录的 `dkms.conf` 把"每装一个新内核就重编一次"接到内核包 postinst 上。
+
+**`install.sh` 会自动做这件事** —— 它调用内建的 `install_dkms()`,失败才回退到一次性
+`make`。手工步骤只在补救或从旧部署迁移时需要:
 
 ```bash
 sudo apt-get install -y dkms                       # 或 yum install dkms
-sudo cp -r /opt/lotspeed /usr/src/lotspeed-2.2     # 目录名必须是 <名>-<版本>
-sudo dkms add    -m lotspeed -v 2.2
-sudo dkms build  -m lotspeed -v 2.2
+
+# 只铺这四个文件。不要 cp -r 整个目录: 那会把 .ko/.o/Module.symvers 一起带进
+# /usr/src, 而 dkms 每次重建都从这里复制, 陈旧产物会混进构建目录。
+sudo mkdir -p /usr/src/lotspeed-2.2                # 目录名必须是 <名>-<版本>
+sudo cp dkms.conf Makefile lotspeed.c qdisc_newneo.c /usr/src/lotspeed-2.2/
+
+sudo dkms add     -m lotspeed -v 2.2
+sudo dkms build   -m lotspeed -v 2.2
 sudo dkms install -m lotspeed -v 2.2
 dkms status                                        # lotspeed/2.2, <kver>, x86_64: installed
 ```
 
 `/usr/src/lotspeed-2.2` 里的 `PACKAGE_VERSION` 必须与目录名后缀、与 `install.sh` 顶部的
 `VERSION=` 三者一致。
+
+**装完必须删掉手工副本并复验解析路径:**
+
+```bash
+sudo rm -f /lib/modules/$(uname -r)/kernel/net/ipv4/lotspeed.ko \
+           /lib/modules/$(uname -r)/kernel/net/sched/sch_neoq.ko \
+           /lib/modules/$(uname -r)/extra/{lotspeed,sch_neoq}.ko
+sudo depmod -a
+modinfo -n lotspeed        # 必须落在 .../updates/dkms/lotspeed.ko
+```
+
+DKMS 装进 `updates/dkms/`,而 `depmod` 的搜索顺序里 `updates` 先于 `kernel`。所以一份
+留在 `kernel/net/` 的旧 `.ko` **不会立刻报错,它只是被遮住**——直到下一次内核升级,
+DKMS 只更新 `updates/` 那份,两份就此分叉。而 `modinfo lotspeed` 始终只报一个路径,
+排查时极难发现。这是本项目实际踩过的坑。
+
+卸载时 `lotspeed uninstall` 会连 DKMS 注册一起摘掉(`dkms remove --all` + 删
+`/usr/src/lotspeed-2.2`)。只删 `.ko` 是不够的:`/var/lib/dkms` 里的记录还在,下次内核
+升级 postinst hook 仍会去重建一个已经卸载的包。
 
 > 一个 DKMS 包带两个模块。注意 `BUILT_MODULE_NAME[1]="sch_neoq"` —— **源文件叫
 > `qdisc_newneo.c`, 产物叫 `sch_neoq.ko`** (Makefile 里 `sch_neoq-objs := qdisc_newneo.o`

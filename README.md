@@ -61,9 +61,16 @@ sudo systemctl enable --now lotspeedctl@ens3   # 网卡名见 /etc/lotspeed/env
 lotspeedctl status
 ```
 
-**接 DKMS(近乎必选)。** 不接的话内核一升级 `.ko` 就不匹配了,重启后 CC 静默回落到
-内建算法,而 `lotspeedctl` 会一直重试。仓库带了 `dkms.conf`,见
-[INSTALL.md §2.1](INSTALL.md)。也要确认模块真的进了 `modules.dep`:
+**DKMS 已由 `install.sh` 自动接好**(内建 `install_dkms()`,装不上才回退到一次性
+`make`)。这一步近乎必选:不接的话内核一升级 `.ko` 就不匹配了,重启后 CC 静默回落到
+内建算法。确认它生效:
+
+```bash
+dkms status                 # lotspeed/2.2, <kver>, x86_64: installed
+```
+
+手工部署的机器要自己补,见 [INSTALL.md §2.1](INSTALL.md)。无论哪种方式,都要确认
+`modprobe` 解析到的就是运行中的那份:
 
 ```bash
 modinfo -F srcversion lotspeed          # 应与 cat /sys/module/lotspeed/srcversion 一致

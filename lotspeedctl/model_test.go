@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // hist_min_cwnd_bound is emitted ONLY by heuristicPlan, never by optimizer
 // samples — its presence in predict() output therefore means the heuristic
@@ -104,5 +108,39 @@ func TestHeuristicPlanLossAware(t *testing.T) {
 		if got := p["loss_thresh"]; got != c.wantThresh {
 			t.Errorf("%s: loss_thresh=%d want %d", c.name, got, c.wantThresh)
 		}
+	}
+}
+
+// TestModelPathNeverRelative 钉住一条: modelPath 在任何环境下都必须是绝对路径。
+//
+// 回归来源: systemd 服务没有 User= 时 $HOME 未设, 旧实现 `d, _ := os.UserHomeDir()`
+// 忽略错误后得到相对路径, 样本库于是落在 WorkingDirectory 下 (systemd 默认 /)。
+// 服务写 /.lotspeedctl/model.json, 人读 ~/.lotspeedctl/model.json, 两边永远看不见
+// 对方, 且不报错。
+func TestModelPathNeverRelative(t *testing.T) {
+	orig, had := os.LookupEnv("HOME")
+	t.Cleanup(func() {
+		if had {
+			os.Setenv("HOME", orig)
+		} else {
+			os.Unsetenv("HOME")
+		}
+	})
+
+	for _, tc := range []struct{ name, home string }{
+		{"HOME 正常", "/root"},
+		{"HOME 为空", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.home == "" {
+				os.Unsetenv("HOME")
+			} else {
+				os.Setenv("HOME", tc.home)
+			}
+			p := modelPath()
+			if !filepath.IsAbs(p) {
+				t.Fatalf("modelPath()=%q 不是绝对路径 —— 样本库会跟着 cwd 走", p)
+			}
+		})
 	}
 }

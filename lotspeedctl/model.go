@@ -121,10 +121,28 @@ func modelShaperCacheSet(key string, kbps float64) {
 	})
 }
 
+// modelPath 返回样本库位置。
+//
+// ★ 必须处理 UserHomeDir 失败: 它读的是 $HOME, 而 systemd 服务在没有 User= 时
+// **不设 $HOME**。原来忽略了错误, d 为空, filepath.Join("", ".lotspeedctl", …)
+// 得到相对路径 ".lotspeedctl/model.json" —— 相对于 WorkingDirectory, 而 systemd
+// 的默认 WorkingDirectory 是 /。生产上的实际后果: 服务把样本写进
+// /.lotspeedctl/model.json, 而运维在 shell 里 (有 $HOME) 跑 `model show` 读的是
+// /root/.lotspeedctl/model.json —— 一个不存在的文件, 报 "samples: 0"。
+// "服务学到的" 和 "人看到的" 成了两份, 且没有任何报错。
+//
+// 退化成相对路径是这里最坏的失效: 它让样本库跟着 cwd 走, 同一台机器上换个目录
+// 启动就换一个库。所以 $HOME 拿不到时用一个确定的系统路径, 而不是相对路径。
 func modelPath() string {
-	d, _ := os.UserHomeDir()
-	return filepath.Join(d, ".lotspeedctl", "model.json")
+	if d, err := os.UserHomeDir(); err == nil && d != "" {
+		return filepath.Join(d, ".lotspeedctl", "model.json")
+	}
+	return filepath.Join(modelFallbackDir, "model.json")
 }
+
+// modelFallbackDir: $HOME 不可用时的确定位置。选 /var/lib 是因为它就是 FHS 里
+// "程序自己维护的持久状态" 该待的地方, 且不依赖 cwd。
+const modelFallbackDir = "/var/lib/lotspeedctl"
 
 func loadModel() *model {
 	m := &model{}

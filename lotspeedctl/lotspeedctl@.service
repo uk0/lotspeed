@@ -16,6 +16,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# systemd 在没有 User= 时不设 $HOME。lotspeedctl 用 os.UserHomeDir() 定位样本库
+# (~/.lotspeedctl/model.json), $HOME 缺失时它只能退到 /var/lib/lotspeedctl —— 那份
+# 库运维在 shell 里 `lotspeedctl model show` 是看不到的 (那边有 $HOME, 读 ~/)。
+# 显式给出 HOME, 让服务和人读同一个文件。
+Environment=HOME=/root
 ExecStartPre=/usr/local/bin/lotspeedctl enable %i
 # --shaper 打开 2s 的整形速率反馈环 (measurement-driven probe-and-hold,
 # 写 /proc/net/neoq_rate)。

@@ -17,7 +17,7 @@ ccflags-y := -std=gnu99 -DCONFIG_NET_SCH_DEFAULT \
 all:
 	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
 
-clean: clean-dkms.conf clean-dkms-tarball
+clean: clean-dkms-tarball
 	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
 
 load:
@@ -49,15 +49,13 @@ neoq-status:
 	@echo "=== Stats ==="
 	@cat /proc/net/neoq 2>/dev/null || echo "/proc/net/neoq not available"
 
-.PHONY: dkms-tarball clean-dkms-tarball clean-dkms.conf
+.PHONY: dkms-tarball clean-dkms-tarball
 
-.always.make:
-
-dkms.conf: ./scripts/mkdkmsconf.sh .always-make
-	./scripts/mkdkmsconf.sh > dkms.conf
-
-clean-dkms.conf:
-	$(RM) dkms.conf
+# dkms.conf 现在是**提交在仓库里的静态文件**, 不再生成。
+# 原来这里有一条 `dkms.conf: ./scripts/mkdkmsconf.sh` 的生成规则, 但那个脚本
+# 从来不存在 (scripts/ 目录在 git 历史里也没出现过) —— 规则一直是坏的, 而
+# `clean:` 依赖的 clean-dkms.conf 会把文件删掉。两者合起来的后果是: DKMS 打包
+# 路径不可用, 且任何人跑一次 make clean 就会丢掉手写的 dkms.conf。
 
 $(DKMS_TARBALL): dkms.conf Makefile lotspeed.c qdisc_newneo.c
 	$(TAR) zcf $(DKMS_TARBALL) \

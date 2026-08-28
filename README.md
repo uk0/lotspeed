@@ -467,25 +467,23 @@ lotspeedctl model show          # 查看学到了什么
 
 ### systemd 常驻
 
-```ini
-# /etc/systemd/system/lotspeedctl.service
-[Unit]
-Description=LotSpeed adaptive accelerator
-After=network-online.target
-
-[Service]
-ExecStartPre=/usr/local/bin/lotspeedctl enable eth0
-ExecStart=/usr/local/bin/lotspeedctl optimize --iface eth0 --target <peer_ip> --interval 5
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-```
+安装器会装好模板单元 `lotspeedctl@.service` 并检测网卡,直接按网卡名启用即可:
 
 ```bash
-systemctl enable --now lotspeedctl
+systemctl enable --now lotspeedctl@ens3     # 网卡名由 install.sh 写在 /etc/lotspeed/env
 ```
+
+模板单元见 `lotspeedctl/lotspeedctl@.service`。**不要手写一份**——里面有一条
+必须原样保留的护栏:
+
+```ini
+ExecStopPost=/bin/sh -c 'echo 0 > /proc/net/neoq_rate || true'
+```
+
+它是四层护栏的最外层:无论进程是正常退出、崩溃还是被 kill,都把整形速率写回 0。
+内核默认 `rate=0` 等于完全不整形,所以"控制器不在"退化成今天的行为,而不是
+"卡在最后一个速率上把链路勒死"。这是唯一一条不依赖控制器自身还活着的失效路径,
+早期文档里那份手写单元恰恰缺了它。
 
 ### NeoQ 配套接口(运行时可调)
 

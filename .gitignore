@@ -59,7 +59,6 @@ tapv2
 modules.order
 Module.symvers
 Mkfile.old
-dkms.conf
 
 ### C++ ###
 # Prerequisites
@@ -263,7 +262,8 @@ $RECYCLE.BIN/
 
 # End of https://www.toptal.com/developers/gitignore/api/windows,linux,macos,visualstudiocode,clion+all,c++,c
 
-/dkms.conf
+# dkms.conf 现在是提交的静态文件 (见 Makefile 里的说明), 不再被生成 —— 必须进 git,
+# 否则 curl|bash 的一键安装路径拉不到它, DKMS 分支在远程安装时永远是死代码。
 /dkms.tar.gz
 
 # Go build output

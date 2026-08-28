@@ -1,0 +1,46 @@
+# 模板 unit: %i = 网卡名。启用方式 `systemctl enable --now lotspeedctl@ens3`。
+#
+# 为什么是模板而不是固定 unit: 上一版把 iface 写死成 eth0, 而目标机器的网卡叫
+# ens3 (systemd 可预测命名下 eth0 几乎不存在)。写死的后果不是启动失败, 而是
+# `lotspeedctl enable eth0` 报错退出 -> Restart=always 无限重启, 加速从未生效,
+# 而 journal 里每 3 秒刷一条同样的错。把网卡提升成实例名, 部署时才是显式选择。
+[Unit]
+Description=LotSpeed adaptive shaper/tuner on %i
+Documentation=https://github.com/uk0/lotspeed
+# 只做**排序**不做依赖: 网卡设备单元存在时就等它, 不存在时 (veth / 隧道口 / 某些
+# 虚拟设备没有 .device 单元) 也照常启动。刻意不用 BindsTo/Requires —— 那是
+# fail-closed, 会让一个本来能工作的接口起不来, 与本项目整条链路的 fail-open 纪律
+# 相反 (见 ExecStopPost 的护栏说明)。
+After=network-online.target sys-subsystem-net-devices-%i.device
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/lotspeedctl enable %i
+# --shaper 打开 2s 的整形速率反馈环 (measurement-driven probe-and-hold,
+# 写 /proc/net/neoq_rate)。
+#
+# 刻意**不**写 --shaper-max-mbps。R_max 只有一个职责: 永远存在一条"退回今天行为"
+# 的路 (R=R_max 等价于不整形)。读不到网卡线速时控制器已经兜底到 10Gbps 这个策略
+# 常数并打 WARNING, 方向是 fail-open; 而在这里拍脑袋写死一个偏低的上限是
+# fail-closed —— 会把链路真的勒到那个数, 比读不到更糟。
+#
+# 什么时候该加它: 只在你**确知**真实上行速率时。
+#   - 裸金属 / e1000 等物理网卡: /sys/class/net/%i/speed 直接给出真线速, 控制器
+#     自动读到, 不需要加。
+#   - virtio (本机 ens3 就是) 该文件是 -1 / "Unknown!", 启动日志里会出现
+#     `WARNING: ... reports no line rate (virtual NIC)`。此时若 VPS 的合同上行
+#     带宽是确定值 (且实测能跑到), 再把它作为 --shaper-max-mbps 传进来, util /
+#     R_max 这一类相对判据才重新有物理意义。拿不准就别加。
+ExecStart=/usr/local/bin/lotspeedctl optimize --iface %i --shaper --interval 5
+# 护栏 4 (最外层的兜底): 无论进程是正常退出、崩溃还是被 kill, 都把整形速率写回 0。
+# 内核默认 rate=0 = 完全无整形, 所以"控制器不在" 等价于"今天的行为", 而不是"卡在
+# 最后一个速率上把链路勒死"。这是唯一一条不依赖控制器自身还活着的失效路径, 所以
+# 它必须留在 systemd 这一层, 进程内的信号处理只是它的补充。
+# `|| true` 保证 qdisc 已经被卸掉 (proc 文件不存在) 时不影响停止流程。
+ExecStopPost=/bin/sh -c 'echo 0 > /proc/net/neoq_rate || true'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -26,6 +26,12 @@ type metrics struct {
 	t0DeltaPkts    uint64  // Express pkts THIS window (from a t0_pkts delta) — activity gate
 	t3GoodputDelta uint64  // Bulk bytes THIS window (from a t3_bytes delta)
 	bulkFlows      uint64  // concurrent bulk flows (mixed-workload gate for neoq_sparse_thresh)
+
+	// ambientPct 是 qdisc 侧导出的 ambient_share (上一完整 1s 窗口的全链路重传占比,
+	// 百分数 0-100) —— loss_thresh 闭环的首选环境丢包锚点。ambientOK=false 表示内核
+	// 没导出这个键 (老模块), 闭环退回用 lossPct (ss/snmp 差分) 估。
+	ambientPct float64
+	ambientOK  bool
 }
 
 // tunable parameter with a safe range.
@@ -122,6 +128,33 @@ type optimizer struct {
 	// them absorb exploration credit — the neoq_boost lesson. Unlike frozen this is
 	// transient: re-checked every cycle, never persisted.
 	mixedWorkload bool
+
+	// lt 是 loss_thresh 的机制闭环状态 (见 lossThreshLoop)。只在 coord 机制模式下
+	// 驱动: --legacy-bandit 下 loss_thresh 回到 tun 表当臂, 闭环整个停用 —— 一个
+	// 参数绝不允许有两个写者。
+	lt lossThreshLoop
+
+	// legacyBandit: --legacy-bandit 一键回到旧行为 (tun 表恢复、坐标上升照跑),
+	// 整期可回退。为 false 时 tun 表在 coord 模式下是空的, 主循环退化为
+	// "测量 -> 驱动机制 (applyCodel / loss_thresh 闭环) -> 记录遥测样本"。
+	legacyBandit bool
+	// ltAuto: 允许 loss_thresh 闭环**真的写** sysctl。默认 false —— 闭环照常测量、
+	// 报告、打日志, 但只给建议。
+	//
+	// 为什么: ambient (无论取 qdisc 的 ambient_share 还是 ss/snmp 差分) 都是**重传
+	// 占比**, 而 loss_thresh 正是决定 CC 遇到丢包退不退避的那个旋钮。抬高 lt -> 少
+	// 退避 -> 发得更快 -> 重传占比上升 -> 公式据此给出更高的 lt。回归量与误差项相关,
+	// 参数在观测数据上不可识别。实测棘轮: 真实 ambient 8% (正确答案 lt=12), 自致
+	// 系数只要 >= 0.2pp / 单位 lt 就会越过正确答案, >= 0.5pp 直接钉死在 lossThreshMax。
+	//
+	// 两条防线都挡不住: nonBinding() 的 util 判据在本机恒真 (unit 不传
+	// --shaper-max-mbps, R_max 兜底 10Gbps, 满载 100Mbps 时 util=0.01), 退化成只剩
+	// eRemote 一个条件, 而 policer 型瓶颈丢包时**不堆驻留队列**; P25 只滤突发, 而
+	// 自致污染是每拍恒定的。
+	//
+	// 打破内生性需要外生变异, 也就是随机化。abtest 的交替 A/B 就是那个实验 ——
+	// 因果推断放在唯一能做对的地方, 闭环负责它做得对的那部分: 测量与检测。
+	ltAuto bool
 }
 
 // neoqOnly reports whether a tunable only makes sense under a mixed (bulk +
@@ -193,7 +226,364 @@ const (
 	shaperHeadroomParam = "shaper_headroom"
 )
 
-func newOptimizer(iface, target string, interval time.Duration, gamma float64, sh *shaper) *optimizer {
+// === 本轮冻结为常数的参数 ===
+//
+// 逐参数评估结论: 这几个量的"可观测量"根本不在 optimizer 的拍上, 或者它们是护栏
+// 而不是学习对象。把它们钉成常数, 探索预算才不会被没有信噪比的臂吃掉。
+const (
+	// startup_gain: 只作用于流的前 ~10 轮。被动观测长活隧道永远采不到它的效应
+	// (它的可观测量是"新流到满速时间", 只能主动测), 所以钉在最激进档。
+	frozenStartupGain = 400
+	// hd_rho_max: 防 rho^2 过冲重传风暴的**护栏**, 护栏应该是常数不是学习对象;
+	// 且主要作用面在 STARTUP, optimizer 的拍观测不到。
+	frozenHdRhoMax = 400
+	// fast_alpha: 从 tun 表移除。这里保留旧 tun 表的启动值 (30), 行为与今天逐字一致;
+	// 物理推导见 fastAlphaFor —— 那是 HYPOTHESIS 级, netem 台架验证前不接线上。
+	frozenFastAlpha = 30
+	// delay_cap_thresh: 永不进 bandit。人工交替配对 A/B 两轮都是"开了更差", 这条
+	// 证据的优先级高于 UCB 学出来的 50 (内核默认也是 0)。
+	// ★ 行为变更: 旧 tun 表在启动时会写 50, 现在写 0。
+	frozenDelayCapThresh = 0
+	// neoq_sparse_thresh: 冻结在内核默认 2*MTU。混流收益本身在这台机器上未证
+	// (bandmap 判决 A3=0.0%), 现在投入探索预算不合算。
+	frozenNeoqSparseThresh = 3028
+	// shaper_headroom: R = h*C_hat 的前馈项。它想解决的问题 (留多少余量让 E_remote
+	// 不涨) 正是 HOLD trim 环已经在闭环解决的 (按 E_remote 超预算逐步收 R)。反馈在跑
+	// 的时候前馈只需要一个保守常数。setHeadroom 保留给人工运维, 只从 tun 表移除。
+	frozenShaperHeadroom = 0.95
+)
+
+// === loss_thresh 机制闭环 (本轮把它从 bandit 臂改成可测量的机制) ===
+//
+// 物理锚点: K1 门控的语义就是"每轮丢包率低于 loss_thresh 不算拥塞、不退避", 所以
+// loss_thresh 恒等于 环境丢包率 + 余量 —— 一个可直接测量的量, 不需要学。公式本体在
+// model.go 的 lossThreshFor, 与 heuristicPlan 冷启动共用同一份边界。
+//
+// ★ ambient 的自指风险 (这条最关键): 朴素做法是直接用当拍测到的 loss, 但那会形成
+// 正反馈棘轮 —— thresh↑ -> CC 更激进 -> 自致丢包↑ -> 测得 loss↑ -> thresh↑ ...
+// 两条防线都上, 因为任何一条单独都有覆盖不到的情形:
+//
+// (a) 非绑定窗口筛选 (shaper.nonBinding): 只采 util<utilBind 且 E_remote 不超预算的
+// 拍 —— 那种拍的丢包 by construction 不是我造成的。这是最强的一条, 但只有快环真的在
+// 跑才判得了 (生产的 systemd unit 带 --shaper, 所以线上有它)。
+//
+// (b) 活跃拍读数的滚动 P25 (下四分位近似环境底) 而不是均值。它不依赖快环, 是
+// --shaper 关闭时唯一的防线; 自致丢包是突发的、集中在推得最狠的那几拍上, 所以下
+// 四分位比均值更接近"路本身有多脏"。
+//
+// 单靠 (b), 在"长时间满载、每拍都绑定"的情形下 P25 会跟着自致丢包一起抬 —— 那正是
+// (a) 覆盖的洞; 单靠 (a), 快环关闭时完全失效 —— 那正是 (b) 覆盖的洞。最后还有一道
+// 死兜底: lossThreshMax 把棘轮的终点封在 20。
+const (
+	// ambientRingLen 是 ambient 采样环的长度 (只数被采纳的活跃拍)。P25 要有分位数的
+	// 意义就得有足够样本, 又不能长到跟不上小时级摆动 (实测 90 分钟内 ambient 从
+	// 10.4% 漂到 18.2%, 近一倍)。
+	ambientRingLen = 40
+	// ambientMinSamples: 环里少于这么多样本时 P25 不可信, 闭环一律不动 loss_thresh
+	// (保持冷启动种子值)。
+	ambientMinSamples = 8
+	// ambientP25 = 下四分位, 见上面的防法 (b)。
+	ambientP25 = 0.25
+	// ambientHalfLife: ambient EWMA 的半衰期。5-10 分钟这个量级是实测定的 —— 短于
+	// 5 分钟跟着单窗噪声抖, 长于 10 分钟跟不上小时级摆动。取 7.5 分钟。
+	// ★ 它的时间轴是**活跃拍折算**出来的, 不是墙钟: 每个活跃拍推进 o.interval,
+	//   idle 拍一拍都不推进 (D1 纪律, 见 lossThreshLoop.step)。settle 让真实拍长略大
+	//   于 interval, 所以有效半衰期比标称还长一点 —— 保守方向, 可以接受。
+	ambientHalfLife = 450 * time.Second
+	// ambientApplyInterval: 写 sysctl 的节流下限 (同样按活跃拍折算)。
+	ambientApplyInterval = 5 * time.Minute
+	// ambientHysteresis: 迟滞。|新值 - 在用值| >= 2 才真的写下去, 否则 ±1 的抖动会让
+	// sysctl 每 5 分钟翻一次。硬边界 (lossThreshMin/Max) 上有一个例外, 见 step。
+	ambientHysteresis = 2
+)
+
+// lossThreshLoop 是 loss_thresh 机制闭环的全部状态。
+//
+// ★ D1 纪律 (务必保持): 无流量窗口既不更新、也不遗忘 —— ring / ewma / 节流计时器
+// 全部只在活跃拍推进。green1 有 96.8% 的拍是 idle 或被 shaper 冻结, idle 拍的 loss
+// 读数是垃圾; 让它进 EWMA 会把 thresh 拖向噪声, 这与我们刚修完的参照系腐蚀
+// (见 advanceRefs) 是同一族的口径污染。
+type lossThreshLoop struct {
+	ring    []float64     // 最近 ambientRingLen 个被采纳的 ambient 读数 (百分数 0-100)
+	ewma    float64       // ring 的 P25 的 EWMA (百分数)
+	primed  bool          // ewma 是否已经有第一份读数
+	elapsed time.Duration // 距上次播报 (写 sysctl 或顶格心跳) 累计的**活跃拍**时长
+	cur     int           // 当前生效的 loss_thresh (由冷启动种子初始化)
+	saturN  int           // 顶格播报次数 (余量被 lossThreshMax 吃掉; 每个节流窗口最多 1 次)
+}
+
+// ltAction 是闭环一拍的产出。write 与 report 必须分开: "值变了" 和 "顶格这件事该让
+// 运维看见" 是两回事 —— 顶格是个**驻留状态**而不是一次性事件, 阈值一旦被 clamp 钉在
+// 20 上就再也不会"变化"了, 只按 write 播报的话运维只能看见一次然后永远失明。
+type ltAction struct {
+	val       int  // 目标 loss_thresh
+	write     bool // 需要写 sysctl (值真的变了)
+	saturated bool // 余量被 lossThreshMax 吃掉
+	report    bool // 有事要打日志 (值变了, 或顶格状态走到了播报节流点)
+}
+
+// step 推进一个活跃拍。调用方必须自己保证这是活跃拍 (D1)。
+//
+//	sample  这一拍的 ambient 读数 (百分数 0-100)
+//	admit   这一拍是否允许进 ambient 环 (防法 (a): 非绑定窗口才算数)
+//	dt      本拍折算的时长 (= optimizer 的 interval)
+//	rttMs   当前路径 RTT, 供 lossThreshFor 的高 RTT 地板用
+func (l *lossThreshLoop) step(sample float64, admit bool, dt time.Duration, rttMs float64) ltAction {
+	// 节流计时器只在活跃拍推进 —— 与 ring/ewma 同一纪律。
+	l.elapsed += dt
+	if admit && sample >= 0 {
+		l.ring = append(l.ring, sample)
+		if len(l.ring) > ambientRingLen {
+			l.ring = l.ring[1:]
+		}
+		p25 := percentile(l.ring, ambientP25)
+		if !l.primed {
+			l.ewma, l.primed = p25, true
+		} else {
+			l.ewma += ewmaAlphaFor(dt, ambientHalfLife) * (p25 - l.ewma)
+		}
+	}
+	if !l.primed || len(l.ring) < ambientMinSamples {
+		return ltAction{}
+	}
+	amb := l.ewma / 100 // lossThreshFor 吃的是 0..1 的分数
+	act := ltAction{val: lossThreshFor(amb, rttMs), saturated: lossThreshSaturated(amb)}
+	if l.elapsed < ambientApplyInterval {
+		return act
+	}
+	changed := act.val != l.cur
+	// 迟滞: |Δ|>=2 才落盘。**硬边界例外**: want 贴到 lossThreshMin/Max 时只要与在用值
+	// 不同就写 —— ambient 是以 2 为步长逼近上限的 (9->11->...->19), 严格的 |Δ|>=2 会
+	// 让 19->20 永远差 1, 阈值被永久钉在顶格前一格, 而"顶格"恰恰是要让人看见的状态。
+	atRail := act.val == lossThreshMin || act.val == lossThreshMax
+	if changed && !atRail && absInt(act.val-l.cur) < ambientHysteresis {
+		// 迟滞挡下的时候**不**重置节流计时器: 节流约束的是"两次写之间至少隔 5 分钟",
+		// 不是"每 5 分钟只判一次"。重置会让 ±1 的抖动把写窗口无限往后推。
+		return act
+	}
+	if !changed && !act.saturated {
+		return act // 值没变也没顶格: 无事可做, 计时器保持, 变化一到就能立刻写
+	}
+	l.elapsed = 0
+	if changed {
+		l.cur = act.val
+		act.write = true
+	}
+	if act.saturated {
+		l.saturN++
+	}
+	act.report = true
+	return act
+}
+
+// ewmaAlphaFor 把半衰期换算成 EWMA 系数: alpha = 1 - 2^(-dt/T_half)。
+func ewmaAlphaFor(dt, halfLife time.Duration) float64 {
+	if halfLife <= 0 || dt <= 0 {
+		return 1
+	}
+	return 1 - math.Pow(2, -dt.Seconds()/halfLife.Seconds())
+}
+
+// ambientSample 给出这一拍的环境丢包读数 (百分数 0-100)。优先用 qdisc 侧导出的
+// ambient_share —— 滚动 1s 窗、只数 >=128B 的包 (纯 ACK 不稀释分母)、排除哈希冲突包,
+// 口径比 ss/snmp 差分干净。内核没导出这个键时退回 lossPct。ok=false = 无可用读数。
+func ambientSample(m metrics) (float64, bool) {
+	if m.nqOK && m.ambientOK {
+		return m.ambientPct, true
+	}
+	if m.lossPct >= 0 {
+		return m.lossPct * 100, true
+	}
+	return 0, false
+}
+
+// applyLossThresh 推进一拍闭环并落 sysctl。返回要打印的日志行 (空串 = 这一拍没有可
+// 报告的动作)。--legacy-bandit 下 loss_thresh 回到 tun 表当臂, 闭环整个停用 —— 一个
+// 参数绝不允许有两个写者。
+//
+// ★ active 的门在这里, 不在调用方: D1 纪律 (无流量窗口既不更新也不遗忘) 是这个机制
+// 自己的不变式, 让它依赖"调用方记得先判一下"就是等着下一个人把它写丢。
+func (o *optimizer) applyLossThresh(m metrics, active bool) string {
+	if o.legacyBandit || !active {
+		return ""
+	}
+	sample, ok := ambientSample(m)
+	if !ok {
+		return ""
+	}
+	// 防法 (a): 只有非绑定窗口的读数才进 ambient 环。快环没跑 / 内核不导出 shaper 键
+	// 时判不了, 这时放行 —— 由防法 (b) 的 P25 独自兜底。
+	admit := true
+	if nb, known := o.sh.nonBinding(); known {
+		admit = nb
+	}
+	act := o.lt.step(sample, admit, o.interval, m.rttMs)
+	if !act.report {
+		return ""
+	}
+	verb := "hold" // 值没变, 这是顶格驻留的心跳
+	if act.write {
+		if o.ltAuto {
+			_ = writeSysctl("loss_thresh", strconv.Itoa(act.val))
+			verb = "->"
+		} else {
+			// 默认只建议。见 optimizer.go 顶部 ltAuto 的说明: ambient 与 loss_thresh
+			// 之间是内生的, 闭环自己写会形成棘轮。
+			verb = "suggest"
+		}
+	}
+	src := "ss-diff"
+	if m.nqOK && m.ambientOK {
+		src = "ambient_share"
+	}
+	line := fmt.Sprintf("LOSS-THRESH %s %d (ambient=%.1f%% src=%s p25ring=%d)",
+		verb, act.val, o.lt.ewma, src, len(o.lt.ring))
+	if act.saturated {
+		// 顶格必须显式可见: 余量被 lossThreshMax 吃掉了。上限是否该提到 24 交给
+		// abtest 裁决, 但运维得先看得见这件事正在发生。
+		line += fmt.Sprintf(" [SATURATED #%d: ambient+%d=%d > cap %d, effective margin +%.1f]",
+			o.lt.saturN, lossThreshMargin,
+			int(math.Round(o.lt.ewma))+lossThreshMargin, lossThreshMax,
+			float64(lossThreshMax)-o.lt.ewma)
+	}
+	return line
+}
+
+// === fast_alpha 的物理推导 (HYPOTHESIS 级, 未接入主循环) ===
+//
+// 物理含义: fast_alpha 是"瓶颈站立队列目标 = alpha 个包"。锚点是排队延迟
+// E = srtt - min_rtt。队列预算沿用 shaper 那份 (eRemoteFloorMs / eRemoteRttFrac,
+// 即 max(30ms, 0.2*min_rtt)) —— 同源, 不另立常数。于是
+//
+//	alpha_target = E_target * bw_pkts_per_s
+//
+// 纠缠点: 内核里 alpha 会被 hybla_gain 乘上去 (ls_fast_cwnd: alpha = alpha*gain/100),
+// 所以推导要把主导档的典型 rho 除出去:
+//
+//	alpha_base = alpha_target / rho_typical,  rho_typical = clamp(min_rtt/50ms, 1, 4)
+//
+// 50ms = 内核的 hd_ref_us; 上限 4 = hd_rho_max/100 (内核 ls_update_rho 把 rho 夹在
+// [1, rho_max], ls_hybla_cwnd_gain 再把 rho^1.5 封在 rho_max)。
+//
+// ★ 已知偏差 (留给台架裁决): 内核真正的乘子是 min(rho^1.5, 4), 不是 rho。两者在
+// min_rtt >= 200ms 时都等于 4 (完全一致), 在 159ms 处是 4 vs 3.18 —— 也就是本函数在
+// 主导档的低端最多高估 alpha 约 1.26x。要不要改成除以 min(rho^1.5, 4), 由 netem 台架
+// 的实测决定, 不在这里凭直觉选边。
+//
+// ★ 状态: HYPOTHESIS。**不接进主循环**, 只有函数 + 表驱动单测。验收条件: netem 台架
+// 上固定 bw/min_rtt/loss, 对比 fastAlphaFor 给出的值与人工扫描出的最优值, 在主导档
+// (min_rtt 159-264ms) 上排队延迟 E 落在预算 ±30% 内、且吞吐不低于扫描最优的 95%。
+// 台架不在本轮范围。
+const (
+	// fastAlphaMSS: 换算包速率用的典型 MSS (与 heuristicPlan 的 BDP 换算同值)。
+	fastAlphaMSS = 1460.0
+	// fastAlphaHdRefMs: 内核 hd_ref_us 的毫秒形式 (rho 的参考 RTT)。
+	fastAlphaHdRefMs = 50.0
+	// fastAlphaRhoMax: rho 的上限, = hd_rho_max/100。
+	fastAlphaRhoMax = 4.0
+	// fastAlphaMin/Max: 输出夹紧区间, 沿用旧 tun 表探索过的范围。
+	fastAlphaMin = 4
+	fastAlphaMax = 40
+)
+
+// fastAlphaFor 由带宽 (Mbps) 和无负载 RTT (ms) 推导 fast_alpha 的写入值。
+// ok=false 表示输入不足以推导 (bw/rtt 非正)。
+func fastAlphaFor(bwMbps, minRttMs float64) (int, bool) {
+	if bwMbps <= 0 || minRttMs <= 0 {
+		return 0, false
+	}
+	// 队列预算 (秒)。常量与 shaper 的 HOLD trim 环同源。
+	eTargetSec := math.Max(eRemoteFloorMs, eRemoteRttFrac*minRttMs) / 1000
+	pktsPerSec := bwMbps * 1e6 / 8 / fastAlphaMSS
+	alphaTarget := eTargetSec * pktsPerSec
+	rhoTypical := clampF(minRttMs/fastAlphaHdRefMs, 1, fastAlphaRhoMax)
+	return clampInt(int(math.Round(alphaTarget/rhoTypical)), fastAlphaMin, fastAlphaMax), true
+}
+
+// legacyTunables 是 --legacy-bandit 下恢复的 tun 表 —— 逐字保留本轮之前的内容, 使那
+// 个开关是一次真正的整期回退, 而不是一个"看起来像旧行为"的近似。
+func legacyTunables() []tunable {
+	return []tunable{
+		{"startup_gain", "", 200, 400, 20, 400},
+		{"fast_alpha", "", 4, 40, 4, 30},
+		// loss_thresh 2..24 default 4: on a ~10%-ambient-loss link the per-link
+		// optimum sits ~12-16 and was pressing the old max=16 ceiling, so the
+		// range is widened to 24 (lt=30 still caused retrans storms; 24 gives
+		// headroom above the 10%-ambient optimum without reaching that zone).
+		// Start tight (4) — the per-link optimum is found by stepping up.
+		{"loss_thresh", "", 2, 24, 2, 4},
+		// hd_rho_max kept high (250..400): full Hybla high-delay rho keeps
+		// high-RTT cwnd ramping aggressively. (Was observed stuck at 0 = boost off.)
+		{"hd_rho_max", "", 250, 400, 25, 400},
+		// neoq_sparse_thresh: CAKE-style sparse-gate byte threshold per 100ms
+		// window; the window stays fixed at 100000us. See apply() for the write
+		// format ("100000 <bytes>"). The 6 stepped arms cover 0.24-9.9 Mbps, which
+		// is where the real sparse/bulk boundary lives (a 2MB web page burst must
+		// stay Express; a sustained download must demote to Bulk). cur=3028 =
+		// 2*MTU = the kernel default.
+		{"neoq_sparse_thresh", neoqSparseProc, 3028, 123448, 24084, 3028},
+		// delay_cap_thresh: 延迟门控封顶阈值 (%): srtt > min_rtt*(100+x)% 时把
+		// cwnd 封到 BDP*1.25。30..80 的理由: 低于 30 会被正常 RTT 抖动误触发
+		// (实测这条路 minRtt 159ms / 均值 468ms, 抖动本身就有 2-3x); 高于 80
+		// 在同一条路上几乎等于不封顶。
+		{"delay_cap_thresh", "", 30, 80, 10, 50},
+	}
+}
+
+// applyFrozenConstants 写下本轮从 tun 表移除、转成常数的那几个参数。这里是它们唯一
+// 的写入点 (loss_thresh 除外 —— 它之后由 lossThreshLoop 接管), 读者查"这些参数去哪
+// 了"只需要看这一个函数。--legacy-bandit 下不调用: 那时它们仍是 tun 表的臂。
+func (o *optimizer) applyFrozenConstants() {
+	_ = writeSysctl("startup_gain", strconv.Itoa(frozenStartupGain))
+	_ = writeSysctl("hd_rho_max", strconv.Itoa(frozenHdRhoMax))
+	_ = writeSysctl("fast_alpha", strconv.Itoa(frozenFastAlpha))
+	_ = writeSysctl("delay_cap_thresh", strconv.Itoa(frozenDelayCapThresh))
+	// Sparse gate 的写入格式是 "<window_us> <thresh_bytes>" (内核 sscanf "%u %u"),
+	// 与 apply() 里那一支保持一致。
+	_ = os.WriteFile(neoqSparseProc,
+		[]byte("100000 "+strconv.Itoa(frozenNeoqSparseThresh)), 0o644)
+	o.sh.setHeadroom(frozenShaperHeadroom) // nil-safe
+	// loss_thresh 的冷启动种子: **读当前内核值**, 不写。
+	//
+	// 早先这里用 lossThreshFor(0,0)=4 无条件覆盖, 那等于每次进程启动都断言"链路是
+	// 干净的"。配合 unit 的 Restart=always, 任何一次崩溃都会把一条 18% ambient 的
+	// 洲际链路打回 lt=4 —— 那正是 CC 退化成 bbr 的状态, 也就是这个参数存在的全部
+	// 理由。旧 tun 表里 loss_thresh 是有 warm-start 的 (predict() 能恢复), 机制模式
+	// 下 tun 表为空, 那条恢复路径消失了, 所以必须在这里补回来。
+	//
+	// 读不到 (模块没加载 / procfs 不可见) 才退到公式, 保持旧行为。
+	seed := lossThreshFor(0, 0)
+	if cur, err := readSysctl("loss_thresh"); err == nil {
+		if v, err2 := strconv.Atoi(strings.TrimSpace(cur)); err2 == nil && v > 0 {
+			seed = v
+		}
+	}
+	o.lt.cur = seed
+}
+
+// paramsSnapshot 返回"这一拍真正生效的配置", 用于遥测样本。
+//
+// ★ 为什么不能直接遍历 tun 表: 机制模式下 tun 表是空的, 样本会带着空 params 进
+// model.json —— `model show` 看不到东西, KNN predict 平均出空配置, cmdTune 于是一个
+// 参数都不写。样本记的必须是"什么配置产生了这个分数", 而不是"优化器还在动哪几个
+// 旋钮"。
+func (o *optimizer) paramsSnapshot() paramSet {
+	p := paramSet{}
+	for i := range o.tun {
+		p[o.tun[i].name] = o.tun[i].cur
+	}
+	if o.legacyBandit {
+		return p
+	}
+	p["loss_thresh"] = o.lt.cur
+	p["startup_gain"] = frozenStartupGain
+	p["hd_rho_max"] = frozenHdRhoMax
+	p["fast_alpha"] = frozenFastAlpha
+	p["delay_cap_thresh"] = frozenDelayCapThresh
+	return p
+}
+
+func newOptimizer(iface, target string, interval time.Duration, gamma float64, sh *shaper, legacyBandit bool) *optimizer {
 	o := &optimizer{
 		// beta=1.0 (goodput-accurate): the score measures wire throughput (iface
 		// tx+rx, which includes retransmits). beta*loss discounts that by the
@@ -203,58 +593,27 @@ func newOptimizer(iface, target string, interval time.Duration, gamma float64, s
 		// (+186% vs bbr; bbr collapses to 2M on loss spikes, aggressive holds 36-87M).
 		iface: iface, target: target, interval: interval, alpha: 0.5, beta: 1.0, gamma: gamma, sh: sh,
 		dir: 1, phase: "EXPLORE", bestScore: -1e9,
-		probedTi: -1, frozen: map[string]bool{},
-		tun: []tunable{
-			{"startup_gain", "", 200, 400, 20, 400},
-			{"fast_alpha", "", 4, 40, 4, 30},
-			// loss_thresh 2..24 default 4: on a ~10%-ambient-loss link the per-link
-			// optimum sits ~12-16 and was pressing the old max=16 ceiling, so the
-			// range is widened to 24 (lt=30 still caused retrans storms; 24 gives
-			// headroom above the 10%-ambient optimum without reaching that zone).
-			// Start tight (4) — the per-link optimum is found by stepping up.
-			{"loss_thresh", "", 2, 24, 2, 4},
-			// hd_rho_max kept high (250..400): full Hybla high-delay rho keeps
-			// high-RTT cwnd ramping aggressively. (Was observed stuck at 0 = boost off.)
-			{"hd_rho_max", "", 250, 400, 25, 400},
-			// neoq_sparse_thresh: CAKE-style sparse-gate byte threshold per 100ms
-			// window; the window stays fixed at 100000us. A flow under this many
-			// bytes/window stays "sparse" (Express-eligible); above it it's demoted to
-			// bulk. Written as "100000 <bytes>" (see apply()). bytes/100ms map to a
-			// rate as bytes*8/0.1/1e6 Mbps = bytes*80/1e6, so the 6 stepped arms
-			// {3028,27112,51196,75280,99364,123448} cover {0.24, 2.2, 4.1, 6.0, 7.9,
-			// 9.9} Mbps. RANGE RATIONALE: the real sparse/bulk boundary is between a
-			// "web page burst" (a 2MB page loading at 5-20 Mbps for 1-2s — must stay
-			// Express/fast) and a "sustained download" (50+ Mbps for minutes — must
-			// demote to Bulk), which sits in the 1-10 Mbps band. The old max of
-			// 12112B/100ms (~0.97 Mbps) topped out an order of magnitude below that
-			// boundary, so the optimizer could never explore where the answer lives.
-			// (max-min) is an exact multiple of step (120420/24084=5) so the top arm
-			// lands exactly at 123448. cur=3028 = 2*MTU = the kernel default
-			// (conservative start). ANTI-NOISE: this arm is only SELECTED for probing
-			// when the cycle shows a genuinely mixed workload (see nextTi +
-			// mixedWorkload) — on single-flow/idle traffic it's a no-op and would
-			// otherwise absorb exploration credit (the neoq_boost lesson).
-			{"neoq_sparse_thresh", neoqSparseProc, 3028, 123448, 24084, 3028},
-			// delay_cap_thresh: 延迟门控封顶阈值 (%): srtt > min_rtt*(100+x)% 时把
-			// cwnd 封到 BDP*1.25。30..80 的理由: 低于 30 会被正常 RTT 抖动误触发
-			// (实测这条路 minRtt 159ms / 均值 468ms, 抖动本身就有 2-3x); 高于 80
-			// 在同一条路上几乎等于不封顶。cur=50 = 目前生产上跑的值。
-			// 这是慢层臂而不是快环量: 它是策略阈值, 效应以分钟计, 正好适合 bandit。
-			{"delay_cap_thresh", "", 30, 80, 10, 50},
-			// NOTE: neoq_boost was REMOVED from the tun list (B4) — it is a no-op on
-			// single-flow traffic (it only reshapes the downstream rwnd across
-			// concurrent flows) so probing it (~28% of the old exploration budget)
-			// just added noise. The sysctl/proc writer (cmdBoost in prio.go,
-			// neoqBoostProc) is kept; reintroduce this arm here if/when a
-			// multi-flow optimization mode is added.
-		},
+		probedTi: -1, frozen: map[string]bool{}, legacyBandit: legacyBandit,
 	}
-	// shaper_headroom 只在 --shaper 打开时才进轮转: 快环没跑的时候它连接收方都没有,
-	// 留在列表里只会白白吃掉探索预算 (neoq_boost 的教训)。
-	if sh != nil {
-		// 85..105 的理由: 低于 85 白扔 15% 带宽, 高于 105 等于故意超发。让 bandit
-		// 在这个窄带里找"留多少余量最稳", 但速率本体永远归反馈控制管。
-		o.tun = append(o.tun, tunable{shaperHeadroomParam, "", 85, 105, 5, 95})
+	// === tun 表 ===
+	//
+	// 机制模式 (默认) 下 tun 表是**空的**: 本轮逐参数评估的结论是这条链路上没有一个
+	// 参数具备可学的信噪比 (效应量 ~0.01 vs 相邻两拍 0.34 的噪声, 2σ 下每臂需要约
+	// 4600 个平稳配对样本, 而实测有效学习拍只有 106 拍/天、链路容量在分钟级于
+	// 6-59 Mbps 跳变)。于是 loss_thresh 转机制闭环, 其余的钉成常数或护栏,
+	// 主循环退化为 "测量 -> 驱动机制 -> 记录遥测样本"。
+	//
+	// --legacy-bandit 一键恢复旧表 + 坐标上升, 整期可回退。
+	if legacyBandit {
+		o.tun = legacyTunables()
+		// shaper_headroom 只在 --shaper 打开时才进轮转: 快环没跑的时候它连接收方都
+		// 没有, 留在列表里只会白白吃掉探索预算 (neoq_boost 的教训)。
+		if sh != nil {
+			// 85..105 的理由: 低于 85 白扔 15% 带宽, 高于 105 等于故意超发。
+			o.tun = append(o.tun, tunable{shaperHeadroomParam, "", 85, 105, 5, 95})
+		}
+	} else {
+		o.applyFrozenConstants()
 	}
 	// Start every tunable at its AGGRESSIVE default and push it to the kernel.
 	// We deliberately do NOT adopt the live sysctl value: a fresh module load has
@@ -263,6 +622,7 @@ func newOptimizer(iface, target string, interval time.Duration, gamma float64, s
 	// overwrites any stale/garbage value from a prior run. Per-link learned optima
 	// are recovered via the model warm-start (explicit-target mode) and the
 	// model.json the optimizer keeps growing.
+	// (机制模式下 tun 表为空, 这个循环是 no-op —— 基线由 applyFrozenConstants 写。)
 	for i := range o.tun {
 		o.apply(&o.tun[i])
 	}
@@ -743,6 +1103,9 @@ func (o *optimizer) measure() metrics {
 		m.nqOK = true
 		m.t0PeakDelayUs = float64(nq.t0PeakDelayUs)
 		m.bulkFlows = nq.bulkFlows
+		// ambient_share 必须在这里搬运, 否则 ambientSample 永远走 ss-diff 兜底, 而
+		// 日志仍会打印 src=ss-diff —— 运维会读成"内核太老没导出这个键"。
+		m.ambientPct, m.ambientOK = float64(nq.ambientShare), nq.ambientOK
 		if o.nqPrimed {
 			m.t0DeltaPkts = nq.t0Pkts - o.prevT0Pkts
 			m.t3GoodputDelta = nq.t3Bytes - o.prevT3Bytes
@@ -1031,6 +1394,10 @@ func cmdOptimize(args []string) error {
 	gamma := defaultGamma // Express-delay penalty weight; --gamma 0 disables the term
 	shaperOn := false     // --shaper: 启用 2s 的整形速率快环 (独立于这里的慢环)
 	shaperMaxMbps := 0.0  // --shaper-max-mbps: 覆盖 R_max (默认读网卡线速)
+	// --legacy-bandit: 一键回到本轮之前的行为 (tun 表恢复、坐标上升/UCB 照跑,
+	// loss_thresh 闭环停用)。整期可回退, 出事就加这个开关重启。
+	legacyBandit := false
+	ltAuto := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--interval":
@@ -1064,6 +1431,10 @@ func cmdOptimize(args []string) error {
 			}
 		case "--shaper":
 			shaperOn = true
+		case "--legacy-bandit":
+			legacyBandit = true
+		case "--auto-loss-thresh":
+			ltAuto = true
 		case "--shaper-max-mbps":
 			if i+1 < len(args) {
 				if v, e := strconv.ParseFloat(args[i+1], 64); e == nil && v > 0 {
@@ -1074,7 +1445,7 @@ func cmdOptimize(args []string) error {
 		}
 	}
 	if iface == "" {
-		return fmt.Errorf("usage: optimize --iface <dev> [--interval N] [--target IP] [--algo coord|ucb] [--gamma G] [--shaper] [--shaper-max-mbps M]")
+		return fmt.Errorf("usage: optimize --iface <dev> [--interval N] [--target IP] [--algo coord|ucb] [--gamma G] [--shaper] [--shaper-max-mbps M] [--legacy-bandit]")
 	}
 	// Always record samples passively from whatever real traffic the kernel
 	// is moving. --target is now purely informational — if set, it's stamped
@@ -1130,7 +1501,8 @@ func cmdOptimize(args []string) error {
 		go sh.run(nil)
 	}
 
-	o := newOptimizer(iface, target, interval, gamma, sh)
+	o := newOptimizer(iface, target, interval, gamma, sh, legacyBandit)
+	o.ltAuto = ltAuto
 	// UCB bandit: pre-load it with all prior samples so a fresh process
 	// inherits learning from previous runs (crucial for systemd auto-restart).
 	// Instantiated in BOTH modes: in coord mode it backs delta-credit (B1) and the
@@ -1194,8 +1566,12 @@ func cmdOptimize(args []string) error {
 		}
 	}
 	nq0, nqUp := nqReader.read(true)
-	fmt.Printf("optimize: iface=%s interval=%v gamma=%.2f neoq_ml=%v shaper=%v phase=EXPLORE (aggressive grab, tx+rx)\n",
-		iface, interval, gamma, nqUp, sh.running())
+	mode := "MECHANISM (tun table empty; loss_thresh closed-loop + frozen consts)"
+	if legacyBandit {
+		mode = fmt.Sprintf("LEGACY-BANDIT (%d tunables, loss_thresh closed-loop OFF)", len(o.tun))
+	}
+	fmt.Printf("optimize: iface=%s interval=%v gamma=%.2f neoq_ml=%v shaper=%v mode=%s phase=EXPLORE (aggressive grab, tx+rx)\n",
+		iface, interval, gamma, nqUp, sh.running(), mode)
 	o.prevBytes = ifaceBytes(iface)
 	o.prevOut, o.prevRetr = readSnmpTcp()
 	// Per-target mode: prime the target's summed lifetime ss counters alongside
@@ -1236,6 +1612,15 @@ func cmdOptimize(args []string) error {
 				o.codelRtt = 0.8*o.codelRtt + 0.2*m.rttMs
 			}
 			applyCodel(o.codelRtt)
+		}
+
+		// loss_thresh 机制闭环 —— 与 applyCodel 并列的第二个"驱动机制"动作 (两者都是
+		// 测量 -> 直接算 -> 写内核, 都不经过统计归因)。
+		// ★ 只在活跃拍推进 (D1): idle 拍的 loss 读数是垃圾, 让它进 EWMA 会把 thresh
+		//   拖向噪声。也**不遗忘** —— 门在 applyLossThresh 里, 见那里的注释。
+		// ★ 放在 EXPLORE 分支之前, 所以两个相位都在跑: 它是机制不是搜索。
+		if line := o.applyLossThresh(m, active); line != "" {
+			fmt.Printf("%s %s\n", ts, line)
 		}
 
 		if o.phase == "EXPLORE" {
@@ -1300,10 +1685,7 @@ func cmdOptimize(args []string) error {
 		// mode feat.Target is filled from the dominant peer at record time.
 		if sc > windowBest.score {
 			windowBest.score = sc
-			windowBest.params = paramSet{}
-			for i := range o.tun {
-				windowBest.params[o.tun[i].name] = o.tun[i].cur
-			}
+			windowBest.params = o.paramsSnapshot()
 			windowBest.loss = m.lossPct
 			// B1: tag this best with the coordinate that moved to reach it, so the
 			// persisted sample can carry single-param credit (changedParam/delta).
@@ -1358,6 +1740,15 @@ func cmdOptimize(args []string) error {
 		// 步参数 (生产跑的是 coord, 所以没炸)。
 		if o.idleHold(active) {
 			fmt.Printf("%s OPT idle (bw=%.0fM<%.0f, no signal) — holding params\n", ts, m.bwMbps, idleBwFloorMbps)
+			continue
+		}
+		// 机制模式: tun 表为空, 没有坐标可步进, 下面整段搜索逻辑 (UCB / 坐标上升 /
+		// STABILIZE) 都不适用, 而且它们全都会索引 o.tun —— 空表下 nextTi 的 %n 会
+		// panic。主循环到此就是完整的一拍: 测量 -> 驱动机制 (上面的 applyCodel /
+		// loss_thresh 闭环) -> 记录遥测样本 (上面的 windowBest)。
+		if len(o.tun) == 0 {
+			fmt.Printf("%s OPT bw=%.0f rtt=%.1f loss=%.2f%% score=%.3f | mechanism-only (lt=%d)%s\n",
+				ts, m.bwMbps, m.rttMs, m.lossPct*100, sc, o.lt.cur, o.sh.statusLine())
 			continue
 		}
 		// UCB mode: each cycle pick a fresh value per parameter (rotate which
@@ -1580,6 +1971,11 @@ func cmdOptimize(args []string) error {
 // the loop never deadlocks — selection only steers which param we PROBE.
 func (o *optimizer) nextTi(i int) int {
 	n := len(o.tun)
+	// 机制模式下 tun 表是空的。主循环在这之前就 continue 了, 但 %0 会 panic ——
+	// 一个空表的不变式不该靠"调用点记得先判"来维持。
+	if n == 0 {
+		return i
+	}
 	for k := 1; k <= n; k++ {
 		j := (i + k) % n
 		if o.frozen[o.tun[j].name] {

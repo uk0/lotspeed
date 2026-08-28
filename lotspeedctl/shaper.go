@@ -1039,6 +1039,27 @@ func (s *shaper) slowLayerReady() bool {
 	return s.state == stShaperHold && s.holdStable >= holdStableForSlowLayer
 }
 
+// nonBinding 报告这一拍整形器**没有绑定链路**: util 低于 utilBind (发出去的量远没
+// 顶到 R —— 需求受限, 不是我在控速), 且远端排队没超预算 (E_remote <= max(30ms,
+// 0.2*minRtt), 说明也没有我造出来的驻留队列)。这种拍的丢包 by construction 不是我
+// 造成的, 所以 loss_thresh 闭环用它筛 ambient 样本 —— 见 optimizer.go 里
+// lossThreshLoop 的自指防护注释。
+//
+// ok=false 表示"判不了"(快环没跑 / 内核不导出 shaper 键), 由调用方决定默认放行还是
+// 拒收。只读访问器, 不碰控制律。
+func (s *shaper) nonBinding() (nb bool, ok bool) {
+	if s == nil {
+		return false, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.unsupported {
+		return false, false
+	}
+	budget := math.Max(eRemoteFloorMs, eRemoteRttFrac*s.regimeMinRtt)
+	return s.util < utilBind && s.eRemote <= budget, true
+}
+
 // rateCV 返回 R 环的变异系数 (stddev/mean)。ok=false 表示样本不足或均值为 0。
 // score() 用它惩罚"控制器自己抖 R" —— 目标是稳定的高速低延迟, 不是峰值吞吐。
 func (s *shaper) rateCV() (float64, bool) {

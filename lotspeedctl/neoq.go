@@ -52,6 +52,14 @@ type neoqML struct {
 	backlog     uint64
 	shaperSent  uint64
 	shaperDefer uint64
+
+	// ambientShare: qdisc 侧上一完整 1s 窗口的全链路重传占比 (0-100)。它比用户态用
+	// ss/snmp 差分估出来的环境丢包干净得多 —— 滚动窗口、只数 >=128B 的包 (纯 ACK 不
+	// 稀释分母)、排除哈希冲突包。loss_thresh 闭环优先用它, ss 差分只作 fallback。
+	// ambientOK 必须与值分开: "键不存在"(老内核模块) 和"键在、值是 0"(干净链路) 是
+	// 两件完全不同的事, 后者是合法读数, 不能当缺失处理。
+	ambientShare uint64
+	ambientOK    bool
 	// shaperOK 只有四个 shaper 键全部出现时才为 true。老内核模块 (今天的
 	// sch_neoq) 一个都不导出, 于是整个 shaper 快环禁用, 行为退回今天 —— 沿用
 	// nqOK 那套"文件缺失=特性关闭"的兼容模式。要求"全部齐全"而不是"任意一个"是
@@ -123,6 +131,9 @@ func parseNeoqML(line string) (neoqML, bool) {
 		case "shaper_defer":
 			s.shaperDefer = n
 			shaperSeen |= 8
+		case "ambient_share":
+			s.ambientShare = n
+			s.ambientOK = true
 		}
 	}
 	if !any {

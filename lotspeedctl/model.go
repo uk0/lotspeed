@@ -223,6 +223,47 @@ func (m *model) predict(f linkFeature) paramSet {
 	return out
 }
 
+// === loss_thresh 的唯一公式 (冷启动与运行时闭环共用) ===
+//
+// K1 门控的语义就是"每轮丢包率低于 loss_thresh 不算拥塞、不退避", 所以这个阈值
+// 恒等于 **环境丢包率 + 余量** —— 一个可直接测量的量, 不需要 bandit 去学 (参数效应量
+// ~0.01 而相邻两拍 Δ(bw/peakBw) 噪声可达 0.34, 单样本信噪比 1/34)。
+//
+// ★ 为什么必须是一个函数: heuristicPlan (冷启动) 和 optimizer 的运行时闭环
+// (lossThreshLoop) 都要算它。两处各写一遍就是第三套边界 —— 这个项目刚清理完
+// neoq_codel 的"双真相", 不再造一个。
+const (
+	// lossThreshMargin: 环境丢包之上的余量, 覆盖测量噪声 (环境 10% 时门限 14%)。
+	lossThreshMargin = 4
+	// lossThreshMin/Max: 硬边界。max=20 沿用 heuristicPlan 现役冷启动的保守上限。
+	//
+	// ★ 已知冲突, 摊开写在这里而不是静默选边: tun 表附近记录的证据是"10% ambient
+	//   最优 12-16; lt=30 引发重传风暴; 24 留 headroom", 而 green1 实测 ambient 到
+	//   过 18.2% —— clamp(18+4, 4, 20) = 20 顶格, 于是 +4 的余量被上限压成 +1.8。
+	//   本轮取 20 (heuristic 是现役冷启动、更保守), 但闭环会把每次顶格显式打进日志,
+	//   让运维看得见"余量被上限吃掉了"。上限是否该提到 24 留给 abtest 裁决。
+	lossThreshMin = 4
+	lossThreshMax = 20
+	// 高 RTT 地板: >150ms 的路径上单次丢包更常是瞬时乱序而不是拥塞, 门限不该低于 8。
+	lossThreshHiRttMs    = 150
+	lossThreshHiRttFloor = 8
+)
+
+// lossThreshFor 由环境丢包率 (lossPct 是 0..1 的分数) 和路径 RTT 给出 loss_thresh。
+func lossThreshFor(lossPct, rttMs float64) int {
+	lt := clampInt(int(math.Round(lossPct*100))+lossThreshMargin, lossThreshMin, lossThreshMax)
+	if rttMs > lossThreshHiRttMs {
+		lt = maxInt(lt, lossThreshHiRttFloor)
+	}
+	return lt
+}
+
+// lossThreshSaturated 报告"余量被上限吃掉了": 环境丢包 + 余量已经越过 lossThreshMax,
+// 于是实际生效的余量小于 lossThreshMargin。闭环用它触发顶格日志。
+func lossThreshSaturated(lossPct float64) bool {
+	return int(math.Round(lossPct*100))+lossThreshMargin > lossThreshMax
+}
+
 // heuristicPlan is the cold-start fallback when the model is empty.
 // All formulas are BDP-driven, the only knob the user reasoned about above.
 func heuristicPlan(f linkFeature) paramSet {
@@ -244,17 +285,9 @@ func heuristicPlan(f linkFeature) paramSet {
 	if rhoMax > 800 {
 		rhoMax = 800
 	}
-	// B6: cold-start loss_thresh. This is the single most impactful knob and was
-	// previously never set on cold start (the optimizer tunes it but heuristicPlan
-	// didn't emit it). Loss-aware seed: ambient loss below loss_thresh must not
-	// trigger backoff or the CC degenerates to bbr behavior; +4 margin covers
-	// measurement noise. f.LossPct is a fraction (0..1), so *100 -> percent.
-	lossThresh := clampInt(int(math.Round(f.LossPct*100))+4, 4, 20)
-	// Keep the high-RTT floor of 8 (single losses on >150ms paths are more often
-	// transient reordering than congestion): take the max of the two heuristics.
-	if f.RttMs > 150 {
-		lossThresh = maxInt(lossThresh, 8)
-	}
+	// B6: cold-start loss_thresh. 公式本体已抽到 lossThreshFor —— 冷启动和运行时
+	// 闭环 (optimizer 的 lossThreshLoop) 必须共用同一份边界, 见那个函数的注释。
+	lossThresh := lossThreshFor(f.LossPct, f.RttMs)
 	// TODO(param-table): unify this output set with the optimizer's tun list
 	// (optimizer.go newOptimizer) and cmdTune's writer — heuristicPlan still emits
 	// min_cwnd/max_cwnd/hist_min_cwnd_bound that the optimizer doesn't tune, while
@@ -281,6 +314,12 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+func absInt(a int) int {
+	if a < 0 {
+		return -a
+	}
+	return a
 }
 
 // record appends a new (feature, params, score) sample and persists.
@@ -345,10 +384,11 @@ func cmdModel(args []string) error {
 		// Also replay all samples through a fresh UCB bandit and show per-param
 		// best arm + sample count — this is what UCB learned across all sessions.
 		if len(m.Samples) > 0 {
-			// Inspection replay. loss_thresh uses the CURRENT optimizer range
-			// {2,24,2} so new samples bucket onto real arms. neoq_boost is kept
-			// here (not in the optimizer's tun list anymore) only so legacy
-			// samples that still carry it remain visible in `model show`.
+			// Inspection replay —— 纯展示用, 不驱动任何写入。这张表是**历史口径**:
+			// 机制模式下 tun 表已经是空的, 这些参数要么冻成常数, 要么 (loss_thresh)
+			// 由 ambient 闭环给建议。范围只影响历史样本落到哪个 arm 上, 所以刻意保留
+			// 旧的宽范围 —— 收窄会把老样本挤到边界 arm, 让 `model show` 的历史失真。
+			// neoq_boost 同理: 早就不在优化器里了, 留着只为老样本仍能显示。
 			tuns := []tunable{
 				{"startup_gain", "", 200, 400, 20, 0},
 				{"fast_alpha", "", 4, 40, 4, 0},

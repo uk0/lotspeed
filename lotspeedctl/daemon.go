@@ -111,11 +111,12 @@ func tuneForLoss(lossPct float64) string {
 	set := func(k, v string) { _ = writeSysctl(k, v) }
 	switch {
 	case lossPct > 5: // severe (intercontinental / lossy)
-		set("loss_thresh", "50")
+		// 20 是 lossThreshMax。原值 50 是它的 2.5 倍, 而实测 30 就已经触发重传风暴。
+		set("loss_thresh", "20")
 		set("fast_recovery", "1")
 		set("brave_enable", "1")
 		set("hd_rho_max", "400")
-		return "SEVERE-LOSS: loss_thresh=50 fast_recovery=1 brave=1 hd_rho_max=400"
+		return "SEVERE-LOSS: loss_thresh=20 fast_recovery=1 brave=1 hd_rho_max=400"
 	case lossPct > 1: // moderate
 		set("loss_thresh", "20")
 		set("fast_recovery", "1")

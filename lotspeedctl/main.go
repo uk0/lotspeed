@@ -31,7 +31,10 @@ var presets = map[string]map[string]string{
 		"brave_enable":  "1",
 		"hd_enable":     "1",
 		"hd_rho_max":    "400",
-		"loss_thresh":   "30",
+		// 20 而非 30: 本仓库自己的实测记录是 lt=30 触发重传风暴 (optimizer.go
+		// lossThreshMax 那一段), 24 尚有 headroom。preset 是会覆盖闭环建议值的,
+		// 不能留一个已知有害的数。
+		"loss_thresh":   "20",
 		"fast_recovery": "1",
 	},
 	// Game: latency-first, small target queue, fast reaction.
@@ -93,6 +96,8 @@ func main() {
 		err = cmdHistClear(os.Args[2:])
 	case "bandmap":
 		err = cmdBandmap(os.Args[2:])
+	case "abtest":
+		err = cmdABTest(os.Args[2:])
 	case "model":
 		err = cmdModel(os.Args[2:])
 	case "help", "-h", "--help":
@@ -122,12 +127,16 @@ Usage:
   lotspeedctl monitor [sec]          live refresh of CC + NeoQ stats (default 2s)
   lotspeedctl daemon [--interval N] [--iface eth0]
                                      collect loss -> auto-tune anti-loss params
-  lotspeedctl optimize --iface eth0 [--interval N] [--gamma G] [--shaper] [--shaper-max-mbps M]
-                                     adaptive search: EXPLORE peak bw -> OPTIMIZE score
+  lotspeedctl optimize --iface eth0 [--interval N] [--gamma G] [--shaper] [--shaper-max-mbps M] [--legacy-bandit]
+                                     EXPLORE peak bw -> OPTIMIZE. 默认是**机制模式**:
+                                     tun 表为空, loss_thresh 由 ambient 闭环驱动,
+                                     其余参数冻结为常数 (见 applyFrozenConstants)
                                      (--gamma weights NeoQ Express-delay penalty; 0=off, default 0.3)
                                      (--shaper enables the 2s shaper-rate feedback loop:
                                       measurement-driven probe-and-hold on /proc/net/neoq_rate.
                                       R_max defaults to the NIC line rate; --shaper-max-mbps overrides.)
+                                     (--legacy-bandit 一键回到旧行为: tun 表恢复、坐标
+                                      上升照跑、loss_thresh 闭环停用)
   lotspeedctl prio [list|add P..|del P..|clear|auto]
                                      manage NeoQ priority ports (auto = detect game/web)
   lotspeedctl boost [N]              get/set NeoQ downstream rwnd boost (percent, 100=off)
@@ -138,6 +147,12 @@ Usage:
                                      P0 取证: 每 N 秒把全量 socket (含 lo/docker) 连
                                      同出接口/RTT档/累计计数写成 JSONL, 只读不改行为
   lotspeedctl model [show|clear]     inspect KNN sample store (~/.lotspeedctl/model.json)
+  lotspeedctl abtest --param P --values A,B [--pairs N] [--window 30s] [--apply]
+                                     交替配对 A/B + 符号检验。这是本工具里唯一能对
+                                     参数做**因果**判断的路径: 交替提供外生变异, 观测
+                                     数据上的相关做不到 (见 optimizer.go ltAuto)。
+                                     SIGKILL 会把内核停在当时那个臂上 —— 用 Ctrl-C
+                                     或 SIGTERM 退出, 那两条路径会恢复原值。
 `)
 }
 

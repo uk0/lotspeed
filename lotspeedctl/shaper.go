@@ -227,6 +227,8 @@ type shaper struct {
 	regimeMinRtt float64
 	peer         string
 	band         string
+	// pickedBand 是上一拍自动选中的 RTT 档 (仅用于日志去重, 不参与控制律)。
+	pickedBand string
 
 	// holdStable 是慢层闸门用的"连续稳定拍数": PROBE/trim/BACKOFF 都会把它清零,
 	// 因为那几拍速率在动, 慢层这时候步进就归因不了。
@@ -344,9 +346,47 @@ func ifaceLineRateBps(iface string) (float64, bool) {
 // 注意样本量小的时候中位数救不了这件事 —— n=2 时中位数就是平均值, 一样跳。
 func (s *shaper) sampleStat() ssTargetStat {
 	if s.target != "" {
-		return ssTarget(s.target)
+		return ssTarget(s.target) // 显式指定一条链路时不做自动选档
 	}
-	return ssAll()
+	st, band := pickBand(ssBands(ssMaxSocks))
+	if band != "" && band != s.pickedBand {
+		s.logf("band -> %s (minRtt=%.0fms E=%.0fms socks=%d) — 控制信号改取此档",
+			band, st.minRttP50Ms, st.queueDelayMs, st.socks)
+		s.pickedBand = band
+	}
+	return st
+}
+
+// pickBand 从各 RTT 档里选出该驱动 R 的那一档。
+//
+// 判据不是"哪档流量大", 而是"哪档有远端排队" —— 整形的全部作用是把队列从够不着
+// 的远端搬回本机, 一个档如果 E 很小, 它根本没有队列可搬, 对它限速纯粹是白扔带宽。
+// 只有都没排队时才退回按字节选, 那种情况下 R 会停在 R_max (= 不整形), 选谁都一样,
+// 选字节大的只是让 util 判据有个合理的分母。
+//
+// 这是"target 默认覆盖全部连接"的实现: 不需要手工指定 IP, 每拍自动认出当前真正
+// 需要整形的那一类路径。代价是 shaper 仍然只有一个全局 rate, 所以被选中档的限速
+// 会同时作用于其它档 —— 在洲际流量占主导的出口上可接受, 彻底解决要靠 NeoQ 侧的
+// 多 rate class (按目的地分类整形)。
+func pickBand(bands map[string]ssTargetStat) (ssTargetStat, string) {
+	var best ssTargetStat
+	var bestBand string
+	var bestQueued bool
+	for b, st := range bands {
+		if st.socks == 0 {
+			continue
+		}
+		queued := st.queueDelayMs > eRemoteFloorMs
+		switch {
+		case bestBand == "":
+		case queued && !bestQueued: // 有排队的档一律优先于没排队的
+		case queued == bestQueued && st.acked > best.acked:
+		default:
+			continue
+		}
+		best, bestBand, bestQueued = st, b, queued
+	}
+	return best, bestBand
 }
 
 // shaperMinRtt 取 shaper 该用的那个 minRtt: 各 socket minrtt 的中位数。只有在

@@ -448,45 +448,79 @@ func ssTarget(target string) ssTargetStat {
 // socket missing a field (e.g. retrans: omitted when its lifetime count is zero)
 // just contributes 0 for it. Split from ssTarget so it's unit-testable on a fixture
 // (mirrors the readNeoqML/parseNeoqML split).
-func parseSSTarget(out string) ssTargetStat {
-	var st ssTargetStat
-	var rttSum float64
-	var rttN int
-	var queueDelays []float64
-	var minRtts []float64
+// ssRow 是一个 socket 的原始读数。拆出来是为了让"解析"和"聚合"分开: 同一次
+// ss 输出要被按 RTT 档分组后各自聚合 (见 ssBands), 一次解析多次聚合。
+type ssRow struct {
+	minRtt float64
+	srtt   float64
+	retr   uint64
+	segs   uint64
+	acked  uint64
+}
+
+// ssMaxSocks 是单拍解析的 socket 上限。快环 2s 一拍, 而 ss 全量扫描在几百个
+// socket 时是毫秒级 —— 上限存在的意义不是省 CPU, 而是给最坏情况 (连接风暴)
+// 一个确定的代价上界, 免得控制器的一拍被 ss 拖成几百毫秒。
+const ssMaxSocks = 1024
+
+func parseSSRows(out string, maxRows int) []ssRow {
+	var rows []ssRow
 	for _, ln := range strings.Split(out, "\n") {
 		// A socket's stats line is the one carrying the rtt field; the address line
 		// (Local/Peer) has none. Use rtt presence to identify a real socket line.
 		if _, ok := ssField(ln, "rtt"); !ok {
 			continue
 		}
-		st.socks++
-		srtt := 0.0
+		if maxRows > 0 && len(rows) >= maxRows {
+			break
+		}
+		var r ssRow
 		if v, ok := ssFloatX(ln, "rtt"); ok && v > 0 { // srtt = X of rtt:X/Y
-			rttSum += v
-			rttN++
-			srtt = v
+			r.srtt = v
 		}
 		// minrtt: 一个裸浮点 (无 X/Y), ssFloatX 直接给整值。ssField 的整词匹配保证
 		// 它不会跟 rtt: 串味 (反之亦然)。
 		if v, ok := ssFloatX(ln, "minrtt"); ok && v > 0 {
-			if st.minRttMs == 0 || v < st.minRttMs {
-				st.minRttMs = v
-			}
-			minRtts = append(minRtts, v)
-			if srtt >= v {
-				queueDelays = append(queueDelays, srtt-v)
-			}
+			r.minRtt = v
 		}
 		if v, ok := ssUintY(ln, "retrans"); ok { // lifetime total = Y of retrans:X/Y
-			st.retr += v
+			r.retr = v
 		}
 		if v, ok := ssUint(ln, "segs_out"); ok {
-			st.segs += v
+			r.segs = v
 		}
 		if v, ok := ssUint(ln, "bytes_acked"); ok {
-			st.acked += v
+			r.acked = v
 		}
+		rows = append(rows, r)
+	}
+	return rows
+}
+
+func aggregateRows(rows []ssRow) ssTargetStat {
+	var st ssTargetStat
+	var rttSum float64
+	var rttN int
+	var queueDelays []float64
+	var minRtts []float64
+	for _, r := range rows {
+		st.socks++
+		if r.srtt > 0 {
+			rttSum += r.srtt
+			rttN++
+		}
+		if r.minRtt > 0 {
+			if st.minRttMs == 0 || r.minRtt < st.minRttMs {
+				st.minRttMs = r.minRtt
+			}
+			minRtts = append(minRtts, r.minRtt)
+			if r.srtt >= r.minRtt {
+				queueDelays = append(queueDelays, r.srtt-r.minRtt)
+			}
+		}
+		st.retr += r.retr
+		st.segs += r.segs
+		st.acked += r.acked
 	}
 	if rttN > 0 {
 		st.rttMs = rttSum / float64(rttN)
@@ -494,6 +528,41 @@ func parseSSTarget(out string) ssTargetStat {
 	st.queueDelayMs = percentile(queueDelays, 0.5)
 	st.minRttP50Ms = percentile(minRtts, 0.5)
 	return st
+}
+
+func parseSSTarget(out string) ssTargetStat {
+	return aggregateRows(parseSSRows(out, 0))
+}
+
+// ssBands 把全机 established socket 按 RTT 档分组, 每组各自聚合。
+//
+// 为什么必须分组再聚合, 而不是在全机总体上取某个统计量: 这台机器同一时刻并存
+// 本地回环 (0.011ms)、同城 CDN (0.036ms)、docker 容器 (0.029/46ms) 和洲际
+// (180/214/234/324ms) —— minRtt 跨五个数量级。在这样的总体上, 全局 min 由"这一拍
+// 恰好存在哪个本地 socket"决定, 而中位数在样本少时同样不稳 (实测 n=2 时中位数就是
+// 平均值, 跳得和 min 一样凶)。对错误的总体做任何统计量都救不回来 —— 总体本身要换。
+// 档内的 socket 走物理上相近的路径, 它们的 minRtt/E 才有可比性, 中位数才有意义。
+//
+// 注意不能按地址段分类: 实测有 127.0.0.1 的 socket minrtt 是 234ms —— 那是 xray
+// 的本地 socket 承载着洲际隧道流量。只有实测 RTT 能说明一个 socket 走的是哪条路。
+func ssBands(maxSocks int) map[string]ssTargetStat {
+	out, err := exec.Command("ss", "-tin", "state", "established").Output()
+	if err != nil {
+		return nil
+	}
+	byBand := map[string][]ssRow{}
+	for _, r := range parseSSRows(string(out), maxSocks) {
+		if r.minRtt <= 0 {
+			continue // 没有 minrtt 就无法归档, 计入任何一档都是污染
+		}
+		b := rttBand(r.minRtt)
+		byBand[b] = append(byBand[b], r)
+	}
+	res := make(map[string]ssTargetStat, len(byBand))
+	for b, rows := range byBand {
+		res[b] = aggregateRows(rows)
+	}
+	return res
 }
 
 // ssAll 聚合本机全部 ESTABLISHED socket, 复用同一个解析器。

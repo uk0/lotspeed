@@ -1141,3 +1141,78 @@ func TestBackoffFreezesRateWithoutDemand(t *testing.T) {
 			"that is exactly why acting on it is wrong", s.deficitEMA)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 自动选档 (target 默认覆盖全部连接)
+// ---------------------------------------------------------------------------
+
+// 有远端排队的档必须优先于字节量更大但没排队的档 —— 整形只对"有队列可搬回来"的
+// 路径有意义, 对没排队的档限速纯粹是白扔带宽。
+func TestPickBandPrefersQueuedOverBusier(t *testing.T) {
+	got, band := pickBand(map[string]ssTargetStat{
+		// 字节量大 10 倍, 但几乎不排队
+		"lan": {socks: 40, acked: 10e9, minRttP50Ms: 0.5, queueDelayMs: 1},
+		// 字节量小, 但远端排了 80ms
+		"intercontinental": {socks: 4, acked: 1e9, minRttP50Ms: 160, queueDelayMs: 80},
+	})
+	if band != "intercontinental" {
+		t.Fatalf("band=%q want intercontinental (queued beats busier)", band)
+	}
+	if got.minRttP50Ms != 160 {
+		t.Errorf("minRttP50Ms=%.0f want 160 — 控制信号必须整组取自被选中的档", got.minRttP50Ms)
+	}
+}
+
+// 都没排队时退回按字节选: R 这时会停在 R_max (不整形), 选谁都一样, 选字节大的
+// 只是让 util 判据有个合理的分母。
+func TestPickBandFallsBackToBytes(t *testing.T) {
+	_, band := pickBand(map[string]ssTargetStat{
+		"lan":              {socks: 40, acked: 10e9, minRttP50Ms: 0.5, queueDelayMs: 1},
+		"intercontinental": {socks: 4, acked: 1e9, minRttP50Ms: 160, queueDelayMs: 2},
+	})
+	if band != "lan" {
+		t.Fatalf("band=%q want lan (no queue anywhere -> busiest)", band)
+	}
+}
+
+// 空档位不能被选中 (socks==0 的条目没有任何可用信号)。
+func TestPickBandSkipsEmpty(t *testing.T) {
+	_, band := pickBand(map[string]ssTargetStat{
+		"far": {socks: 0, acked: 99e9, queueDelayMs: 999},
+	})
+	if band != "" {
+		t.Fatalf("band=%q want empty — socks==0 的档没有可用信号", band)
+	}
+	if _, b := pickBand(nil); b != "" {
+		t.Fatalf("band=%q want empty for nil map", b)
+	}
+}
+
+// 分档聚合: 同一次 ss 输出里的本地与洲际 socket 必须落进不同的档, 各自算各自的
+// 中位数。这是"对错误的总体做统计救不回来"那个教训的回归测试。
+func TestSSBandsSeparatesLocalFromIntercontinental(t *testing.T) {
+	rows := parseSSRows(`ESTAB 0 0 10.0.0.1:22 10.0.0.2:1
+	 cubic rtt:0.05/0.03 minrtt:0.011 bytes_acked:500 segs_out:5
+ESTAB 0 0 10.0.0.1:443 9.9.9.9:2
+	 cubic rtt:180.5/7.7 minrtt:180 bytes_acked:900000 segs_out:900
+ESTAB 0 0 10.0.0.1:443 9.9.9.8:3
+	 cubic rtt:220.1/9.0 minrtt:214 bytes_acked:800000 segs_out:800`, 0)
+	if len(rows) != 3 {
+		t.Fatalf("rows=%d want 3", len(rows))
+	}
+	byBand := map[string][]ssRow{}
+	for _, r := range rows {
+		byBand[rttBand(r.minRtt)] = append(byBand[rttBand(r.minRtt)], r)
+	}
+	if n := len(byBand["lan"]); n != 1 {
+		t.Errorf("lan rows=%d want 1", n)
+	}
+	if n := len(byBand["intercontinental"]); n != 2 {
+		t.Errorf("intercontinental rows=%d want 2", n)
+	}
+	ic := aggregateRows(byBand["intercontinental"])
+	if ic.minRttP50Ms < 180 || ic.minRttP50Ms > 214 {
+		t.Errorf("minRttP50Ms=%.0f want within [180,214] — 档内中位数, 不含 0.011 的本地流",
+			ic.minRttP50Ms)
+	}
+}

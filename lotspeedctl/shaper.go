@@ -176,7 +176,10 @@ type shaper struct {
 	mu sync.Mutex
 
 	iface string
-	state string
+	// target: --target 指定的对端 IP。非空时所有 ss 采样只看这条链路的 socket ——
+	// 快环的 minRtt/srtt/queueDelay 必须同源, 否则 regime 判定拿的是别人的 RTT。
+	target string
+	state  string
 
 	rate     float64 // 当前 R (bit/s)
 	rateMin  float64 // 护栏 1
@@ -257,8 +260,9 @@ type shaper struct {
 //  1. model.json 的 shaper_cache 命中 -> R = 0.7*缓存值, 进 SEEK
 //  2. 无缓存 -> 前 10s R=R_max 纯观测, 取 goodput 中位数 g0, R = 1.2*g0 进 SEEK
 //  3. 完全无流量 -> HOLD at R_max, 等 util 信号 (在 OBSERVE 结束时分流)
-func newShaper(iface string, rateMaxMbps float64) *shaper {
+func newShaper(iface, target string, rateMaxMbps float64) *shaper {
 	s := &shaper{
+		target: target,
 		iface:         iface,
 		state:         stShaperObserve,
 		headroom:      0.95,
@@ -299,7 +303,7 @@ func newShaper(iface string, rateMaxMbps float64) *shaper {
 
 	// 冷启动 1: 缓存命中。band 需要 minRtt, 此刻还没有测量, 所以先用当前链路的
 	// 一次性快照探一下; 探不到就走 OBSERVE (路 2/3)。
-	st := ssAll()
+	st := s.sampleStat()
 	s.peer = s.detectPeer()
 	if mr := shaperMinRtt(st); mr > 0 {
 		s.regimeMinRtt = mr
@@ -331,6 +335,18 @@ func ifaceLineRateBps(iface string) (float64, bool) {
 		}
 	}
 	return defaultRateMaxMbps * 1e6, false
+}
+
+// sampleStat 取本拍的 ss 统计。有 --target 就只看那条链路 —— 快环的 minRtt 决定
+// regime 分档, 而 regime 一切换 C_hat 就清零; 用全机口径的话, 这台机器上并存的
+// 近端 socket (实测 0.9ms) 和洲际 socket (169ms) 会让它在两个档之间反复横跳,
+// 控制器永远到不了 HOLD。实测: 全机口径下 10 秒内切换两次, C_hat 反复归零。
+// 注意样本量小的时候中位数救不了这件事 —— n=2 时中位数就是平均值, 一样跳。
+func (s *shaper) sampleStat() ssTargetStat {
+	if s.target != "" {
+		return ssTarget(s.target)
+	}
+	return ssAll()
 }
 
 // shaperMinRtt 取 shaper 该用的那个 minRtt: 各 socket minrtt 的中位数。只有在
@@ -1034,7 +1050,7 @@ func (s *shaper) tick() {
 	dt := now.Sub(s.lastTick).Seconds()
 	s.lastTick = now
 
-	st := ssAll()
+	st := s.sampleStat()
 	sm := shaperSample{
 		dt:           dt,
 		backlogBytes: nq.backlog,

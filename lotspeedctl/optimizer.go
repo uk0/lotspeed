@@ -908,7 +908,7 @@ func cmdOptimize(args []string) error {
 	// 两者的隔离由 slowLayerReady() 的闸门保证。
 	var sh *shaper
 	if shaperOn {
-		sh = newShaper(iface, shaperMaxMbps)
+		sh = newShaper(iface, target, shaperMaxMbps)
 		// 护栏 4 的进程内一半: 被 SIGTERM/SIGINT 打断时也把 rate 归零。systemd 的
 		// ExecStopPost 覆盖服务路径, 这里覆盖手动调试路径 —— 无论哪条路, "控制器
 		// 不在"都必须等于"完全无整形", 而不是"卡在最后一个速率上"。
